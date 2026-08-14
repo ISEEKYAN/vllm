@@ -192,6 +192,28 @@ def _import_deep_gemm():
     return None
 
 
+@functools.cache
+def supports_deep_gemm_batch_invariance() -> bool:
+    """Return whether the installed DeepGEMM has invariant masked grouped FP8."""
+
+    deep_gemm = _import_deep_gemm()
+    if deep_gemm is None:
+        return False
+    controls_available = all(
+        callable(getattr(deep_gemm, name, None))
+        for name in ("set_batch_invariant", "get_batch_invariant")
+    )
+    masked_api_available = any(
+        callable(getattr(deep_gemm, name, None))
+        for name in (
+            "m_grouped_fp8_gemm_nt_masked",
+            "fp8_m_grouped_gemm_nt_masked",
+            "m_grouped_fp8_fp4_gemm_nt_masked",
+        )
+    )
+    return controls_available and masked_api_available
+
+
 def _apply_pdl(mod, enable: bool = True) -> None:
     mod_name = getattr(mod, "__name__", str(mod))
     try:
