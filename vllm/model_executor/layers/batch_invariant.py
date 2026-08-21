@@ -987,9 +987,9 @@ def override_envs_for_invariance():
     os.environ["VLLM_USE_AOT_COMPILE"] = "0"
 
 
-def init_batch_invariance():
+def init_batch_invariance(*, force: bool = False):
     # this will hit all the csrc overrides as well
-    if envs.VLLM_BATCH_INVARIANT:
+    if force or envs.VLLM_BATCH_INVARIANT:
         override_envs_for_invariance()
         enable_batch_invariant_mode()
 
