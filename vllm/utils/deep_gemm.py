@@ -225,6 +225,7 @@ def enable_deep_gemm_batch_invariance() -> None:
     """
     if not is_deep_gemm_supported():
         return
+    _lazy_init()
     deep_gemm = _import_deep_gemm()
     if deep_gemm is None or not supports_deep_gemm_batch_invariance():
         raise RuntimeError(
