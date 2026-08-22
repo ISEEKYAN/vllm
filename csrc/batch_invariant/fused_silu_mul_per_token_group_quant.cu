@@ -357,7 +357,8 @@ __global__ void per_token_group_quant_8bit_kernel(
     const int scale_expert_stride,
     const int scale_hidden_stride,
     const int num_tokens_per_expert,
-    const float max_8bit) {
+    const float max_8bit,
+    const float swiglu_limit) {
   using dst_dtype_info = DtypeInfo<DST_DTYPE>;
   using scale_element_t = std::conditional_t<SCALE_UE8M0, uint8_t, float>;
   static_assert(sizeof(scale_packed_t) % sizeof(scale_element_t) == 0);
@@ -438,11 +439,16 @@ __global__ void per_token_group_quant_8bit_kernel(
         for (uint32_t j = 0; j < INPUT_PRIMARY_VEC_SIZE; ++j) {
           float val;
           if constexpr (FUSE_SILU_AND_MUL) {
+            float gate = static_cast<float>(input_primary_vec[j]);
+            float up = static_cast<float>(input_secondary_vec[j]);
+            if (swiglu_limit > 0.0f) {
+              gate = fminf(gate, swiglu_limit);
+              up = fminf(fmaxf(up, -swiglu_limit), swiglu_limit);
+            }
             // Keep the same single visible low-precision boundary as the
             // contiguous activation path.  Rounding SiLU before multiplying
             // changes the second MoE GEMM's FP8 inputs.
-            T val_lowprec = static_cast<T>(
-                silu(static_cast<float>(input_primary_vec[j])) * static_cast<float>(input_secondary_vec[j]));
+            T val_lowprec = static_cast<T>(silu(gate) * up);
             val = static_cast<float>(val_lowprec);
             input_primary_vec[j] = val_lowprec;
           } else {
@@ -537,10 +543,12 @@ void fused_silu_mul_per_token_group_quant(
     bool round_scale,
     bool scale_ue8m0,
     bool fuse_silu_and_mul,
+    double swiglu_limit,
     const std::optional<torch::Tensor>& masked_m) {
   CHECK_INPUT(input);
   CHECK_INPUT(output_q);
   TORCH_CHECK(input.numel() > 0);
+  TORCH_CHECK(std::isfinite(swiglu_limit) && swiglu_limit >= 0.0, "swiglu_limit must be finite and non-negative");
 
   TORCH_CHECK(std::abs(LOCAL_ABSMAX_ABS - eps) < 1e-13);
 
@@ -593,7 +601,8 @@ void fused_silu_mul_per_token_group_quant(
         scale_expert_stride,                                                                                         \
         scale_hidden_stride,                                                                                         \
         num_tokens_per_expert,                                                                                       \
-        static_cast<float>(max_8bit));                                                                               \
+        static_cast<float>(max_8bit),                                                                                \
+        static_cast<float>(swiglu_limit));                                                                           \
   } while (0)
 
 #define LAUNCH_KERNEL(GROUP_SIZE, T, DST_DTYPE)                                                                     \

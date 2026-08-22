@@ -4,6 +4,7 @@
 # Adapted from https://github.com/sgl-project/sglang/pull/2575
 import functools
 import json
+import math
 import os
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -81,6 +82,7 @@ def fused_silu_mul_per_token_group_quant_fp8(
     use_ue8m0: bool,
     round_scale: bool | None = None,
     masked_m: torch.Tensor | None,
+    swiglu_limit: float = 0.0,
     output_q: torch.Tensor | None = None,
     group_size: int = 128,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -93,6 +95,8 @@ def fused_silu_mul_per_token_group_quant_fp8(
         round_scale = use_ue8m0
     if use_ue8m0 and not round_scale:
         raise ValueError("packed UE8M0 scales require round_scale=True")
+    if not math.isfinite(swiglu_limit) or swiglu_limit < 0:
+        raise ValueError("swiglu_limit must be finite and non-negative")
 
     if input.ndim not in (2, 3) or input.shape[-1] % (2 * group_size):
         raise ValueError(
@@ -149,6 +153,7 @@ def fused_silu_mul_per_token_group_quant_fp8(
         round_scale,
         use_ue8m0,
         True,
+        swiglu_limit,
         masked_m,
     )
     return output_q, output_s

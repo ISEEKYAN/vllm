@@ -104,18 +104,13 @@ def _vllm_silu_mul_quant(
 
     scale_format = DeepGemmQuantScaleFMT.from_oracle()
     if is_batch_invariant_quant_kernel_enabled():
-        if swiglu_limit > 0:
-            # BatchedDeepGemmExperts, which is the rollout reference for this
-            # DS4 path, exposes plain SiLU*up at this fused quant boundary.
-            # Keep the argument for the BF16 fallback/VJP contract, but do not
-            # introduce a training-only clamp into the visible forward.
-            pass
         return fused_silu_mul_per_token_group_quant_fp8(
             gate_up,
             output_q=output,
             use_ue8m0=(scale_format == DeepGemmQuantScaleFMT.UE8M0),
             round_scale=(scale_format != DeepGemmQuantScaleFMT.FLOAT32),
             masked_m=None,
+            swiglu_limit=swiglu_limit,
             group_size=128,
         )
     if scale_format == DeepGemmQuantScaleFMT.UE8M0:
