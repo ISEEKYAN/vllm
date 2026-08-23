@@ -1328,8 +1328,16 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             getattr(self.quant_config, "weight_block_size", None) is not None
             and not self.use_sequence_parallel
         )
+        configured_num_layers = getattr(self.config, "num_hidden_layers", None)
 
         for name, loaded_weight in weights:
+            layer_match = re.match(r"^layers\.(\d+)\.", name)
+            if (
+                configured_num_layers is not None
+                and layer_match is not None
+                and int(layer_match.group(1)) >= configured_num_layers
+            ):
+                continue
             if pad_shared_expert and ".shared_experts." in name:
                 loaded_weight = self._pad_shared_expert_weight(
                     self.quant_config, name, loaded_weight
