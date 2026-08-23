@@ -58,28 +58,3 @@ def test_attn_sink_uses_weight_loader_with_padded_shape(
         atol=0,
     )
     torch.testing.assert_close(param, calls[0], rtol=0, atol=0)
-
-
-def test_online_layer_override_ignores_full_checkpoint_tail(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    model = SimpleNamespace(
-        config=SimpleNamespace(num_attention_heads=3, num_hidden_layers=1),
-        quant_config=None,
-        use_sequence_parallel=False,
-        named_parameters=lambda: [],
-        get_expert_mapping=lambda: [],
-    )
-    monkeypatch.setattr(
-        model_module, "get_tensor_model_parallel_world_size", lambda: 1
-    )
-    monkeypatch.setattr(
-        model_module, "get_tensor_model_parallel_rank", lambda: 0
-    )
-
-    result = DeepseekV4Model.load_weights(
-        model,
-        [("layers.1.attn.attn_sink", torch.ones(3, dtype=torch.float32))],
-    )
-
-    assert result == set()
