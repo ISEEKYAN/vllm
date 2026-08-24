@@ -1464,12 +1464,21 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             return
         layer = self.layers[self.start_layer]
         if isinstance(layer, DeepseekV4DecoderLayer):
+            # Layerwise reload restores registered parameters to meta and may
+            # invoke load_weights() for a partial bucket before hc_attn_fn has
+            # been materialized. Keep the last usable derived value until the
+            # source parameter arrives; the post-reload finalizer refreshes it.
+            if layer.hc_attn_fn.is_meta:
+                return
             broadcast = (
                 layer.hc_attn_fn.detach()
                 .view(-1, layer.hc_mult, layer.hidden_size)
                 .sum(dim=1)
             )
-            if layer.hc_attn_fn_broadcast is None:
+            if (
+                layer.hc_attn_fn_broadcast is None
+                or layer.hc_attn_fn_broadcast.is_meta
+            ):
                 layer.hc_attn_fn_broadcast = broadcast
             else:
                 layer.hc_attn_fn_broadcast.copy_(broadcast)

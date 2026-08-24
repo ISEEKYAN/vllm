@@ -416,3 +416,50 @@ def test_deepseek_v4_mhc_broadcast_refit_refreshes_in_place(monkeypatch):
     assert layer.hc_attn_fn_broadcast is buffer
     expected = layer.hc_attn_fn.detach().view(-1, 2, 8).sum(dim=1)
     assert torch.equal(layer.hc_attn_fn_broadcast, expected)
+
+
+def test_deepseek_v4_mhc_broadcast_partial_meta_reload_is_deferred(monkeypatch):
+    """A partial layerwise reload must retain the last usable derived value."""
+    _patch_first_rank_pp_group(monkeypatch)
+    layer = _make_mhc_decoder_layer(hc_mult=2, hidden_size=8)
+    model = SimpleNamespace(start_layer=0, end_layer=1, layers=[layer])
+    DeepseekV4Model.finalize_mhc_broadcast_weights(model)
+    buffer = layer.hc_attn_fn_broadcast
+    assert buffer is not None
+    before = buffer.clone()
+
+    shape = layer.hc_attn_fn.shape
+    layer.hc_attn_fn = nn.Parameter(
+        torch.empty(shape, dtype=torch.float32, device="meta"),
+        requires_grad=False,
+    )
+    DeepseekV4Model.finalize_mhc_broadcast_weights(model)
+
+    assert layer.hc_attn_fn_broadcast is buffer
+    assert torch.equal(layer.hc_attn_fn_broadcast, before)
+
+    layer.hc_attn_fn = nn.Parameter(
+        torch.randn(shape, dtype=torch.float32), requires_grad=False
+    )
+    DeepseekV4Model.finalize_mhc_broadcast_weights(model)
+
+    assert layer.hc_attn_fn_broadcast is buffer
+    expected = layer.hc_attn_fn.detach().view(-1, 2, 8).sum(dim=1)
+    assert torch.equal(layer.hc_attn_fn_broadcast, expected)
+
+
+def test_deepseek_v4_mhc_broadcast_replaces_meta_destination(monkeypatch):
+    """A meta placeholder cannot be retained as the runtime derived tensor."""
+    _patch_first_rank_pp_group(monkeypatch)
+    layer = _make_mhc_decoder_layer(hc_mult=2, hidden_size=8)
+    model = SimpleNamespace(start_layer=0, end_layer=1, layers=[layer])
+    layer.hc_attn_fn_broadcast = torch.empty(
+        (4, 8), dtype=torch.float32, device="meta"
+    )
+
+    DeepseekV4Model.finalize_mhc_broadcast_weights(model)
+
+    assert layer.hc_attn_fn_broadcast is not None
+    assert not layer.hc_attn_fn_broadcast.is_meta
+    expected = layer.hc_attn_fn.detach().view(-1, 2, 8).sum(dim=1)
+    assert torch.equal(layer.hc_attn_fn_broadcast, expected)
