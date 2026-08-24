@@ -13,6 +13,7 @@ from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import fp8_w8a8_moe_quant_config
 from vllm.model_executor.layers.fused_moe.experts.batched_deep_gemm_moe import (
     BatchedDeepGemmExperts,
+    _capture_safe_expert_token_upper_bound,
     _expected_m_with_actual_floor,
 )
 from vllm.model_executor.layers.fused_moe.experts.fused_batched_moe import (
@@ -44,8 +45,28 @@ BLOCK_SIZE = [128, 128]
 
 def test_expected_m_covers_skewed_live_expert_count():
     counts = torch.tensor([58, 7, 0], dtype=torch.int32)
-    assert _expected_m_with_actual_floor(16, counts) == 64
-    assert _expected_m_with_actual_floor(128, counts) == 128
+    assert _expected_m_with_actual_floor(16, counts, 96) == 64
+    assert _expected_m_with_actual_floor(128, counts, 96) == 128
+
+
+def test_expected_m_capture_uses_graph_bound_without_host_sync(monkeypatch):
+    class CaptureCounts:
+        is_cuda = True
+
+        def max(self):
+            raise AssertionError("capture must not read live GPU expert counts")
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    # The captured buffer may hold 4096 rows per expert, but a graph for 12
+    # input tokens at top-k 8 can route at most 96 rows to any one expert.
+    graph_bound = _capture_safe_expert_token_upper_bound(4096, 12, 8)
+    assert graph_bound == 96
+    assert _expected_m_with_actual_floor(16, CaptureCounts(), graph_bound) == 96
+
+
+def test_capture_safe_bound_is_clamped_to_expert_workspace():
+    assert _capture_safe_expert_token_upper_bound(128, 1000, 8) == 128
 
 
 @pytest.mark.skipif(not is_deep_gemm_supported(), reason="Requires deep_gemm kernels")

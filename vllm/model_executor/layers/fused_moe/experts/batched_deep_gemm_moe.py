@@ -47,9 +47,26 @@ logger = init_logger(__name__)
 def _expected_m_with_actual_floor(
     estimated_m: int,
     expert_num_tokens: torch.Tensor,
+    capture_safe_upper_bound: int,
 ) -> int:
+    if expert_num_tokens.is_cuda and torch.cuda.is_current_stream_capturing():
+        return max(estimated_m, capture_safe_upper_bound)
     actual_m = int(expert_num_tokens.max().item())
     return max(estimated_m, round_up(actual_m, 16))
+
+
+def _capture_safe_expert_token_upper_bound(
+    max_tokens_per_expert: int,
+    total_input_tokens: int,
+    topk: int,
+) -> int:
+    # Every routed row originates from one of the `total_input_tokens * topk`
+    # route slots. Clamp that graph-local bound to the per-expert workspace
+    # capacity so capture does not fall back to the engine-wide maximum M.
+    return max(
+        16,
+        round_up(min(max_tokens_per_expert, total_input_tokens * topk), 16),
+    )
 
 
 def scales_shape_stride_dtype(
@@ -399,19 +416,38 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
     def estimate_expected_m(
         self, global_num_experts: int, max_tokens_per_expert: int, topk: int
     ) -> int:
+        expected_m, _ = self.estimate_expected_m_bounds(
+            global_num_experts, max_tokens_per_expert, topk
+        )
+        return expected_m
+
+    def estimate_expected_m_bounds(
+        self, global_num_experts: int, max_tokens_per_expert: int, topk: int
+    ) -> tuple[int, int]:
         dp_meta = (
             get_forward_context().dp_metadata
             if is_forward_context_available()
             else None
         )
         if dp_meta is None:
-            logger.warning_once(
-                "DPMetadata unavailable. Defaulting expected_m to "
-                f"{max_tokens_per_expert}.",
+            batch_descriptor = (
+                get_forward_context().batch_descriptor
+                if is_forward_context_available()
+                else None
             )
-            return max_tokens_per_expert
+            if batch_descriptor is None:
+                logger.warning_once(
+                    "DPMetadata unavailable. Defaulting expected_m to "
+                    f"{max_tokens_per_expert}.",
+                )
+                return max_tokens_per_expert, max_tokens_per_expert
+            total_num_tokens = batch_descriptor.num_tokens
+        else:
+            # This CPU metadata is the live token count in eager mode and the
+            # graph descriptor's padded capacity in PIECEWISE mode. The latter
+            # is an upper bound for every replay of that descriptor.
+            total_num_tokens = int(dp_meta.num_tokens_across_dp_cpu.sum().item())
 
-        total_num_tokens = dp_meta.num_tokens_across_dp_cpu.sum().item()
         total_num_tokens_replicated = total_num_tokens * topk
 
         # Assume even load balancing
@@ -420,7 +456,10 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
         # clamp estimate
         estimate = max(estimate, 16)
         estimate = min(max_tokens_per_expert, estimate)
-        return estimate
+        capture_safe_upper_bound = _capture_safe_expert_token_upper_bound(
+            max_tokens_per_expert, total_num_tokens, topk
+        )
+        return estimate, capture_safe_upper_bound
 
     def apply(
         self,
@@ -457,7 +496,7 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
 
         workspace1 = _resize_cache(workspace13, (E, max_num_tokens, N))
 
-        expected_m = self.estimate_expected_m(
+        expected_m, capture_safe_upper_bound = self.estimate_expected_m_bounds(
             global_num_experts=global_num_experts,
             max_tokens_per_expert=max_num_tokens,
             topk=topk_ids.size(-1),
@@ -467,7 +506,9 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
         # real masked M and select an invalid DeepGEMM launch shape. Preserve
         # the estimate for tuning, but never let it understate live expert
         # rows.
-        expected_m = _expected_m_with_actual_floor(expected_m, expert_num_tokens)
+        expected_m = _expected_m_with_actual_floor(
+            expected_m, expert_num_tokens, capture_safe_upper_bound
+        )
         fp8_m_grouped_gemm_nt_masked(
             (a1q, a1q_scale),
             (w1, self.w1_scale),
