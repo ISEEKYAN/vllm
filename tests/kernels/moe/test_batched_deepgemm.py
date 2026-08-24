@@ -58,15 +58,16 @@ def test_expected_m_capture_uses_graph_bound_without_host_sync(monkeypatch):
 
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
 
-    # The captured buffer may hold 4096 rows per expert, but a graph for 12
-    # input tokens at top-k 8 can route at most 96 rows to any one expert.
-    graph_bound = _capture_safe_expert_token_upper_bound(4096, 12, 8)
-    assert graph_bound == 96
-    assert _expected_m_with_actual_floor(16, CaptureCounts(), graph_bound) == 96
+    # The captured buffer may hold 4096 rows per expert, but top-k produces
+    # distinct expert IDs, so 12 input tokens route at most 12 rows to one
+    # expert even when every token selects it. The kernel rounds M to 16.
+    graph_bound = _capture_safe_expert_token_upper_bound(4096, 12)
+    assert graph_bound == 16
+    assert _expected_m_with_actual_floor(16, CaptureCounts(), graph_bound) == 16
 
 
 def test_capture_safe_bound_is_clamped_to_expert_workspace():
-    assert _capture_safe_expert_token_upper_bound(128, 1000, 8) == 128
+    assert _capture_safe_expert_token_upper_bound(128, 1000) == 128
 
 
 @pytest.mark.skipif(not is_deep_gemm_supported(), reason="Requires deep_gemm kernels")

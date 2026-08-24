@@ -58,14 +58,14 @@ def _expected_m_with_actual_floor(
 def _capture_safe_expert_token_upper_bound(
     max_tokens_per_expert: int,
     total_input_tokens: int,
-    topk: int,
 ) -> int:
-    # Every routed row originates from one of the `total_input_tokens * topk`
-    # route slots. Clamp that graph-local bound to the per-expert workspace
-    # capacity so capture does not fall back to the engine-wide maximum M.
+    # torch.topk returns distinct expert IDs for each token, so a single expert
+    # receives at most one routed row per input token. Clamp that graph-local
+    # bound to the per-expert workspace capacity instead of using the much
+    # larger engine-wide maximum M.
     return max(
         16,
-        round_up(min(max_tokens_per_expert, total_input_tokens * topk), 16),
+        round_up(min(max_tokens_per_expert, total_input_tokens), 16),
     )
 
 
@@ -457,7 +457,7 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
         estimate = max(estimate, 16)
         estimate = min(max_tokens_per_expert, estimate)
         capture_safe_upper_bound = _capture_safe_expert_token_upper_bound(
-            max_tokens_per_expert, total_num_tokens, topk
+            max_tokens_per_expert, total_num_tokens
         )
         return estimate, capture_safe_upper_bound
 
