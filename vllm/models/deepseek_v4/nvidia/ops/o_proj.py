@@ -29,6 +29,13 @@ def compute_fp8_einsum_recipe() -> tuple[tuple[int, int, int], bool]:
     return einsum_recipe, tma_aligned_scales
 
 
+def use_triton_w8a8_fallback(
+    *, batch_invariant: bool, tma_aligned_scales: bool
+) -> bool:
+    """Use Triton only for the BI Hopper scale layout unsupported by DeepGEMM."""
+    return batch_invariant and not tma_aligned_scales
+
+
 def deep_gemm_fp8_o_proj(
     o: torch.Tensor,
     positions: torch.Tensor,
@@ -62,7 +69,10 @@ def deep_gemm_fp8_o_proj(
     weight_scale = (
         wo_a.weight_scale if hasattr(wo_a, "weight_scale") else wo_a.weight_scale_inv
     )
-    if envs.VLLM_BATCH_INVARIANT and not tma_aligned_scales:
+    if use_triton_w8a8_fallback(
+        batch_invariant=envs.VLLM_BATCH_INVARIANT,
+        tma_aligned_scales=tma_aligned_scales,
+    ):
         # The BI DeepGEMM fork does not currently accept the grouped scale
         # layout used by fp8_einsum on Hopper. Preserve its verified W8A8
         # semantics with the deterministic block-scaled Triton kernel.
