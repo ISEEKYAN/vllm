@@ -274,6 +274,36 @@ def test_top_k_per_row(
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
 @torch.inference_mode()
+@pytest.mark.parametrize("row_start", [0, 7, 100])
+def test_top_k_per_row_prefill_indices_are_row_relative(row_start: int) -> None:
+    """Prefill returns indices relative to row_start, not absolute ones."""
+    rows, cols, top_k = 4, 512, 64
+    torch.manual_seed(0)
+    logits = torch.randn((rows, cols), dtype=torch.float32, device="cuda")
+    row_starts = torch.full((rows,), row_start, dtype=torch.int32, device="cuda")
+    row_ends = torch.full((rows,), cols, dtype=torch.int32, device="cuda")
+
+    indices = torch.empty((rows, top_k), dtype=torch.int32, device="cuda")
+    ops.top_k_per_row_prefill(
+        logits,
+        row_starts,
+        row_ends,
+        indices,
+        rows,
+        logits.stride(0),
+        logits.stride(1),
+        top_k,
+    )
+    torch.cuda.synchronize()
+
+    expected = torch.topk(logits[:, row_start:], top_k, dim=1).indices.int()
+    torch.testing.assert_close(
+        indices.sort(dim=1).values, expected.sort(dim=1).values
+    )
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@torch.inference_mode()
 def test_top_k_per_row_prefill_ties_use_source_index() -> None:
     top_k = 64
     logits = torch.ones((4, 512), dtype=torch.float32, device="cuda")

@@ -43,16 +43,16 @@ __global__ __launch_bounds__(kThreads) void deterministic_top_k_per_row_prefill(
   for (int item = 0; item < kItemsPerThread; ++item) {
     const int local_index = item * kThreads + threadIdx.x;
     if (row_start + local_index < row_end) {
-      const int absolute_index = row_start + local_index;
       const float score =
           logits[static_cast<int64_t>(row) * stride0 +
-                 static_cast<int64_t>(absolute_index) * stride1];
+                 static_cast<int64_t>(row_start + local_index) * stride1];
       // Descending score, then ascending source index. The key is unique, so
       // neither candidate selection nor output depends on warp scheduling.
+      // The index is row-relative, matching the non-deterministic path.
       score_keys[item] =
           (static_cast<uint64_t>(ordered_float_bits(score)) << 32) |
           static_cast<uint32_t>(0xffffffffU -
-                                static_cast<uint32_t>(absolute_index));
+                                static_cast<uint32_t>(local_index));
     } else {
       score_keys[item] = 0;
     }
