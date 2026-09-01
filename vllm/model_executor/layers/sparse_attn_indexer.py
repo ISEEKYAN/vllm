@@ -45,6 +45,28 @@ RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 MXFP4_BLOCK_SIZE = 32
 
 
+def _top_k_per_row_prefill(
+    logits: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    indices: torch.Tensor,
+    num_rows: int,
+    stride0: int,
+    stride1: int,
+    top_k: int,
+) -> None:
+    ops.top_k_per_row_prefill(
+        logits,
+        row_starts,
+        row_ends,
+        indices,
+        num_rows,
+        stride0,
+        stride1,
+        top_k,
+    )
+
+
 def _assert_cutedsl_dcp_merge_supported(
     logits: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -506,7 +528,7 @@ def sparse_attn_indexer(
                         clean_logits=False,
                     )
                 num_rows = logits.shape[0]
-                ops.top_k_per_row_prefill(
+                _top_k_per_row_prefill(
                     logits,
                     cu_seqlen_ks,
                     cu_seqlen_ke,
@@ -627,7 +649,24 @@ def sparse_attn_indexer(
             1024,
             2048,
         )
-        if use_cooperative_topk:
+        if envs.VLLM_BATCH_INVARIANT:
+            # Match prefill's selector as well as its DeepGEMM score kernel.
+            # At C128 position 2051 there are 513 candidates for top-512, so
+            # score/selection differences that were hidden on shorter rows
+            # become observable in the chosen KV set.
+            row_starts = decode_metadata.row_starts[:num_rows]
+            row_ends = seq_lens.reshape(-1)[:num_rows].contiguous()
+            _top_k_per_row_prefill(
+                logits,
+                row_starts,
+                row_ends,
+                topk_indices,
+                num_rows,
+                logits.stride(0),
+                logits.stride(1),
+                topk_tokens,
+            )
+        elif use_cooperative_topk:
             workspace_manager = current_workspace_manager()
             (topk_workspace,) = workspace_manager.get_simultaneous(
                 ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),

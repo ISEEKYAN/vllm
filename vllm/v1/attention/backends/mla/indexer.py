@@ -496,6 +496,10 @@ class DeepSeekV32IndexerDecodeMetadata:
     decode_lens: torch.Tensor
     requires_padding: bool
     schedule_metadata: torch.Tensor
+    # All decode rows start at column zero for the ragged prefill-style Top-K
+    # selector.  Keep a persistent zero buffer so every invocation (including
+    # CUDA Graph replay) can reuse it without launching a fill kernel.
+    row_starts: torch.Tensor
     global_seq_lens: torch.Tensor | None = None
     indices: torch.Tensor | None = None
 
@@ -644,6 +648,11 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         # (B, max_decode_len) at runtime, keeping context_lens contiguous even
         # when max_decode_len is smaller than next_n.
         self.decode_seq_lens_buffer = torch.zeros(
+            (scheduler_config.max_num_batched_tokens,),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.decode_row_starts_buffer = torch.zeros(
             (scheduler_config.max_num_batched_tokens,),
             dtype=torch.int32,
             device=self.device,
@@ -1112,6 +1121,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 requires_padding=requires_padding,
                 schedule_metadata=schedule_metadata,
                 indices=decode_indices,
+                row_starts=self.decode_row_starts_buffer[:num_decode_tokens],
                 global_seq_lens=global_seq_lens_for_decode,
             )
 

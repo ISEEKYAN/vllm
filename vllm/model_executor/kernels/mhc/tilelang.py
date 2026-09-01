@@ -1,8 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+
 import torch
 
 from vllm.utils.torch_utils import direct_register_custom_op
+
+
+def _batch_invariant_enabled() -> bool:
+    return os.environ.get("VLLM_BATCH_INVARIANT") == "1"
 
 
 def _torch_hc_prenorm_gemm(
@@ -169,7 +175,9 @@ def mhc_pre_tilelang(
         # these numbers are from deepgemm kernel impl
         block_k = 64
         block_m = 64
-        n_splits = compute_num_split(block_k, hc_hidden_size, cdiv(num_tokens, block_m))
+        # keep the split-k factor independent of the batch
+        split_tokens = 1 if _batch_invariant_enabled() else num_tokens
+        n_splits = compute_num_split(block_k, hc_hidden_size, cdiv(split_tokens, block_m))
     else:
         n_splits = 1
 
@@ -348,7 +356,9 @@ def mhc_pre_broadcast_tilelang(
     residual_flat = residual
     num_tokens = residual.shape[0]
 
-    n_splits = compute_num_split(64, hidden_size, cdiv(num_tokens, 64))
+    # keep the split-k factor independent of the batch
+    split_tokens = 1 if _batch_invariant_enabled() else num_tokens
+    n_splits = compute_num_split(64, hidden_size, cdiv(split_tokens, 64))
 
     residual_out = torch.empty(
         num_tokens, hc_mult, hidden_size, dtype=torch.bfloat16, device=residual.device
@@ -461,6 +471,32 @@ def mhc_fused_post_pre_tilelang(
         comb_mix_cur: shape (..., hc_mult, hc_mult)
         layer_input_cur: shape (..., hidden_size)
     """
+
+    if _batch_invariant_enabled() and x.shape[0] > 1:
+        token_outputs = [
+            mhc_fused_post_pre_tilelang(
+                x[index : index + 1],
+                residual[index : index + 1],
+                post_layer_mix[index : index + 1],
+                comb_res_mix[index : index + 1],
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                n_splits,
+                tile_n,
+                norm_weight,
+                norm_eps,
+            )
+            for index in range(x.shape[0])
+        ]
+        return tuple(
+            torch.cat(parts, dim=0) for parts in zip(*token_outputs, strict=True)
+        )
 
     from vllm.model_executor.kernels.mhc.tilelang_kernels import (
         compute_num_split,
