@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import functools
 import math
 import os
 from collections.abc import Callable
@@ -129,15 +130,40 @@ def matmul_kernel_persistent(
         tl.store(c_ptrs, c, mask=c_mask)
 
 
+@functools.cache
+def _bi_gemm() -> Callable[..., torch.Tensor]:
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        require_batch_invariant_quant_kernel,
+    )
+
+    require_batch_invariant_quant_kernel()
+    return torch.ops.vllm_batch_invariant.bi_gemm
+
+
 def matmul_persistent(
     a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None
 ):
-    # Check constraints.
+    """Batch-invariant ``a @ b (+ bias)`` for 2D operands.
+
+    On CUDA this is the ``bi_gemm`` kernel (csrc/batch_invariant/bi_gemm.cu):
+    fp32 accumulation in ascending K from identical MMA instructions, with a
+    split-K schedule chosen from (K, N) only and reduced in fixed order, so
+    row m of the result depends only on row m of ``a``. Other platforms use
+    the Triton persistent kernel.
+    """
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     assert a.dtype == b.dtype, "Incompatible dtypes"
     assert bias is None or bias.dim() == 1, (
         "Currently assuming bias is 1D, let Horace know if you run into this"
     )
+    if current_platform.is_cuda():
+        return _bi_gemm()(a, b, bias)
+    return _matmul_persistent_triton(a, b, bias)
+
+
+def _matmul_persistent_triton(
+    a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None
+):
     NUM_SMS = num_compute_units(a.device.index)
     M, K = a.shape
     K, N = b.shape
