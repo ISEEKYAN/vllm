@@ -23,6 +23,12 @@ def dequantize_and_gather_k_cache_cutedsl(
     block_size: int,
     offset: int,
 ) -> None:
+    # grid.y: a CTA's 4 warps take one row each, so ceil(max_rows / 4) CTAs per
+    # request already give every warp a row; past that, extra CTAs only add
+    # tail cost. Independently, the whole grid is held near 8192 CTAs, which is
+    # where measured throughput plateaus on GB200 for every request count.
+    # Both terms bind: without the first, 32-request decode runs 7x slower;
+    # without the second, a 262k-row single-request gather runs 3.9x slower.
     DequantGatherKCacheKernel.compile(
         block_size=block_size,
         has_gather_lens=gather_lens is not None,
@@ -73,7 +79,12 @@ class DequantGatherKCacheKernel:
             ),
         )
 
-        grid = (out.shape[0], 1024, 1)
+        num_reqs = out.shape[0]
+        max_rows = out.shape[1] - offset
+        num_workers = cutlass.max(
+            1, cutlass.min(cute.ceil_div(max_rows, 4), cute.ceil_div(8192, num_reqs))
+        )
+        grid = (num_reqs, num_workers, 1)
         self.kernel(
             out,
             k_data,
@@ -326,6 +337,7 @@ class DequantGatherKCacheKernel:
             gather_lens,
             block_table,
             Int32(0),
+            Int32(1024),
             stream,
             options="--enable-tvm-ffi",
         )
