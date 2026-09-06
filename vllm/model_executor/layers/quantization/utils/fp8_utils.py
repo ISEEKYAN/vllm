@@ -53,9 +53,7 @@ def _batch_invariant_kernel_path() -> Path:
 def _load_batch_invariant_kernel_library(path: str) -> None:
     library = Path(path).expanduser().resolve()
     if not library.is_file():
-        raise RuntimeError(
-            f"batch-invariant kernel library does not exist: {library}"
-        )
+        raise RuntimeError(f"batch-invariant kernel library does not exist: {library}")
     try:
         torch.ops.load_library(str(library))
         _ = torch.ops.vllm_batch_invariant.fused_silu_mul_per_token_group_quant
@@ -65,11 +63,23 @@ def _load_batch_invariant_kernel_library(path: str) -> None:
         ) from exc
 
 
-def is_batch_invariant_quant_kernel_enabled() -> bool:
+def batch_invariant_quant_kernel_available() -> bool:
     path = _batch_invariant_kernel_path()
     if not path.is_file():
         return False
     _load_batch_invariant_kernel_library(str(path))
+    return True
+
+
+def is_batch_invariant_quant_kernel_enabled() -> bool:
+    if not envs.VLLM_BATCH_INVARIANT:
+        return False
+    if not batch_invariant_quant_kernel_available():
+        return False
+    logger.info_once(
+        "Using the batch-invariant fused SiLU/quant kernel from %s",
+        _batch_invariant_kernel_path(),
+    )
     return True
 
 
@@ -102,9 +112,7 @@ def fused_silu_mul_per_token_group_quant_fp8(
             f"invalid batch-invariant activation shape: {tuple(input.shape)}"
         )
     if not input.is_contiguous() or input.dtype != torch.bfloat16:
-        raise ValueError(
-            "batch-invariant activation input must be contiguous BF16"
-        )
+        raise ValueError("batch-invariant activation input must be contiguous BF16")
 
     hidden = input.shape[-1] // 2
     groups = hidden // group_size
