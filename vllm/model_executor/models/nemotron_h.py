@@ -593,6 +593,10 @@ class NemotronHModel(nn.Module, EagleModelMixin):
         )
 
         self.norm_f = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        if getattr(config, "nemotron_shared_norms", False):
+            from .nemotron_h_alignment import install_inference_norms
+
+            install_inference_norms(self)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -781,6 +785,7 @@ class NemotronHForCausalLM(
             state_size=hf_config.ssm_state_size,
             conv_kernel=hf_config.conv_kernel,
             num_spec=vllm_config.num_speculative_tokens,
+            chunk_size=vllm_config.model_config.get_mamba_chunk_size(),
         )
         if cache_config.use_replayssm:
             return MambaStateShapeCalculator.append_replayssm_ring(
@@ -887,5 +892,18 @@ class NemotronHForCausalLM(
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        def per_expert_weights():
+            for name, weight in weights:
+                prefix, sep, projection = name.rpartition(".experts.")
+                if sep and projection in ("up_proj", "down_proj"):
+                    if weight.ndim != 3:
+                        raise ValueError(f"Expected stacked expert weights: {name}")
+                    for expert_id, expert in enumerate(weight.unbind(0)):
+                        yield (
+                            f"{prefix}.experts.{expert_id}.{projection}.weight", expert
+                        )
+                else:
+                    yield name, weight
+
         loader = AutoWeightsLoader(self, skip_prefixes=["mtp"])
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        return loader.load_weights(per_expert_weights(), mapper=self.hf_to_vllm_mapper)
