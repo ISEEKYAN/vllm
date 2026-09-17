@@ -96,7 +96,7 @@ for output in outputs:
     print(f"Generated: {generated_text!r}\n")
 ```
 
-## Mamba2 Models
+## Nemotron Mamba2 layers
 
 Mamba2 layers normally run two different kernels: a chunked scan for prefill
 and a recurrent single-token update for decode. The two are not bit-identical,
@@ -113,13 +113,11 @@ see the chunk grid of a single-shot prefill. Decode computes only the new
 token's output row from the buffered inputs and the boundary state, with
 row-gated kernels that perform the same fp32 arithmetic as the chunked scan in
 the same order, and folds a chunk into the boundary state when it completes.
-The SSM computation produces identical bits on every path. Nothing is
-configured per model: every model built on `MambaMixer2` behaves this way, and
-in a hybrid model the attention layers keep using their own batch-invariant
-kernels.
+This migration targets Nemotron-H only. Its attention layers keep using their
+own batch-invariant kernels; other Mamba2 model integrations are out of scope.
 
 ```bash
-VLLM_BATCH_INVARIANT=1 vllm serve <mamba2-model> --no-enable-prefix-caching
+VLLM_BATCH_INVARIANT=1 vllm serve <nemotron-checkpoint> --no-enable-prefix-caching
 ```
 
 Current limitations (the engine fails at startup otherwise): prefix caching
@@ -151,7 +149,6 @@ Batch invariance has been tested and verified on the following models:
 - **GPT-OSS**: `openai/gpt-oss-20b`, `openai/gpt-oss-120b`
 - **Mistral**: `mistralai/Mistral-7B-v0.3`
 - **Phi series**: `microsoft/Phi-3.5-mini-instruct`
-- **Mamba2**: `AntonV/mamba2-130m-hf`; **Mamba2 + attention hybrid**: `ibm-granite/granite-4.0-h-350m` (including scheduler preemption)
 
 Other models may also work, but these have been explicitly validated. If you encounter issues with a specific model, please report them on the [GitHub issue tracker](https://github.com/vllm-project/vllm/issues/new/choose).
 

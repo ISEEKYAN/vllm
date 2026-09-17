@@ -45,12 +45,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.sequence import IntermediateTensors
 
-from .interfaces import (
-    HasInnerState,
-    IsHybrid,
-    MambaStateShapes,
-    SupportsMambaPrefixCaching,
-)
+from .interfaces import HasInnerState, IsHybrid, SupportsMambaPrefixCaching
 from .utils import AutoWeightsLoader, WeightsMapper, maybe_prefix
 
 
@@ -837,7 +832,7 @@ class Zamba2ForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsMambaPrefixC
     def get_mamba_state_dtype_from_config(
         cls,
         vllm_config: "VllmConfig",
-    ) -> tuple[torch.dtype, ...]:
+    ) -> tuple[torch.dtype, torch.dtype]:
         return MambaStateDtypeCalculator.mamba2_state_dtype(
             vllm_config.model_config.dtype,
             vllm_config.cache_config.mamba_cache_dtype,
@@ -848,7 +843,7 @@ class Zamba2ForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsMambaPrefixC
     def get_mamba_state_shape_from_config(
         cls,
         vllm_config: "VllmConfig",
-    ) -> MambaStateShapes:
+    ) -> tuple[tuple[int, int], tuple[int, int, int]]:
         """Calculate shapes for Mamba's convolutional and state caches.
 
         Args:
@@ -872,7 +867,6 @@ class Zamba2ForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsMambaPrefixC
             head_dim=hf_config.mamba_headdim,
             state_size=hf_config.mamba_d_state,
             conv_kernel=hf_config.mamba_d_conv,
-            chunk_size=vllm_config.model_config.get_mamba_chunk_size(),
         )
 
     @classmethod
