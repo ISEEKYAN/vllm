@@ -1,7 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import os
-
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -109,7 +107,7 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
         return self._num_dispatchers
 
     def output_is_reduced(self) -> bool:
-        return os.environ.get("NEMOTRON_EP_SLOT_DIAGNOSTIC") == "1"
+        return False
 
     def prepare(
         self,
@@ -206,14 +204,9 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
             apply_router_weight_on_input=apply_router_weight_on_input,
         )
 
-        if os.environ.get("NEMOTRON_EP_SLOT_DIAGNOSTIC") == "1":
-            output.copy_(out[: output.shape[0]])
-        else:
-            output.copy_(
-                get_ep_group().combine(
-                    out, is_sequence_parallel=self.is_sequence_parallel
-                )
-            )
+        output.copy_(
+            get_ep_group().combine(out, is_sequence_parallel=self.is_sequence_parallel)
+        )
 
 
 class MoEPrepareAndFinalizeNaiveDPEPMonolithic(mk.FusedMoEPrepareAndFinalizeMonolithic):

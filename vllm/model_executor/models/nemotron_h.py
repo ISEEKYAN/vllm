@@ -548,12 +548,6 @@ class NemotronHModel(nn.Module, EagleModelMixin):
     ):
         super().__init__()
 
-        from vllm.model_executor.layers.batch_invariant_cublaslt import (
-            install_pinned_cublaslt,
-        )
-
-        install_pinned_cublaslt()
-
         config: NemotronHConfig = vllm_config.model_config.hf_config
         model_config = vllm_config.model_config
         cache_config = vllm_config.cache_config

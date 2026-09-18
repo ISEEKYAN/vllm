@@ -1300,15 +1300,9 @@ def get_default_config(
     block_shape: list[int] | None = None,
 ) -> dict[str, int]:
     if envs.VLLM_BATCH_INVARIANT:
-        if M <= 512:
-            block_m = 16
-        elif M <= 4096:
-            block_m = 64
-        else:
-            block_m = 128
         return {
-            "BLOCK_SIZE_M": block_m,
-            "BLOCK_SIZE_N": 64 if block_m == 16 else 128,
+            "BLOCK_SIZE_M": 64,
+            "BLOCK_SIZE_N": 64,
             "BLOCK_SIZE_K": 32,
             "GROUP_SIZE_M": 8,
             "SPLIT_K": 1,

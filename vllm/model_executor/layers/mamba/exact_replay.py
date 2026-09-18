@@ -12,7 +12,6 @@ chunked-scan kernels see exactly the chunk grid of a single-shot prefill, so
 prefill, chunked prefill and decode produce identical bits.
 """
 
-import os
 from typing import NamedTuple
 
 import torch
@@ -26,7 +25,6 @@ from vllm.model_executor.layers.mamba.ops.ssd_emit import (
     _fold_chunk_fwd,
     _workspace_chunk_cumsum_fwd,
 )
-from vllm.triton_utils import tl, triton
 
 
 class ExactReplayBuffers(NamedTuple):
@@ -43,156 +41,6 @@ class ExactReplayBuffers(NamedTuple):
     """``(num_slots, chunk_size, nheads)``, raw dt before bias and softplus."""
     B: torch.Tensor
     """``(num_slots, chunk_size, ngroups, dstate)``."""
-
-
-@triton.jit
-def _scatter_replay_buffers_kernel(
-    x_ptr,
-    dt_ptr,
-    b_ptr,
-    x_buffer_ptr,
-    dt_buffer_ptr,
-    b_buffer_ptr,
-    source_rows_ptr,
-    slots_ptr,
-    positions_ptr,
-    x_row_stride,
-    dt_row_stride,
-    b_row_stride,
-    x_slot_stride,
-    x_pos_stride,
-    dt_slot_stride,
-    dt_pos_stride,
-    b_slot_stride,
-    b_pos_stride,
-    X_WIDTH: tl.constexpr,
-    DT_WIDTH: tl.constexpr,
-    B_WIDTH: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    row = tl.program_id(0)
-    offsets = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    source_row = tl.load(source_rows_ptr + row).to(tl.int64)
-    slot = tl.load(slots_ptr + row).to(tl.int64)
-    position = tl.load(positions_ptr + row).to(tl.int64)
-
-    x_mask = offsets < X_WIDTH
-    x = tl.load(x_ptr + source_row * x_row_stride + offsets, mask=x_mask)
-    tl.store(
-        x_buffer_ptr + slot * x_slot_stride + position * x_pos_stride + offsets,
-        x,
-        mask=x_mask,
-    )
-    dt_mask = offsets < DT_WIDTH
-    dt = tl.load(dt_ptr + source_row * dt_row_stride + offsets, mask=dt_mask)
-    tl.store(
-        dt_buffer_ptr + slot * dt_slot_stride + position * dt_pos_stride + offsets,
-        dt,
-        mask=dt_mask,
-    )
-    b_mask = offsets < B_WIDTH
-    b = tl.load(b_ptr + source_row * b_row_stride + offsets, mask=b_mask)
-    tl.store(
-        b_buffer_ptr + slot * b_slot_stride + position * b_pos_stride + offsets,
-        b,
-        mask=b_mask,
-    )
-
-
-@triton.jit
-def _scatter_replay_states_kernel(
-    source_ptr,
-    state_ptr,
-    source_rows_ptr,
-    slots_ptr,
-    source_row_stride,
-    state_slot_stride,
-    WIDTH: tl.constexpr,
-    ZERO: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    row = tl.program_id(0)
-    offsets = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < WIDTH
-    slot = tl.load(slots_ptr + row).to(tl.int64)
-    if ZERO:
-        value = tl.zeros((BLOCK,), dtype=tl.float32)
-    else:
-        source_row = tl.load(source_rows_ptr + row).to(tl.int64)
-        value = tl.load(
-            source_ptr + source_row * source_row_stride + offsets,
-            mask=mask,
-        )
-    tl.store(state_ptr + slot * state_slot_stride + offsets, value, mask=mask)
-
-
-def _scatter_replay_buffers(
-    x: torch.Tensor,
-    dt: torch.Tensor,
-    B: torch.Tensor,
-    buffers: ExactReplayBuffers,
-    source_rows: torch.Tensor,
-    slots: torch.Tensor,
-    positions: torch.Tensor,
-) -> None:
-    block = 256
-    x_width = x.shape[1] * x.shape[2]
-    dt_width = dt.shape[1]
-    b_width = B.shape[1] * B.shape[2]
-    grid = (
-        source_rows.numel(),
-        triton.cdiv(max(x_width, dt_width, b_width), block),
-    )
-    _scatter_replay_buffers_kernel[grid](
-        x,
-        dt,
-        B,
-        buffers.x,
-        buffers.dt,
-        buffers.B,
-        source_rows,
-        slots,
-        positions,
-        x.stride(0),
-        dt.stride(0),
-        B.stride(0),
-        buffers.x.stride(0),
-        buffers.x.stride(1),
-        buffers.dt.stride(0),
-        buffers.dt.stride(1),
-        buffers.B.stride(0),
-        buffers.B.stride(1),
-        X_WIDTH=x_width,
-        DT_WIDTH=dt_width,
-        B_WIDTH=b_width,
-        BLOCK=block,
-        num_warps=4,
-    )
-
-
-def _scatter_replay_states(
-    source: torch.Tensor,
-    states: torch.Tensor,
-    source_rows: torch.Tensor,
-    slots: torch.Tensor,
-    *,
-    zero: bool = False,
-) -> None:
-    block = 256
-    width = states.shape[1] * states.shape[2] * states.shape[3]
-    grid = (slots.numel(), triton.cdiv(width, block))
-    _scatter_replay_states_kernel[grid](
-        source,
-        states,
-        source_rows,
-        slots,
-        source.stride(0),
-        states.stride(0),
-        WIDTH=width,
-        ZERO=zero,
-        BLOCK=block,
-        num_warps=4,
-    )
 
 
 def exact_replay_ssd(
@@ -288,48 +136,17 @@ def exact_replay_ssd(
     )
     if augmented:
         out.copy_(out_aug[meta.step_dst])
-    fused_scatter = os.environ.get("NEMOTRON_EXACT_REPLAY_FUSED_SCATTER") == "1"
     if meta.boundary_rows.numel() > 0:
-        boundary_slots = slots64[meta.boundary_rows]
-        if fused_scatter:
-            _scatter_replay_states(
-                states,
-                ssm_state,
-                meta.boundary_chunk_idx,
-                boundary_slots,
-            )
-        else:
-            ssm_state[boundary_slots] = states[meta.boundary_chunk_idx]
+        ssm_state[slots64[meta.boundary_rows]] = states[meta.boundary_chunk_idx]
     if meta.zero_state_rows.numel() > 0:
         # No chunk completed yet: a zero state lets a single-row decode read
         # the slot as its boundary state without a separate flag.
-        zero_slots = slots64[meta.zero_state_rows]
-        if fused_scatter:
-            _scatter_replay_states(
-                ssm_state,
-                ssm_state,
-                zero_slots,
-                zero_slots,
-                zero=True,
-            )
-        else:
-            ssm_state[zero_slots] = 0
+        ssm_state[slots64[meta.zero_state_rows]] = 0
     if meta.store_src.numel() > 0:
         store_slot = slots64[meta.store_seq]
-        if fused_scatter:
-            _scatter_replay_buffers(
-                x_aug,
-                dt_aug,
-                B_aug,
-                buffers,
-                meta.store_src,
-                store_slot,
-                meta.store_pos,
-            )
-        else:
-            buffers.x[store_slot, meta.store_pos] = x_aug[meta.store_src]
-            buffers.dt[store_slot, meta.store_pos] = dt_aug[meta.store_src]
-            buffers.B[store_slot, meta.store_pos] = B_aug[meta.store_src]
+        buffers.x[store_slot, meta.store_pos] = x_aug[meta.store_src]
+        buffers.dt[store_slot, meta.store_pos] = dt_aug[meta.store_src]
+        buffers.B[store_slot, meta.store_pos] = B_aug[meta.store_src]
 
 
 def exact_replay_emit(

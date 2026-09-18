@@ -516,14 +516,7 @@ class RoutedExperts(PluggableLayer):
         else:
             assert shard_id == "w3"
             expert_data = expert_data.narrow(shard_dim, shard_size, shard_size)
-        try:
-            hidden_dim = self._get_hidden_dim(shard_dim, expert_data.ndim)
-        except ValueError as exc:
-            raise ValueError(
-                f"{exc}; shard_id={shard_id}, "
-                f"expert_data.shape={tuple(expert_data.shape)}, "
-                f"loaded_weight.shape={tuple(loaded_weight.shape)}"
-            ) from exc
+        hidden_dim = self._get_hidden_dim(shard_dim, expert_data.ndim)
         expert_data = self._narrow_expert_data_for_padding(
             expert_data,
             loaded_weight,

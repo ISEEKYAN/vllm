@@ -157,7 +157,7 @@ def matmul_persistent(
 
     configs = {
         torch.bfloat16: {
-            "BLOCK_SIZE_M": 32,
+            "BLOCK_SIZE_M": 128,
             "BLOCK_SIZE_N": 128,
             "BLOCK_SIZE_K": 64,
             "GROUP_SIZE_M": 8,
