@@ -124,7 +124,9 @@ def should_nccl_symm_mem_allreduce(world_size: int, input_tensor: torch.Tensor) 
         is_symmetric_memory_enabled,
     )
 
-    if envs.VLLM_BATCH_INVARIANT:
+    if envs.VLLM_BATCH_INVARIANT and not bool(
+        int(os.getenv("VLLM_BATCH_INVARIANT_ALLOW_SYMM_MEM", "0"))
+    ):
         return False
 
     if not is_symmetric_memory_enabled():
@@ -153,7 +155,9 @@ def should_nccl_symm_mem_ag_rs() -> bool:
         is_symmetric_memory_enabled,
     )
 
-    if envs.VLLM_BATCH_INVARIANT:
+    if envs.VLLM_BATCH_INVARIANT and not bool(
+        int(os.getenv("VLLM_BATCH_INVARIANT_ALLOW_SYMM_MEM", "0"))
+    ):
         return False
     return is_symmetric_memory_enabled()
 

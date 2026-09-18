@@ -548,6 +548,12 @@ class NemotronHModel(nn.Module, EagleModelMixin):
     ):
         super().__init__()
 
+        from vllm.model_executor.layers.batch_invariant_cublaslt import (
+            install_pinned_cublaslt,
+        )
+
+        install_pinned_cublaslt()
+
         config: NemotronHConfig = vllm_config.model_config.hf_config
         model_config = vllm_config.model_config
         cache_config = vllm_config.cache_config
@@ -900,7 +906,8 @@ class NemotronHForCausalLM(
                         raise ValueError(f"Expected stacked expert weights: {name}")
                     for expert_id, expert in enumerate(weight.unbind(0)):
                         yield (
-                            f"{prefix}.experts.{expert_id}.{projection}.weight", expert
+                            f"{prefix}.experts.{expert_id}.{projection}.weight",
+                            expert,
                         )
                 else:
                     yield name, weight

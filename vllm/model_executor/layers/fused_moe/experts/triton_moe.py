@@ -565,17 +565,20 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             from vllm.distributed import get_ep_group
 
             parallel = self.moe_config.moe_parallel_config
+            if not parallel.use_ep:
+                ops.moe_sum(input, output)
+                return
             assert parallel.use_ep and parallel.tp_size == 1
             assert parallel.all2all_backend == "allgather_reducescatter"
             assert input.ndim == 3 and input.shape[1:] == (6, 2688)
             assert input.dtype == torch.bfloat16
             group = get_ep_group()
-            # Each slot has one expert owner; join slots before BF16 reduction.
-            joined = group.all_reduce(input)
-            ops.moe_sum(joined, output)
-            # The existing finalize still sums rank outputs: contribute once.
-            if group.rank_in_group != 0:
-                output.zero_()
+            # Each slot has one expert owner. Reduce-scatter the slots first,
+            # then preserve their order in the local BF16 reduction. Finalize
+            # consumes the packed local rows without another collective.
+            local_slots = group.combine(input)
+            output.zero_()
+            ops.moe_sum(local_slots, output[: local_slots.shape[0]])
             return
         ops.moe_sum(input, output)
 

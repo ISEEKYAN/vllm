@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import os
+
 import torch
 from torch.distributed import ProcessGroup
 
@@ -47,7 +49,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
             global_world_size,
             use_all2all=use_all2all,
         )
-        if "tp" not in unique_name:
+        group_kind = unique_name.split(":")[0]
+        use_batch_invariant_ep_collectives = (
+            group_kind in ("dp", "ep")
+            and os.environ.get("VLLM_BATCH_INVARIANT_CUSTOM_AG_RS") == "1"
+        )
+        if "tp" not in unique_name and not use_batch_invariant_ep_collectives:
             # custom allreduce or torch symm mem can be used only by tp
             use_custom_allreduce = False
             use_torch_symm_mem = False
@@ -56,7 +63,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
         else:
             from vllm.distributed.parallel_state import _ENABLE_CUSTOM_ALL_REDUCE
 
-            use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
+            use_custom_allreduce = (
+                True
+                if use_batch_invariant_ep_collectives
+                else _ENABLE_CUSTOM_ALL_REDUCE
+            )
             use_torch_symm_mem = envs.VLLM_ALLREDUCE_USE_SYMM_MEM
             use_flashinfer_allreduce = envs.VLLM_ALLREDUCE_USE_FLASHINFER
             use_aiter_allreduce = use_custom_allreduce and bool(
@@ -116,12 +127,19 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         if use_custom_allreduce and self.aiter_ar_comm is None and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
+            mnnvl_sizes = {}
+            if use_batch_invariant_ep_collectives:
+                mnnvl_sizes = {
+                    "max_mnnvl_all_gather_size": 16 * 1024 * 1024,
+                    "max_mnnvl_reduce_scatter_size": 512 * 1024 * 1024,
+                }
             self.ca_comm = CustomAllreduce(
                 group=self.cpu_group,
                 device=self.device,
                 symm_mem_enabled=(
                     self.symm_mem_comm is not None and not self.symm_mem_comm.disabled
                 ),
+                **mnnvl_sizes,
             )
 
         if use_custom_allreduce and self.world_size > 1 and current_platform.is_rocm():
@@ -359,6 +377,16 @@ class CudaCommunicator(DeviceCommunicatorBase):
         # gather-before-GEMM uses dim=0 with tp-aligned (uniform) shards.
         if dim < 0:
             dim += input_.dim()
+        if dim == 0 and os.environ.get("VLLM_BATCH_INVARIANT_CUSTOM_AG_RS") == "1":
+            output = self.custom_all_gather(input_)
+            if output is not None:
+                logger.warning_once(
+                    "Using the custom MNNVL all-gather for batch-invariant EP."
+                )
+                return output
+            logger.warning_once(
+                "Custom MNNVL all-gather was requested but is unavailable."
+            )
         if dim == 0 and should_nccl_symm_mem_ag_rs():
             return self._all_gather_symm_mem(input_.contiguous())
 
@@ -400,6 +428,17 @@ class CudaCommunicator(DeviceCommunicatorBase):
         # the input_tensor contiguous. Possible bug in reduce_scatter_tensor?
         input_tensor = input_.movedim(0, dim).contiguous()
 
+        if os.environ.get("VLLM_BATCH_INVARIANT_CUSTOM_AG_RS") == "1":
+            output = self.custom_reduce_scatter(input_tensor)
+            if output is not None:
+                logger.warning_once(
+                    "Using the custom MNNVL reduce-scatter for batch-invariant EP."
+                )
+                return output.movedim(0, dim).contiguous()
+            logger.warning_once(
+                "Custom MNNVL reduce-scatter was requested but is unavailable."
+            )
+
         assert input_tensor.shape[0] % world_size == 0
         chunk_size = input_tensor.shape[0] // world_size
         output_shape = (chunk_size,) + input_tensor.shape[1:]
@@ -437,6 +476,36 @@ class CudaCommunicator(DeviceCommunicatorBase):
             assert input_tensor.shape[0] % world_size == 0
             chunk_size = input_tensor.shape[0] // world_size
         output_shape = (chunk_size,) + input_tensor.shape[1:]
+
+        if os.environ.get("VLLM_BATCH_INVARIANT_CUSTOM_AG_RS") == "1":
+            custom_input = input_tensor
+            max_size = None
+            if sizes is not None and sizes.count(sizes[0]) != len(sizes):
+                max_size = max(sizes)
+                padded_chunks = []
+                for chunk, size in zip(input_tensor.split(sizes, dim=0), sizes):
+                    if size == max_size:
+                        padded_chunks.append(chunk)
+                        continue
+                    padded = torch.zeros(
+                        (max_size,) + tuple(chunk.shape[1:]),
+                        dtype=chunk.dtype,
+                        device=chunk.device,
+                    )
+                    padded[:size].copy_(chunk)
+                    padded_chunks.append(padded)
+                custom_input = torch.cat(padded_chunks, dim=0)
+            output = self.custom_reduce_scatter(custom_input)
+            if output is not None:
+                logger.warning_once(
+                    "Using the custom MNNVL reduce-scatterv for batch-invariant EP."
+                )
+                if max_size is not None:
+                    output = output[:chunk_size]
+                return output.movedim(0, dim).contiguous()
+            logger.warning_once(
+                "Custom MNNVL reduce-scatterv was requested but is unavailable."
+            )
 
         # Symmetric memory is only used when all ranks have uniform sizes.
         # ncclCommWindowRegister is collective: asymmetric pool allocations
@@ -617,6 +686,104 @@ class CudaCommunicator(DeviceCommunicatorBase):
         # shape
         if sizes is not None and all(s == sizes[0] for s in sizes):
             sizes = None
+
+        def _custom_all_gather(input_tensor: torch.Tensor):
+            original_dtype = input_tensor.dtype
+            wire = input_tensor
+            if original_dtype in (torch.int32, torch.int64):
+                wire = input_tensor.view(torch.float32)
+            elif original_dtype == torch.int16:
+                wire = input_tensor.view(torch.float16)
+            output = self.custom_all_gather(wire)
+            if output is not None and wire.dtype != original_dtype:
+                output = output.view(original_dtype)
+            return output
+
+        if os.environ.get("VLLM_BATCH_INVARIANT_CUSTOM_AG_RS") == "1":
+            inputs = [input_] if isinstance(input_, torch.Tensor) else input_
+            max_size = max(sizes) if sizes is not None else None
+            custom_inputs = []
+            for inp in inputs:
+                if max_size is None or inp.shape[0] == max_size:
+                    custom_inputs.append(inp)
+                    continue
+                padded = torch.zeros(
+                    (max_size,) + tuple(inp.shape[1:]),
+                    dtype=inp.dtype,
+                    device=inp.device,
+                )
+                padded[: inp.shape[0]].copy_(inp)
+                custom_inputs.append(padded)
+
+            can_pack = (
+                not isinstance(input_, torch.Tensor)
+                and len(custom_inputs) > 1
+                and all(inp.ndim == 2 for inp in custom_inputs)
+                and all(inp.is_contiguous() for inp in custom_inputs)
+                and all(
+                    inp.dtype in (torch.bfloat16, torch.float32, torch.int64)
+                    for inp in custom_inputs
+                )
+                and all(
+                    inp.shape[0] == custom_inputs[0].shape[0]
+                    and inp.device == custom_inputs[0].device
+                    for inp in custom_inputs[1:]
+                )
+            )
+            if can_pack:
+                wire_inputs = [
+                    inp if inp.dtype == torch.bfloat16 else inp.view(torch.bfloat16)
+                    for inp in custom_inputs
+                ]
+                widths = [inp.shape[1] for inp in wire_inputs]
+                packed_output = self.custom_all_gather(torch.cat(wire_inputs, dim=1))
+                if packed_output is not None:
+                    logger.warning_once(
+                        "Using the packed custom MNNVL all-gatherv for "
+                        "batch-invariant EP."
+                    )
+                    if sizes is not None:
+                        assert max_size is not None
+                        packed_output = torch.cat(
+                            [
+                                packed_output[
+                                    index * max_size : index * max_size + size
+                                ]
+                                for index, size in enumerate(sizes)
+                            ],
+                            dim=0,
+                        )
+                    wire_outputs = packed_output.split(widths, dim=1)
+                    outputs = []
+                    for wire_output, inp in zip(wire_outputs, inputs):
+                        output = wire_output
+                        if inp.dtype != torch.bfloat16:
+                            output = output.view(inp.dtype)
+                        outputs.append(
+                            output.reshape((output.shape[0],) + inp.shape[1:])
+                        )
+                    return outputs
+            outputs = [_custom_all_gather(inp) for inp in custom_inputs]
+            if all(output is not None for output in outputs):
+                logger.warning_once(
+                    "Using the custom MNNVL all-gatherv for batch-invariant EP."
+                )
+                if sizes is not None:
+                    assert max_size is not None
+                    outputs = [
+                        torch.cat(
+                            [
+                                output[index * max_size : index * max_size + size]
+                                for index, size in enumerate(sizes)
+                            ],
+                            dim=0,
+                        )
+                        for output in outputs
+                    ]
+                return outputs[0] if isinstance(input_, torch.Tensor) else outputs
+            logger.warning_once(
+                "Custom MNNVL all-gatherv was requested but is unavailable."
+            )
 
         # Symmetric memory is only used when all ranks have uniform sizes.
         # ncclCommWindowRegister is collective: asymmetric pool allocations

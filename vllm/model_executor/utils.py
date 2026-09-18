@@ -69,11 +69,11 @@ def replace_parameter(
         new_tensor: New data of the new parameter, or None to set the parameter
             to None
         prefer_copy: If True and the existing parameter is compatible with
-            ``new_tensor`` (same shape, dtype, and device), copy ``new_tensor``
-            into the existing parameter in place rather than re-registering
-            a new parameter. This preserves the parameter's storage address
-            (``data_ptr``), which is required for captured CUDA graphs to
-            remain valid across weight updates (e.g. in RL training loops).
+            ``new_tensor`` (same number of elements, dtype, and device), reshape
+            and copy ``new_tensor`` into the existing parameter in place rather
+            than re-registering a new parameter. This preserves the parameter's
+            storage address (``data_ptr``), which is required for captured CUDA
+            graphs to remain valid across weight updates (e.g. in RL loops).
     """
     # should not be used on a tied/shared param
 
@@ -99,10 +99,13 @@ def replace_parameter(
     if (
         prefer_copy
         and old_param is not None
-        and old_param.shape == new_tensor.shape
+        and old_param.numel() == new_tensor.numel()
         and old_param.dtype == new_tensor.dtype
         and old_param.device == new_tensor.device
     ):
+        old_param.data = old_param.data.as_strided(
+            new_tensor.shape, new_tensor.stride()
+        )
         old_param.copy_(new_tensor)
         for attr_name, attr in new_tensor_attrs.items():
             setattr(old_param, attr_name, attr)
