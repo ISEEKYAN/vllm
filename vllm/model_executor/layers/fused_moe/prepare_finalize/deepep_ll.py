@@ -34,9 +34,7 @@ logger = init_logger(__name__)
 def dequant_fp8(
     expert_x_fp8: torch.Tensor, expert_x_scales: torch.Tensor
 ) -> torch.Tensor:
-    """
-    Return dequantized tensor in fp32
-    """
+    """Return dequantized tensor in fp32."""
     # TODO (varun) : Optimize leverage num_tokens_per_expert counts
     assert expert_x_fp8.is_contiguous()
     expert_x_scales = expert_x_scales.contiguous()
@@ -50,9 +48,7 @@ def dequant_fp8(
 
 
 class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
-    """
-    Prepare/Finalize using DeepEP low-latency kernels.
-    """
+    """Prepare/Finalize using DeepEP low-latency kernels."""
 
     # DeepEP low-latency kernels are compiled only for certain
     # specific hidden sizes.
@@ -226,6 +222,9 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
     def supports_async(self) -> bool:
         return True
 
+    def supports_rank_synchronous_token_staging(self) -> bool:
+        return True
+
     def prepare_async(
         self,
         a1: torch.Tensor,
@@ -303,6 +302,11 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             use_fp8=self.use_fp8_dispatch,
             round_scale=self.use_ue8m0_dispatch,
             use_ue8m0=self.use_ue8m0_dispatch,
+            # Slime's rollout/training alignment uses the DeepEP-align_fp8
+            # compatibility switch here.  It selects scalar_rn inside the
+            # special LL kernel so its FP8 q/scales match the official
+            # post-dispatch quantizer used by normal training DeepEP.
+            align_fp8_quantization=True,
             **(dict(use_nvfp4=True) if use_nvfp4 else dict()),
             **(
                 dict(x_global_scale=qc_a1_gscale_or_scale)

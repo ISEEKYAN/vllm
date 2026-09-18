@@ -69,6 +69,29 @@ def _gemm(a, b):
     return ll_bf16_gemm(a, b)
 
 
+def test_c1_pdl_kernel_is_selected_automatically(monkeypatch):
+    from vllm.model_executor.kernels.linear.cute_dsl import ll_bf16
+
+    calls = []
+
+    def default_kernel(hidden_states, router_weight, output_dtype):
+        calls.append(("default", hidden_states.shape[0]))
+        return hidden_states
+
+    def c1_pdl_kernel(hidden_states, router_weight, output_dtype):
+        calls.append(("c1_pdl", hidden_states.shape[0]))
+        return hidden_states
+
+    monkeypatch.setattr(ll_bf16, "ll_bf16_gemm_kernel", default_kernel)
+    monkeypatch.setattr(ll_bf16, "ll_bf16_gemm_c1_pdl_kernel", c1_pdl_kernel)
+    weight = torch.empty(4, 8, device="cuda", dtype=torch.bfloat16)
+
+    ll_bf16.ll_bf16_gemm(torch.empty(1, 8, device="cuda", dtype=torch.bfloat16), weight)
+    ll_bf16.ll_bf16_gemm(torch.empty(2, 8, device="cuda", dtype=torch.bfloat16), weight)
+
+    assert calls == [("c1_pdl", 1), ("default", 2)]
+
+
 # ===== Shapes =====
 
 SHAPES = [
@@ -478,6 +501,36 @@ def test_gate_linear_m_gt_16_falls_back(monkeypatch):
     out, _ = gate(x)
     assert out.shape == (17, 64)
     assert out.dtype == torch.float32
+
+
+def test_gate_linear_batch_invariant_skips_shape_dependent_kernel(monkeypatch):
+    gate = _make_gate_linear(monkeypatch, params_dtype=torch.bfloat16)
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.fused_moe.router.gate_linear.envs.VLLM_BATCH_INVARIANT",
+        True,
+    )
+    x = torch.randn(4, 2048, dtype=torch.bfloat16, device="cuda")
+    calls = []
+
+    def fail_ll_bf16_gemm(hidden_states, router_weight):
+        raise AssertionError("BI mode must not use the M-dependent ll_bf16 kernel")
+
+    original_mm = torch.mm
+
+    def record_mm(lhs, rhs, **kwargs):
+        calls.append((lhs.shape[0], kwargs.get("out_dtype")))
+        return original_mm(lhs, rhs, **kwargs)
+
+    monkeypatch.setattr(
+        "vllm.model_executor.kernels.linear.cute_dsl.ll_bf16.ll_bf16_gemm",
+        fail_ll_bf16_gemm,
+    )
+    monkeypatch.setattr(torch, "mm", record_mm)
+    output, bias = gate(x)
+    assert bias is None
+    assert output.shape == (4, 64)
+    assert output.dtype == torch.float32
+    assert calls == [(4, torch.float32)]
 
 
 # =================================================================
