@@ -12,6 +12,19 @@ def _batch_invariant_enabled() -> bool:
     return os.environ.get("VLLM_BATCH_INVARIANT") == "1"
 
 
+def _fixed_split_k() -> bool:
+    """Keep the mHC split-K factor independent of the batch size.
+
+    Every distinct ``n_splits`` is a separate TileLang JIT specialization, and
+    compiling one takes 10-14 s during which every data-parallel rank stalls.
+    Outside batch invariance ``n_splits`` is a function of the prefill batch
+    size, so a server recompiles on each unseen batch size and its tail
+    latency moves with traffic. Pinning the factor costs nothing at decode
+    sizes, where it is already constant.
+    """
+    return os.environ.get("VLLM_MHC_FIXED_SPLITK") == "1"
+
+
 def _torch_hc_prenorm_gemm(
     x: torch.Tensor,
     fn: torch.Tensor,
@@ -43,7 +56,8 @@ def _hc_prenorm_gemm_outputs(
 
     use_deep_gemm = is_deep_gemm_supported() or not use_tilelang_fallback
     num_tokens = x.shape[0]
-    split_tokens = 1 if _batch_invariant_enabled() else num_tokens
+    pin_split = _batch_invariant_enabled() or _fixed_split_k()
+    split_tokens = 1 if pin_split else num_tokens
     n_splits = (
         compute_num_split(64, x.shape[1], cdiv(split_tokens, 64))
         if use_deep_gemm
