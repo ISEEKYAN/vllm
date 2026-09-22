@@ -119,9 +119,11 @@ class TrtLlmFp8ExpertsBase:
     def bind_swiglu_buffers(self, layer: torch.nn.Module) -> None:
         """Expose constants to sleep-mode buffer preservation."""
         for name in self._swiglu_param_names:
-            layer.register_buffer(
-                f"_trtllm_{name}", getattr(self, name), persistent=False
-            )
+            buffer_name = f"_trtllm_{name}"
+            if buffer_name not in layer._buffers:
+                layer.register_buffer(
+                    buffer_name, getattr(self, name), persistent=False
+                )
         self._swiglu_owner = weakref.ref(layer)
 
     def _swiglu_params(self) -> dict[str, torch.Tensor | None]:

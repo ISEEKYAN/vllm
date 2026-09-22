@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
 import inspect
+import types
 from unittest.mock import Mock
 from weakref import WeakKeyDictionary, ref
 
@@ -140,8 +141,11 @@ class _ReloadableAttentionLayer(
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA sleep allocator")
-def test_trtllm_swiglu_buffers_survive_sleep_and_kernel_rebuild(monkeypatch):
+@pytest.mark.parametrize("layerwise", [False, True])
+def test_trtllm_swiglu_buffers_survive_sleep_and_kernel_rebuild(monkeypatch, layerwise):
     """Sleep restores constants at the addresses used by old and new kernels."""
+    gc.collect()
+    torch.accelerator.empty_cache()
     from vllm.device_allocator.cumem import CuMemAllocator
     from vllm.model_executor.layers.fused_moe.experts.trtllm_fp8_moe import (
         TrtLlmFp8ExpertsBase,
@@ -209,9 +213,13 @@ def test_trtllm_swiglu_buffers_survive_sleep_and_kernel_rebuild(monkeypatch):
             tensor.copy_(expected[name])
 
         with allocator.use_memory_pool(tag="weights"):
-            initialize_layerwise_reload(layer)
+            if layerwise:
+                initialize_layerwise_reload(layer)
             layer.weight.weight_loader(layer.weight, torch.full((1,), 3.0))
-            finalize_layerwise_reload(layer, model_config=None)
+            if layerwise:
+                finalize_layerwise_reload(layer, model_config=None)
+            else:
+                method.process_weights_after_loading(layer)
         experts = method.moe_kernel.fused_experts
         graph.replay()
         torch.accelerator.synchronize()
