@@ -657,6 +657,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         w2_input_scale: torch.Tensor | None,
     ) -> None:
         # Shuffle weights to runtime format.
+        from vllm.model_executor.layers.fused_moe.experts.trtllm_fp8_moe import (
+            TrtLlmFp8ExpertsBase,
+        )
+
         w13, w2, w13_scale, w2_scale = convert_to_fp8_moe_kernel_format(
             fp8_backend=self.fp8_backend,
             layer=layer,
@@ -685,6 +689,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             experts_cls=self.experts_cls,
             routing_tables=layer._expert_routing_tables(),
         )
+        experts = self.moe_kernel.fused_experts
+        if isinstance(experts, TrtLlmFp8ExpertsBase):
+            experts.bind_swiglu_buffers(layer)
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
         # Allow for accessing weights and scales in standard way.

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import weakref
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -41,6 +43,8 @@ class TrtLlmFp8ExpertsBase:
     Fp8 TRTLLM-Gen MoE kernels. Shared base for modular and monolithic
     interfaces.
     """
+
+    _swiglu_param_names = ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit")
 
     @staticmethod
     def is_supported_config(
@@ -109,6 +113,26 @@ class TrtLlmFp8ExpertsBase:
             )
         else:
             self.gemm1_clamp_limit = None
+
+        self._swiglu_owner: weakref.ReferenceType[torch.nn.Module] | None = None
+
+    def bind_swiglu_buffers(self, layer: torch.nn.Module) -> None:
+        """Expose constants to sleep-mode buffer preservation."""
+        for name in self._swiglu_param_names:
+            layer.register_buffer(
+                f"_trtllm_{name}", getattr(self, name), persistent=False
+            )
+        self._swiglu_owner = weakref.ref(layer)
+
+    def _swiglu_params(self) -> dict[str, torch.Tensor | None]:
+        if self._swiglu_owner is None:
+            return {name: getattr(self, name) for name in self._swiglu_param_names}
+        layer = self._swiglu_owner()
+        assert layer is not None
+        # Layerwise reload restores the original buffers after rebuilding experts.
+        return {
+            name: getattr(layer, f"_trtllm_{name}") for name in self._swiglu_param_names
+        }
 
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
@@ -260,9 +284,7 @@ class TrtLlmFp8ExpertsModular(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsModular):
             hidden_states_scale=hidden_states_scale,
             gemm1_weights=w1,
             gemm1_weights_scale=self.quant_config.w1_scale,
-            gemm1_alpha=self.gemm1_alpha,
-            gemm1_beta=self.gemm1_beta,
-            gemm1_clamp_limit=self.gemm1_clamp_limit,
+            **self._swiglu_params(),
             gemm2_weights=w2,
             gemm2_weights_scale=self.quant_config.w2_scale,
             num_experts=global_num_experts,
@@ -440,9 +462,7 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
             hidden_states_scale=hidden_states_scale,
             gemm1_weights=w1,
             gemm1_weights_scale=self.quant_config.w1_scale,
-            gemm1_alpha=self.gemm1_alpha,
-            gemm1_beta=self.gemm1_beta,
-            gemm1_clamp_limit=self.gemm1_clamp_limit,
+            **self._swiglu_params(),
             gemm2_weights=w2,
             gemm2_weights_scale=self.quant_config.w2_scale,
             num_experts=global_num_experts,

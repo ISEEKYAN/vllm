@@ -139,6 +139,90 @@ class _ReloadableAttentionLayer(
         self.post_load_called = True
 
 
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA sleep allocator")
+def test_trtllm_swiglu_buffers_survive_sleep_and_kernel_rebuild(monkeypatch):
+    """Sleep restores constants at the addresses used by old and new kernels."""
+    from vllm.device_allocator.cumem import CuMemAllocator
+    from vllm.model_executor.layers.fused_moe.experts.trtllm_fp8_moe import (
+        TrtLlmFp8ExpertsBase,
+    )
+    from vllm.model_executor.layers.quantization import fp8
+
+    layer = torch.nn.Module()
+    moe = types.SimpleNamespace(
+        routing_method=1,
+        experts_per_token=6,
+        intermediate_size_per_partition=2048,
+        hidden_dim=4096,
+        num_local_experts=32,
+        moe_parallel_config=types.SimpleNamespace(ep_rank=0),
+    )
+    quant = types.SimpleNamespace(
+        gemm1_alpha=1.0, gemm1_beta=None, gemm1_clamp_limit=10.0
+    )
+    monkeypatch.setattr(
+        fp8,
+        "make_fp8_moe_kernel",
+        lambda **kwargs: types.SimpleNamespace(
+            fused_experts=TrtLlmFp8ExpertsBase(moe, quant)
+        ),
+    )
+    method = fp8.Fp8MoEMethod.__new__(fp8.Fp8MoEMethod)
+    method.moe = moe
+    method.experts_cls = TrtLlmFp8ExpertsBase
+    method.fp8_backend = None
+    method.weight_scale_name = "weight_scale"
+    method.get_fused_moe_quant_config = lambda layer: quant
+    monkeypatch.setattr(
+        fp8,
+        "convert_to_fp8_moe_kernel_format",
+        lambda **kwargs: tuple(
+            kwargs[name] for name in ("w13", "w2", "w13_scale", "w2_scale")
+        ),
+    )
+    monkeypatch.setattr(fp8, "replace_parameter", lambda *args: None)
+    method.process_weights_after_loading = lambda layer: method._setup_kernel(
+        layer, layer.weight, layer.weight, layer.weight, layer.weight, None, None
+    )
+    layer.quant_method = method
+    layer._expert_routing_tables = lambda: None
+    allocator = CuMemAllocator.get_instance()
+    with allocator.use_memory_pool(tag="weights"):
+        layer.weight = torch.nn.Parameter(torch.ones(1, device="cuda"))
+        layer.weight.weight_loader = default_weight_loader
+        with torch.device("cuda"):
+            record_metadata_for_reloading(layer)
+        method.process_weights_after_loading(layer)
+    original = dict(layer.named_buffers())
+    expected = {name: tensor.cpu().clone() for name, tensor in original.items()}
+    assert set(layer.state_dict()) == {"weight"}
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        outputs = {name: tensor.clone() for name, tensor in original.items()}
+        weight_output = layer.weight + 1
+
+    for _ in range(2):
+        allocator.sleep(offload_tags=())
+        allocator.wake_up()
+        for name, tensor in layer.named_buffers():
+            tensor.copy_(expected[name])
+
+        with allocator.use_memory_pool(tag="weights"):
+            initialize_layerwise_reload(layer)
+            layer.weight.weight_loader(layer.weight, torch.full((1,), 3.0))
+            finalize_layerwise_reload(layer, model_config=None)
+        experts = method.moe_kernel.fused_experts
+        graph.replay()
+        torch.accelerator.synchronize()
+        for name, tensor in original.items():
+            assert torch.equal(outputs[name].cpu(), expected[name])
+            assert experts._swiglu_params()[name.removeprefix("_trtllm_")] is tensor
+        assert experts._swiglu_params()["gemm1_beta"] is None
+        assert weight_output.item() == 4.0
+        assert set(layer.state_dict()) == {"weight"}
+
+
 def test_move_metatensors():
     tensor = torch.empty((1, 2, 3))
     meta_tensor = to_meta_tensor(tensor)
