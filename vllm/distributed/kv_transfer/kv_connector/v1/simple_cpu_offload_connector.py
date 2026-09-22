@@ -196,11 +196,10 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             self.worker_handler.handle_preemptions(kv_connector_metadata)
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
-        if self.worker_handler is not None:
-            self.worker_handler.start_load_kv()
+        pass  # Launch loads ops in get_finished() after launching model execution
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        pass  # Always load asynchronously, issued in start_load_kv()
+        pass  # Always load asynchronously and deferred to get_finished()
 
     def save_kv_layer(
         self,
@@ -209,11 +208,10 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         attn_metadata: "AttentionMetadata",
         **kwargs: Any,
     ) -> None:
-        pass  # Always save asynchronously, issued in wait_for_save()
+        pass  # Always save asynchronously and deferred to get_finished()
 
     def wait_for_save(self) -> None:
-        if self.worker_handler is not None:
-            self.worker_handler.wait_for_save()
+        pass  # All stores are driven by get_finished() and no wait needed
 
     def get_finished(
         self,

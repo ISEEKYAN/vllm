@@ -4,6 +4,7 @@
 import os
 from typing import TYPE_CHECKING
 
+import regex as re
 from huggingface_hub.utils import HfHubHTTPError, HFValidationError
 from torch import nn
 from transformers import PretrainedConfig
@@ -32,10 +33,8 @@ from vllm.lora.layers import (
     RowParallelLinearWithShardedLoRA,
     VocabParallelEmbeddingWithLoRA,
 )
-from vllm.model_executor.custom_op import maybe_get_oot_by_class
 from vllm.model_executor.layers.fused_moe import MoERunner
 from vllm.model_executor.layers.linear import LinearBase
-from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.utils import get_moe_expert_mapping, get_packed_modules_mapping
 from vllm.transformers_utils.repo_utils import hf_api
 
@@ -231,7 +230,11 @@ def get_supported_lora_modules(model: nn.Module) -> list[str]:
             for name in embedding_modules:
                 supported_lora_modules.add(name)
 
-        if isinstance(module, (LinearBase, MoERunner)):
+        # get all the linear subfixes.
+        if isinstance(module, (LinearBase,)):
+            supported_lora_modules.add(name.split(".")[-1])
+
+        if isinstance(module, (MoERunner,)):
             supported_lora_modules.add(name.split(".")[-1])
 
     return list(supported_lora_modules)
@@ -239,36 +242,29 @@ def get_supported_lora_modules(model: nn.Module) -> list[str]:
 
 def is_supported_lora_module(
     module_name: str,
-    module: nn.Module,
     supported_lora_modules: list[str],
 ) -> bool:
     """Check if a module is in the model's supported LoRA modules.
 
-    The module name must match a model-supported suffix, and the runtime
-    module must belong to a module family handled by LoRA.
+    Uses regex suffix matching against the model-defined supported modules
+    list (e.g., matching "model.layers.0.self_attn.o_proj" against
+    "o_proj").
 
     Args:
         module_name: Full dot-separated module name.
-        module: Runtime module associated with ``module_name``.
         supported_lora_modules: List of module suffixes supported by the
             model.
 
     Returns:
         True if the module is supported, False otherwise.
     """
-    module_suffix = module_name.rsplit(".", 1)[-1]
-    if module_suffix not in supported_lora_modules:
-        return False
-
-    return isinstance(
-        module,
-        (
-            LinearBase,
-            MoERunner,
-            VocabParallelEmbedding,
-            maybe_get_oot_by_class(VocabParallelEmbedding),
-            BaseLayerWithLoRA,
-        ),
+    return any(
+        re.match(
+            r".*\.{target_module}$".format(target_module=target_module),
+            module_name,
+        )
+        or target_module == module_name
+        for target_module in supported_lora_modules
     )
 
 

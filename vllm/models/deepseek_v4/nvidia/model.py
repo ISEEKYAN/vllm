@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import typing
 from collections.abc import Callable, Iterable
-from inspect import signature
 from itertools import islice
 
 import regex as re
@@ -11,7 +10,6 @@ import torch.nn as nn
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
-from vllm.config.kernel import MEGA_MOE_BACKENDS
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
@@ -20,7 +18,6 @@ from vllm.distributed import (
 )
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.forward_context import get_forward_context, is_forward_context_available
-from vllm.logger import init_logger
 from vllm.model_executor.kernels.mhc.tilelang import (
     hc_head_fused_kernel_tilelang,
     mhc_fused_post_pre_tilelang,
@@ -56,7 +53,6 @@ from vllm.model_executor.models.interfaces import (
     EagleModelMixin,
     MixtureOfExperts,
     SupportsEagle3,
-    SupportsLoRA,
     SupportsPP,
 )
 from vllm.model_executor.models.utils import (
@@ -76,6 +72,7 @@ from vllm.models.common.ops.sequence_parallel import (
     sp_shard,
 )
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
+from vllm.models.deepseek_v4.eager_scratch import DeepseekV4EagerScratchPool
 from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferMLAAttention,
     DeepseekV4FlashInferSM120Attention,
@@ -84,15 +81,9 @@ from vllm.models.deepseek_v4.nvidia.flashmla import DeepseekV4FlashMLAAttention
 from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
-from vllm.utils.flashinfer_moe_ep import (
-    is_fi_moe_ep_backend,
-    validate_fi_moe_ep_config,
-)
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
-
-logger = init_logger(__name__)
 
 
 class DeepseekV4MLP(nn.Module):
@@ -175,7 +166,7 @@ def make_deepseek_v4_expert_params_mapping(
 
 
 class DeepseekV4MegaMoEExperts(nn.Module):
-    _symm_buffer_cache: dict[tuple[int, int, int, int, int, int, int, int], object] = {}
+    _symm_buffer_cache: dict[tuple[int, int, int, int, int, int, int], object] = {}
 
     def __init__(
         self,
@@ -187,7 +178,6 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         top_k: int,
         hidden_size: int,
         intermediate_size: int,
-        num_shared_experts: int = 0,
         prefix: str = "",
         num_logical_experts: int | None = None,
     ):
@@ -201,7 +191,6 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         self.top_k = top_k
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
-        self.num_shared_experts = num_shared_experts
         self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
 
         self.num_logical_experts = (
@@ -259,12 +248,6 @@ class DeepseekV4MegaMoEExperts(nn.Module):
 
         self._transformed_l1_weights: tuple[torch.Tensor, torch.Tensor] | None = None
         self._transformed_l2_weights: tuple[torch.Tensor, torch.Tensor] | None = None
-        self._transformed_shared_l1_weights: (
-            tuple[torch.Tensor, torch.Tensor] | None
-        ) = None
-        self._transformed_shared_l2_weights: (
-            tuple[torch.Tensor, torch.Tensor] | None
-        ) = None
 
         # Register in the static forward context so the custom-op wrapper
         # can look up this module by name from within a torch.compile graph.
@@ -339,220 +322,45 @@ class DeepseekV4MegaMoEExperts(nn.Module):
                 "to be multiples of 128."
             )
 
-    @staticmethod
-    def _deep_gemm_supports_shared_experts(deep_gemm) -> bool:
-        """Check the Python API before touching a symmetric-memory group.
-
-        This also gives users of an older precompiled vLLM wheel a safe serial
-        fallback instead of failing halfway through multi-rank buffer setup.
-        """
-        try:
-            buffer_params = signature(deep_gemm.get_symm_buffer_for_mega_moe).parameters
-            kernel_params = signature(deep_gemm.fp8_fp4_mega_moe).parameters
-        except (TypeError, ValueError):
-            return False
-        return (
-            hasattr(deep_gemm, "get_block_m_for_mega_moe")
-            and hasattr(deep_gemm, "transform_weights_for_mega_moe")
-            and "num_shared_experts" in buffer_params
-            and "shared_l1_weights" in kernel_params
-            and "shared_l2_weights" in kernel_params
-        )
-
-    def _finalize_shared_expert_weights(
-        self, deep_gemm, shared_experts: DeepseekV4MLP
-    ) -> None:
-        gate_up = shared_experts.gate_up_proj
-        down = shared_experts.down_proj
-        gate_up_weight = gate_up.weight.data
-        gate_up_scale = gate_up.weight_scale_inv.data
-        down_weight = down.weight.data
-        down_scale = down.weight_scale_inv.data
-
-        # MegaMoE's shared FP8 MMA consumes a 1x32 scale for every weight row,
-        # while the checkpoint uses coarser block-FP8 scales (usually
-        # 128x128). Build a dedicated, numerically equivalent scale view before
-        # the generic linear post-load hook replaces the raw checkpoint scales
-        # with its 128x128 DeepGEMM layout.
-        checkpoint_scale_dtypes = (torch.float8_e8m0fnu, torch.uint8)
-        if (
-            gate_up_scale.dtype in checkpoint_scale_dtypes
-            and down_scale.dtype in checkpoint_scale_dtypes
-        ):
-            gate_up_scale = self._prepare_shared_expert_scale(
-                deep_gemm,
-                gate_up,
-                gate_up_scale,
-                gate_up_weight.shape[0],
-                gate_up_weight.shape[1],
-            )
-            down_scale = self._prepare_shared_expert_scale(
-                deep_gemm,
-                down,
-                down_scale,
-                down_weight.shape[0],
-                down_weight.shape[1],
-            )
-
-        if gate_up_scale is None or down_scale is None:
-            self.num_shared_experts = 0
+    def finalize_weights(self) -> None:
+        if self._transformed_l1_weights is not None:
             return
 
-        shared_intermediate_size = self.intermediate_size * self.num_shared_experts
-        expected_gate_up_shape = (
-            2 * shared_intermediate_size,
-            self.hidden_size,
-        )
-        expected_down_shape = (self.hidden_size, shared_intermediate_size)
-        if (
-            gate_up_weight.dtype != torch.float8_e4m3fn
-            or down_weight.dtype != torch.float8_e4m3fn
-            or gate_up_scale.dtype != torch.int32
-            or down_scale.dtype != torch.int32
-            or tuple(gate_up_weight.shape) != expected_gate_up_shape
-            or tuple(down_weight.shape) != expected_down_shape
-        ):
-            logger.warning(
-                "Disabling native MegaMoE shared-expert fusion for %s: expected "
-                "replicated block-FP8 weights with gate_up=%s, down=%s, and "
-                "DeepGEMM int32 scales; got gate_up=%s/%s/%s and down=%s/%s/%s.",
-                self.prefix,
-                expected_gate_up_shape,
-                expected_down_shape,
-                tuple(gate_up_weight.shape),
-                gate_up_weight.dtype,
-                gate_up_scale.dtype,
-                tuple(down_weight.shape),
-                down_weight.dtype,
-                down_scale.dtype,
-            )
-            self.num_shared_experts = 0
-            return
-
-        transformed_l1, transformed_l2 = deep_gemm.transform_weights_for_mega_moe(
-            (gate_up_weight, gate_up_scale),
-            (down_weight, down_scale),
-        )
-        # L1 interleaving allocates a full copy. Re-home the loader Parameter on
-        # that storage so the original 2*intermediate*hidden FP8 tensor can be
-        # released instead of adding roughly 0.7 GiB per rank on DSV4-Flash.
-        # The generic linear post-load hook may still repack the serial scales,
-        # but this shared MLP is never called after native fusion is enabled.
-        gate_up.weight.data = transformed_l1[0]
-        self._transformed_shared_l1_weights = (
-            gate_up.weight.data,
-            transformed_l1[1],
-        )
-        self._transformed_shared_l2_weights = transformed_l2
-
-    def _prepare_shared_expert_scale(
-        self,
-        deep_gemm,
-        linear: nn.Module,
-        scale: torch.Tensor,
-        mn: int,
-        k: int,
-    ) -> torch.Tensor | None:
-        block_size = getattr(linear, "weight_block_size", None)
-        if block_size is None or len(block_size) != 2:
-            logger.warning(
-                "Disabling native MegaMoE shared-expert fusion for %s: "
-                "shared FP8 weight block size is unavailable.",
-                self.prefix,
-            )
-            return None
-
-        block_m, block_k = block_size
-        expected_shape = (
-            (mn + block_m - 1) // block_m,
-            (k + block_k - 1) // block_k,
-        )
-        if block_k % 32 != 0 or tuple(scale.shape) != expected_shape:
-            logger.warning(
-                "Disabling native MegaMoE shared-expert fusion for %s: "
-                "cannot convert shared scale shape %s with block size %s "
-                "to MegaMoE's 1x32 layout for weight (%d, %d).",
-                self.prefix,
-                tuple(scale.shape),
-                tuple(block_size),
-                mn,
-                k,
-            )
-            return None
-
-        scale_fp32 = self._ue8m0_uint8_to_float(scale.view(torch.uint8))
-        scale_1x32 = (
-            scale_fp32.repeat_interleave(block_m, dim=0)
-            .repeat_interleave(block_k // 32, dim=1)[:mn, : k // 32]
-            .contiguous()
-        )
-        # The grouped API is used with a singleton dimension to request the
-        # MN-major, TMA-aligned packed-UE8M0 strides, then squeezed back to the
-        # 2D layout required for a shared expert.
-        return deep_gemm.transform_sf_into_required_layout(
-            scale_1x32.unsqueeze(0),
-            mn,
-            k,
-            (1, 32),
-            1,
-        ).squeeze(0)
-
-    def finalize_weights(self, shared_experts: DeepseekV4MLP | None = None) -> None:
+        self._check_runtime_supported()
         from vllm.utils.deep_gemm import _import_deep_gemm
 
         deep_gemm = _import_deep_gemm()
 
-        if self._transformed_l1_weights is None:
-            self._check_runtime_supported()
-            w13_scale = deep_gemm.transform_sf_into_required_layout(
-                self._ue8m0_uint8_to_float(self.w13_weight_scale.data).contiguous(),
-                2 * self.intermediate_size,
-                self.hidden_size,
-                (1, 32),
-                self.num_local_experts,
+        w13_scale = deep_gemm.transform_sf_into_required_layout(
+            self._ue8m0_uint8_to_float(self.w13_weight_scale.data).contiguous(),
+            2 * self.intermediate_size,
+            self.hidden_size,
+            (1, 32),
+            self.num_local_experts,
+        )
+        w2_scale = deep_gemm.transform_sf_into_required_layout(
+            self._ue8m0_uint8_to_float(self.w2_weight_scale.data).contiguous(),
+            self.hidden_size,
+            self.intermediate_size,
+            (1, 32),
+            self.num_local_experts,
+        )
+        self._transformed_l1_weights, self._transformed_l2_weights = (
+            deep_gemm.transform_weights_for_mega_moe(
+                (self.w13_weight.data.view(torch.int8).contiguous(), w13_scale),
+                (self.w2_weight.data.view(torch.int8).contiguous(), w2_scale),
             )
-            w2_scale = deep_gemm.transform_sf_into_required_layout(
-                self._ue8m0_uint8_to_float(self.w2_weight_scale.data).contiguous(),
-                self.hidden_size,
-                self.intermediate_size,
-                (1, 32),
-                self.num_local_experts,
-            )
-            self._transformed_l1_weights, self._transformed_l2_weights = (
-                deep_gemm.transform_weights_for_mega_moe(
-                    (self.w13_weight.data.view(torch.int8).contiguous(), w13_scale),
-                    (self.w2_weight.data.view(torch.int8).contiguous(), w2_scale),
-                )
-            )
-            # Drop the original loader-side parameters: the MegaMoE kernels only
-            # consume the transformed views above. transform_weights_for_mega_moe
-            # allocates a fresh tensor for the L1 weight (see
-            # _interleave_l1_weights) and fresh SF tensors for L1/L2; the L2
-            # weight is the only tensor that aliases the original storage, and
-            # _transformed_l2_weights still holds it, so the storage stays live
-            # after we drop the Parameter.
-            self.w13_weight = None
-            self.w13_weight_scale = None
-            self.w2_weight = None
-            self.w2_weight_scale = None
-
-        if shared_experts is None or self.num_shared_experts == 0:
-            return
-        if self._transformed_shared_l1_weights is not None:
-            return
-        if not self._deep_gemm_supports_shared_experts(deep_gemm):
-            logger.warning_once(
-                "Disabling native MegaMoE shared-expert fusion because the "
-                "installed DeepGEMM Python API is older than the vLLM "
-                "source. Rebuild the vendored _deep_gemm_C extension to enable it.",
-            )
-            self.num_shared_experts = 0
-            return
-        self._finalize_shared_expert_weights(deep_gemm, shared_experts)
-
-    @property
-    def has_fused_shared_experts(self) -> bool:
-        return self._transformed_shared_l1_weights is not None
+        )
+        # Drop the original loader-side parameters: the MegaMoE kernels only
+        # consume the transformed views above. transform_weights_for_mega_moe
+        # allocates a fresh tensor for the L1 weight (see _interleave_l1_weights)
+        # and fresh SF tensors for L1/L2; the L2 weight is the only tensor that
+        # aliases the original storage, and _transformed_l2_weights still holds
+        # it, so the storage stays live after we drop the Parameter.
+        self.w13_weight = None
+        self.w13_weight_scale = None
+        self.w2_weight = None
+        self.w2_weight_scale = None
 
     def get_symm_buffer(self):
         from vllm.utils.deep_gemm import _import_deep_gemm
@@ -569,7 +377,6 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             self.top_k,
             self.hidden_size,
             self.intermediate_size,
-            self.num_shared_experts if self.has_fused_shared_experts else 0,
         )
         symm_buffer = self._symm_buffer_cache.get(key)
         if symm_buffer is None:
@@ -580,9 +387,6 @@ class DeepseekV4MegaMoEExperts(nn.Module):
                 self.top_k,
                 self.hidden_size,
                 self.intermediate_size,
-                num_shared_experts=(
-                    self.num_shared_experts if self.has_fused_shared_experts else 0
-                ),
             )
             self._symm_buffer_cache[key] = symm_buffer
         return symm_buffer
@@ -689,19 +493,6 @@ class DeepseekV4MegaMoEExperts(nn.Module):
                 else None,
             )
 
-        shared_x_sf = None
-        shared_block_m = None
-        if self.has_fused_shared_experts:
-            shared_x_sf = symm_buffer.shared_l1_acts_sf
-            shared_block_m = deep_gemm.get_block_m_for_mega_moe(
-                get_ep_group().world_size,
-                self.num_experts,
-                symm_buffer.num_max_tokens_per_rank,
-                num_tokens,
-                self.top_k,
-                "fp8xfp4",
-            )
-
         prepare_megamoe_inputs(
             hidden_states,
             topk_weights,
@@ -711,32 +502,22 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             symm_buffer.topk_idx[:num_tokens],
             symm_buffer.topk_weights[:num_tokens],
             is_padding=is_padding,
-            shared_x_sf=shared_x_sf,
-            shared_block_m=shared_block_m,
         )
+
+        # This method must have been already called during the weight loading phase.
+        # We call it again here to cover the dummy weight loading case.
+        self.finalize_weights()
 
         assert self._transformed_l1_weights is not None
         assert self._transformed_l2_weights is not None
-        if self.has_fused_shared_experts:
-            deep_gemm.fp8_fp4_mega_moe(
-                y,
-                self._transformed_l1_weights,
-                self._transformed_l2_weights,
-                symm_buffer,
-                shared_l1_weights=self._transformed_shared_l1_weights,
-                shared_l2_weights=self._transformed_shared_l2_weights,
-                activation_clamp=activation_clamp,
-                fast_math=fast_math,
-            )
-        else:
-            deep_gemm.fp8_fp4_mega_moe(
-                y,
-                self._transformed_l1_weights,
-                self._transformed_l2_weights,
-                symm_buffer,
-                activation_clamp=activation_clamp,
-                fast_math=fast_math,
-            )
+        deep_gemm.fp8_fp4_mega_moe(
+            y,
+            self._transformed_l1_weights,
+            self._transformed_l2_weights,
+            symm_buffer,
+            activation_clamp=activation_clamp,
+            fast_math=fast_math,
+        )
         return y
 
 
@@ -757,10 +538,9 @@ class DeepseekV4MoE(nn.Module):
         quant_config = vllm_config.quant_config
         self.prefix = prefix
         self.use_sequence_parallel = use_sequence_parallel
-        moe_backend = vllm_config.kernel_config.moe_backend
-        validate_fi_moe_ep_config(vllm_config)
-        self.use_mega_moe = moe_backend in MEGA_MOE_BACKENDS
-        self.use_fi_mega_moe = is_fi_moe_ep_backend(moe_backend)
+        self.use_mega_moe = (
+            vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
+        )
         if self.use_mega_moe and not vllm_config.parallel_config.enable_expert_parallel:
             raise NotImplementedError(
                 "DeepSeek V4 MegaMoE currently requires expert parallel. "
@@ -785,7 +565,7 @@ class DeepseekV4MoE(nn.Module):
             raise NotImplementedError(
                 "DeepSeek V4 MegaMoE only supports fp4 experts; got expert_dtype="
                 f"{config.expert_dtype!r}. Drop --kernel-config moe_backend="
-                f"{moe_backend} for this checkpoint."
+                "deep_gemm_mega_moe for this checkpoint."
             )
 
         self.gate = GateLinear(
@@ -870,32 +650,8 @@ class DeepseekV4MoE(nn.Module):
         self.experts_start_idx = self.physical_expert_start
         self.experts_end_idx = self.physical_expert_end
 
-        # Native DeepGEMM fusion requires each EP rank to own the complete
-        # shared MLP. Sequence parallel replicates those weights while sharding
-        # tokens. TP=1 is also naturally replicated. With PP+TP the shared MLP
-        # remains tensor-sharded, so retain the serial path. The FlashInfer
-        # megakernel has no shared-expert fusion, so it keeps the serial path.
-        fuse_shared_experts = bool(
-            self.shared_experts is not None
-            and not envs.VLLM_DISABLE_DSV4_MEGAMOE_SHARED_EXPERT_FUSION
-            and (self.use_sequence_parallel or self.tp_size == 1)
-            and not self.use_fi_mega_moe
-        )
-
-        activation_clamp = (
-            float(self.swiglu_limit) if self.swiglu_limit is not None else None
-        )
-        if self.use_fi_mega_moe:
-            # Deferred: fi_moe subclasses DeepseekV4MegaMoEExperts, so a
-            # module-level import here would be circular.
-            from vllm.models.deepseek_v4.nvidia.fi_moe import (
-                DeepseekV4MegaMoEExpertsFI,
-            )
-
-            experts_cls: type[DeepseekV4MegaMoEExperts] = DeepseekV4MegaMoEExpertsFI
-        else:
-            experts_cls = DeepseekV4MegaMoEExperts
-        expert_kwargs: dict[str, typing.Any] = dict(
+        self.experts = DeepseekV4MegaMoEExperts(
+            vllm_config,
             num_experts=self.n_physical_experts,
             num_local_experts=self.n_local_physical_experts,
             experts_start_idx=self.physical_expert_start,
@@ -903,12 +659,8 @@ class DeepseekV4MoE(nn.Module):
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
-            num_shared_experts=(self.n_shared_experts if fuse_shared_experts else 0),
             prefix=f"{prefix}.experts",
         )
-        if self.use_fi_mega_moe:
-            expert_kwargs["activation_clamp"] = activation_clamp
-        self.experts = experts_cls(vllm_config, **expert_kwargs)
 
     def _init_fused_moe_experts(
         self,
@@ -992,10 +744,7 @@ class DeepseekV4MoE(nn.Module):
             activation_clamp=activation_clamp,
         )
 
-        if (
-            self.shared_experts is not None
-            and not self.experts.has_fused_shared_experts
-        ):
+        if self.shared_experts is not None:
             shared_output = self.shared_experts(hidden_states)
             final_hidden_states += shared_output
 
@@ -1015,7 +764,7 @@ class DeepseekV4MoE(nn.Module):
 
     def finalize_mega_moe_weights(self) -> None:
         if self.use_mega_moe:
-            self.experts.finalize_weights(self.shared_experts)
+            self.experts.finalize_weights()
 
 
 def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
@@ -1054,7 +803,7 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
 
 def _use_sequence_parallel(vllm_config: VllmConfig) -> bool:
     parallel_config = vllm_config.parallel_config
-    use_mega_moe = vllm_config.kernel_config.moe_backend in MEGA_MOE_BACKENDS
+    use_mega_moe = vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
     return (
         parallel_config.pipeline_parallel_size == 1
         and parallel_config.enable_expert_parallel
@@ -1070,6 +819,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         prefix,
         topk_indices_buffer: torch.Tensor | None = None,
         aux_stream_list: list[torch.cuda.Stream] | None = None,
+        eager_scratch_pool: DeepseekV4EagerScratchPool | None = None,
     ):
         super().__init__()
 
@@ -1083,6 +833,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             prefix=f"{prefix}.attn",
             topk_indices_buffer=topk_indices_buffer,
             aux_stream_list=aux_stream_list,
+            eager_scratch_pool=eager_scratch_pool,
         )
         if self.use_sequence_parallel:
             self.attn.wo_b.reduce_results = False
@@ -1143,6 +894,75 @@ class DeepseekV4DecoderLayer(nn.Module):
             ),
             requires_grad=False,
         )
+        # Batch-invariant alignment uses the same explicit pre/block/post
+        # sequence as the training implementation and the mature AMD path.
+        # The default rollout path keeps the fused implementation.
+        self.use_fused_mhc = not envs.VLLM_BATCH_INVARIANT
+
+    def _forward_unfused_post_pre(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        input_ids: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, None, None, None]:
+        attn_norm_weight = self.attn_norm.weight.data
+        attn_norm_eps = self.attn_norm.variance_epsilon
+        residual = x
+        if x.dim() == 2:
+            assert self.hc_attn_fn_broadcast is not None
+            residual, post, comb, x = mhc_pre_broadcast_tilelang(
+                x,
+                self.hc_attn_fn,
+                self.hc_attn_scale,
+                self.hc_attn_base,
+                self.rms_norm_eps,
+                self.hc_eps,
+                self.hc_eps,
+                self.hc_post_alpha,
+                self.hc_sinkhorn_iters,
+                norm_weight=attn_norm_weight,
+                norm_eps=attn_norm_eps,
+                fn_broadcast=self.hc_attn_fn_broadcast,
+            )
+        else:
+            post, comb, x = mhc_pre_tilelang(
+                x,
+                self.hc_attn_fn,
+                self.hc_attn_scale,
+                self.hc_attn_base,
+                self.rms_norm_eps,
+                self.hc_eps,
+                self.hc_eps,
+                self.hc_post_alpha,
+                self.hc_sinkhorn_iters,
+                norm_weight=attn_norm_weight,
+                norm_eps=attn_norm_eps,
+            )
+
+        if self.use_sequence_parallel:
+            x = sp_all_gather(x)[: positions.shape[0]]
+        x = self.attn(positions, x, None)
+        if self.use_sequence_parallel:
+            x = sp_reduce_scatter(x)
+        x = mhc_post_tilelang(x, residual, post, comb)
+
+        residual = x
+        post, comb, x = mhc_pre_tilelang(
+            x,
+            self.hc_ffn_fn,
+            self.hc_ffn_scale,
+            self.hc_ffn_base,
+            self.rms_norm_eps,
+            self.hc_eps,
+            self.hc_eps,
+            self.hc_post_alpha,
+            self.hc_sinkhorn_iters,
+            norm_weight=self.ffn_norm.weight.data,
+            norm_eps=self.ffn_norm.variance_epsilon,
+        )
+        x = self.ffn(x, input_ids)
+        x = mhc_post_tilelang(x, residual, post, comb)
+        return x, None, None, None
 
     def forward(
         self,
@@ -1152,7 +972,14 @@ class DeepseekV4DecoderLayer(nn.Module):
         post_mix: torch.Tensor | None = None,
         res_mix: torch.Tensor | None = None,
         residual: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
+        if not self.use_fused_mhc:
+            return self._forward_unfused_post_pre(x, positions, input_ids)
         attn_norm_weight = self.attn_norm.weight.data
         attn_norm_eps = self.attn_norm.variance_epsilon
         if residual is None:
@@ -1249,7 +1076,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         self.config = config
         self.quant_config = quant_config
         self.parallel_config = vllm_config.parallel_config
-        self.use_mega_moe = vllm_config.kernel_config.moe_backend in MEGA_MOE_BACKENDS
+        self.use_mega_moe = (
+            vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
+        )
         self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
         if self.use_mega_moe and not vllm_config.parallel_config.enable_expert_parallel:
             raise NotImplementedError(
@@ -1268,6 +1097,22 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # (compressor kv_score, indexer.weights_proj, indexer.compressor
         # kv_score). fused_wqa_wkv stays on the default stream.
         aux_stream_list = [torch.cuda.Stream() for _ in range(3)]
+        padded_heads = _select_dsv4_attn_cls(vllm_config).get_padded_num_q_heads(
+            config.num_attention_heads // get_tensor_model_parallel_world_size()
+        )
+        self.eager_scratch_pool: DeepseekV4EagerScratchPool | None = None
+        if not vllm_config.parallel_config.use_ubatching:
+            # TODO: support dbo if needed
+            # this requires the buffer to have ubatch dim
+            self.eager_scratch_pool = DeepseekV4EagerScratchPool(
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                padded_heads,
+                config.head_dim,
+                config.index_n_heads,
+                config.index_head_dim,
+                config.index_topk,
+                current_platform.device_type,
+            )
 
         # Reserved topk indices buffer for all Indexer layers to reuse.
         self.topk_indices_buffer = torch.empty(
@@ -1293,6 +1138,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 prefix=prefix,
                 topk_indices_buffer=self.topk_indices_buffer,
                 aux_stream_list=aux_stream_list,
+                eager_scratch_pool=self.eager_scratch_pool,
             ),
             prefix=f"{prefix}.layers",
         )
@@ -1333,6 +1179,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             )
         else:
             self._mtp_hidden_buffer = None
+
+        # Dummy-load rollouts bypass CausalLM.load_weights(), but vLLM runs a
+        # profiling forward before VERL synchronizes actor weights. Materialize
+        # the derived first-layer MHC tensor for that forward; real weight loads
+        # refresh it again in DeepseekV4ForCausalLM.load_weights().
+        self.finalize_mhc_broadcast_weights()
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -1402,16 +1254,18 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 residual,
             )
             if idx + 1 in self.aux_hidden_state_layers:
-                # Reconstruct the aux hidden state for draft models
-                aux_recon = mhc_post_tilelang(
-                    hidden_states, residual, post_mix, res_mix
+                # The unfused BI path already returns reconstructed streams.
+                aux_recon = (
+                    mhc_post_tilelang(hidden_states, residual, post_mix, res_mix)
+                    if layer.use_fused_mhc
+                    else hidden_states
                 )
                 aux_hidden_state = aux_recon.mean(dim=1)
                 if self.use_sequence_parallel:
                     aux_hidden_state = sp_all_gather(aux_hidden_state)[:full_num_tokens]
                 aux_hidden_states.append(aux_hidden_state)
                 final_aux_recon = aux_recon
-        if layer is not None:
+        if layer is not None and layer.use_fused_mhc:
             # Reuse if the last layer was captured as an aux hidden state
             if self.end_layer in self.aux_hidden_state_layers:
                 hidden_states = final_aux_recon
@@ -1490,11 +1344,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
                 if is_pp_missing_parameter(name, self):
                     break
-                if name not in params_dict:
-                    head, _, leaf = name.rpartition(".")
-                    suffixed = f"{head}.base_layer.{leaf}"
-                    if suffixed in params_dict:
-                        name = suffixed
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -1541,21 +1390,22 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 elif "attn_sink" in name:
                     if is_pp_missing_parameter(name, self):
                         continue
+                    param = params_dict[name]
                     narrow_weight = loaded_weight[head_rank_start:head_rank_end]
                     n = narrow_weight.shape[0]
-                    params_dict[name][:n].copy_(narrow_weight)
+                    padded_weight = loaded_weight.new_full(
+                        param.shape, -float("inf")
+                    )
+                    padded_weight[:n].copy_(narrow_weight)
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, padded_weight)
                     loaded_params.add(name)
                     continue
                 else:
                     if is_pp_missing_parameter(name, self):
                         continue
-                    # Non-LoRA params on a LoRA-wrapped module live at
-                    # ``<head>.base_layer.<leaf>``; the checkpoint is plain.
-                    if name not in params_dict:
-                        head, _, leaf = name.rpartition(".")
-                        suffixed = f"{head}.base_layer.{leaf}"
-                        if suffixed in params_dict:
-                            name = suffixed
                     param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
@@ -1619,7 +1469,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 .view(-1, layer.hc_mult, layer.hidden_size)
                 .sum(dim=1)
             )
-            if layer.hc_attn_fn_broadcast is None:
+            if broadcast.is_meta:
+                return
+            if (
+                layer.hc_attn_fn_broadcast is None
+                or layer.hc_attn_fn_broadcast.is_meta
+            ):
                 layer.hc_attn_fn_broadcast = broadcast
             else:
                 layer.hc_attn_fn_broadcast.copy_(broadcast)
@@ -1632,10 +1487,6 @@ def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
         # shared experts use Fp8LinearMethod's block scales, which
         # register as ``weight_scale_inv``.
         scale_regex = {
-            # ``.base_layer.``-namespace variant (LoRA-wrapped experts).
-            re.compile(
-                r"(\.experts\.\d+\.w[123]\.base_layer)\.scale$"
-            ): r"\1.weight_scale",
             re.compile(r"(\.experts\.\d+\.w[123])\.scale$"): r"\1.weight_scale",
             re.compile(r"\.scale$"): ".weight_scale_inv",
         }
@@ -1644,10 +1495,6 @@ def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
         # scales as ``w{13,2}_weight_scale_inv``. Map all ``.scale`` keys
         # there.
         scale_regex = {
-            # ``.base_layer.``-namespace variant of the above.
-            re.compile(
-                r"(\.experts\.\d+\.w[123]\.base_layer)\.scale$"
-            ): r"\1.weight_scale_inv",
             re.compile(r"\.scale$"): ".weight_scale_inv",
         }
     return WeightsMapper(
@@ -1666,7 +1513,6 @@ def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
         },
         orig_to_new_substr={
             ".shared_experts.w2": ".shared_experts.down_proj",
-            "mtp.": None,
         },
     )
 
@@ -1709,26 +1555,13 @@ class DeepseekV4MixtureOfExperts(MixtureOfExperts):
 
 
 class DeepseekV4ForCausalLM(
-    nn.Module,
-    SupportsPP,
-    SupportsEagle3,
-    SupportsLoRA,
-    DeepseekV4MixtureOfExperts,
+    nn.Module, SupportsPP, SupportsEagle3, DeepseekV4MixtureOfExperts
 ):
     model_cls = DeepseekV4Model
 
     # Default mapper assumes the original FP4-expert checkpoint layout.
     # Overridden per-instance in __init__ when expert_dtype != "fp4".
     hf_to_vllm_mapper = _make_deepseek_v4_weights_mapper("fp4")
-
-    packed_modules_mapping = {
-        "gate_up_proj": ["w1", "w3"],
-        "fused_wqa_wkv": ["wq_a", "wkv"],
-        "fused_wkv_wgate": ["wkv", "wgate"],
-    }
-
-    # The MTP draft head is not LoRA-adapted.
-    lora_skip_prefixes = ["mtp."]
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -1786,12 +1619,6 @@ class DeepseekV4ForCausalLM(
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
-    def compute_logits_local(
-        self,
-        hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
-        return self.logits_processor(self.lm_head, hidden_states, skip_gather=True)
-
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -1811,13 +1638,13 @@ class DeepseekV4ForCausalLM(
         return getattr(self.model, "_mtp_hidden_buffer", None)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
+        loader = AutoWeightsLoader(self, skip_substrs=["mtp."])
         loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-        self.process_weights_after_loading()
+        self.model.finalize_mega_moe_weights()
+        self.model.finalize_mhc_broadcast_weights()
         return loaded_params
 
-    def process_weights_after_loading(self) -> None:
-        self.model.finalize_mega_moe_weights()
+    def finalize_weights_after_layerwise_reload(self) -> None:
         self.model.finalize_mhc_broadcast_weights()
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:

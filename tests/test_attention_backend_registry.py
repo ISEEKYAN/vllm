@@ -38,6 +38,11 @@ class CustomAttentionBackend(AttentionBackend):
         """Mock builder class."""
         return None
 
+    @staticmethod
+    def get_required_kv_cache_layout():
+        """Mock KV cache layout."""
+        return None
+
 
 class CustomMambaAttentionImpl(AttentionImpl):
     """Mock custom mamba attention implementation for testing."""
@@ -64,6 +69,11 @@ class CustomMambaAttentionBackend(AttentionBackend):
     @staticmethod
     def get_builder_cls():
         """Mock builder class."""
+        return None
+
+    @staticmethod
+    def get_required_kv_cache_layout():
+        """Mock KV cache layout."""
         return None
 
 

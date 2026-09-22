@@ -23,7 +23,6 @@ from vllm.entrypoints.scale_out.token_in_token_out.protocol import (
     GenerateResponseStreamChoice,
     GenerateStreamResponse,
 )
-from vllm.entrypoints.serve.engine.protocol import ErrorResponse, UsageInfo
 
 MODEL_NAME = "hmellor/tiny-random-LlamaForCausalLM"
 
@@ -41,6 +40,7 @@ def _make_stream_chunk(
     usage: dict | None = None,
 ) -> GenerateStreamResponse:
     """Build a GenerateStreamResponse SSE chunk."""
+    from vllm.entrypoints.openai.engine.protocol import UsageInfo
 
     return GenerateStreamResponse(
         request_id=request_id,
@@ -61,6 +61,7 @@ def _make_usage_chunk(
     request_id: str = "test-req",
 ) -> GenerateStreamResponse:
     """Build a usage only final SSE chunk (empty choices)."""
+    from vllm.entrypoints.openai.engine.protocol import UsageInfo
 
     return GenerateStreamResponse(
         request_id=request_id,
@@ -472,6 +473,7 @@ class TestServingDerenderStreamErrorHandling:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("exc", [KeyError("bad byte"), IndexError("oob")])
     async def test_completion_stream_bad_state_returns_400(self, exc):
+        from vllm.entrypoints.openai.engine.protocol import ErrorResponse
         from vllm.entrypoints.scale_out.token_in_token_out.protocol import (
             DerenderCompletionStreamRequest,
         )
@@ -490,6 +492,7 @@ class TestServingDerenderStreamErrorHandling:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("exc", [KeyError("bad byte"), IndexError("oob")])
     async def test_chat_stream_bad_state_returns_400(self, exc):
+        from vllm.entrypoints.openai.engine.protocol import ErrorResponse
         from vllm.entrypoints.scale_out.token_in_token_out.protocol import (
             DerenderChatStreamRequest,
         )

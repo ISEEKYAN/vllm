@@ -13,7 +13,6 @@ from vllm.utils.deep_gemm import (
     fp8_fp4_paged_mqa_logits,
     get_num_sms,
     get_paged_mqa_logits_metadata,
-    native_next_n_supported,
 )
 from vllm.utils.import_utils import has_deep_gemm
 from vllm.utils.math_utils import cdiv
@@ -206,12 +205,7 @@ def _ref_fp8_fp4_paged_mqa_logits(
 @pytest.mark.skipif(
     not current_platform.has_device_capability(90), reason="SM90 and SM100 only"
 )
-# next_n = 1 + num_speculative_tokens, so next_n=4 is MTP=3 (issue #35878).
-@pytest.mark.parametrize("batch_size,next_n", [(4, 1), (2, 2), (2, 4)])
-def test_deepgemm_fp8_fp4_paged_mqa_logits(batch_size: int, next_n: int):
-    if not native_next_n_supported(next_n):
-        pytest.skip(f"next_n={next_n} has no native kernel on this architecture")
-
+def test_deepgemm_fp8_fp4_paged_mqa_logits():
     # NOTE: clean_logits=True is incompatible with the 2D context_lens
     # required by csrc/apis/attention.hpp; only the False path is exercised.
     clean_logits = False
@@ -219,97 +213,204 @@ def test_deepgemm_fp8_fp4_paged_mqa_logits(batch_size: int, next_n: int):
     random.seed(0)
 
     max_model_len = 4096
-    for heads, index_dim in [(32, 128)]:
-        for avg_kv in (2048,):
-            num_blocks, blocksize = max_model_len * 2, 64
+    for batch_size, next_n in [(4, 1), (2, 2)]:
+        for heads, index_dim in [(32, 128)]:
+            for avg_kv in (2048,):
+                num_blocks, blocksize = max_model_len * 2, 64
 
-            q = torch.randn(
-                (batch_size, next_n, heads, index_dim),
-                device="cuda",
-                dtype=torch.bfloat16,
-            )
-            kv_cache = torch.randn(
-                (num_blocks, blocksize, 1, index_dim),
-                device="cuda",
-                dtype=torch.bfloat16,
-            )
-            weights = torch.randn(
-                (batch_size * next_n, heads),
-                device="cuda",
-                dtype=torch.float32,
-            )
+                q = torch.randn(
+                    (batch_size, next_n, heads, index_dim),
+                    device="cuda",
+                    dtype=torch.bfloat16,
+                )
+                kv_cache = torch.randn(
+                    (num_blocks, blocksize, 1, index_dim),
+                    device="cuda",
+                    dtype=torch.bfloat16,
+                )
+                weights = torch.randn(
+                    (batch_size * next_n, heads),
+                    device="cuda",
+                    dtype=torch.float32,
+                )
 
-            context_lens = (
-                torch.randint(int(0.8 * avg_kv), int(1.2 * avg_kv), (batch_size,))
-                .cuda()
-                .to(torch.int32)
-            )
-            max_block_len = (
-                (context_lens.max().item() + blocksize - 1) // blocksize * blocksize
-            )
-            block_tables = torch.zeros(
-                (batch_size, max_block_len),
-                device="cuda",
-                dtype=torch.int32,
-            )
+                context_lens = (
+                    torch.randint(int(0.8 * avg_kv), int(1.2 * avg_kv), (batch_size,))
+                    .cuda()
+                    .to(torch.int32)
+                )
+                max_block_len = (
+                    (context_lens.max().item() + blocksize - 1) // blocksize * blocksize
+                )
+                block_tables = torch.zeros(
+                    (batch_size, max_block_len),
+                    device="cuda",
+                    dtype=torch.int32,
+                )
 
-            counter = 0
-            block_idx_pool = list(range(num_blocks))
-            random.shuffle(block_idx_pool)
-            for i in range(batch_size):
-                ctx_len = int(context_lens[i].item())
-                for j in range((ctx_len + blocksize - 1) // blocksize):
-                    block_tables[i][j] = block_idx_pool[counter]
-                    counter += 1
+                counter = 0
+                block_idx_pool = list(range(num_blocks))
+                random.shuffle(block_idx_pool)
+                for i in range(batch_size):
+                    ctx_len = int(context_lens[i].item())
+                    for j in range((ctx_len + blocksize - 1) // blocksize):
+                        block_tables[i][j] = block_idx_pool[counter]
+                        counter += 1
 
-            q_fp8 = q.to(torch.float8_e4m3fn)
-            kv_cache_fp8 = kv_cache_cast_to_fp8(kv_cache)
+                q_fp8 = q.to(torch.float8_e4m3fn)
+                kv_cache_fp8 = kv_cache_cast_to_fp8(kv_cache)
 
-            # deep_gemm paged MQA logits requires 2D context_lens of
-            # shape (B, next_n) (csrc/apis/attention.hpp:332-335);
-            # see indexer.py:607-608. For each batch/next_n token, the
-            # effective context length is context_lens[b] - next_n + j + 1.
-            next_n_arange = torch.arange(next_n, device="cuda", dtype=torch.int32)
-            context_lens_2d = (
-                context_lens.unsqueeze(-1) - next_n + 1 + next_n_arange
-            ).contiguous()
-            schedule_metadata = get_paged_mqa_logits_metadata(
-                context_lens_2d,
-                blocksize,
-                get_num_sms(),
-            )
-            logits = fp8_fp4_paged_mqa_logits(
-                (q_fp8, None),
-                kv_cache_fp8,
-                weights,
-                context_lens_2d,
-                block_tables,
-                schedule_metadata,
-                max_model_len,
-                clean_logits=clean_logits,
-            )
+                # deep_gemm paged MQA logits requires 2D context_lens of
+                # shape (B, next_n) (csrc/apis/attention.hpp:332-335);
+                # see indexer.py:607-608. For each batch/next_n token, the
+                # effective context length is context_lens[b] - next_n + j + 1.
+                next_n_arange = torch.arange(next_n, device="cuda", dtype=torch.int32)
+                context_lens_2d = (
+                    context_lens.unsqueeze(-1) - next_n + 1 + next_n_arange
+                ).contiguous()
+                schedule_metadata = get_paged_mqa_logits_metadata(
+                    context_lens_2d, blocksize, get_num_sms()
+                )
+                logits = fp8_fp4_paged_mqa_logits(
+                    (q_fp8, None),
+                    kv_cache_fp8,
+                    weights,
+                    context_lens_2d,
+                    block_tables,
+                    schedule_metadata,
+                    max_model_len,
+                    clean_logits=clean_logits,
+                )
 
-            ref_logits = _ref_fp8_fp4_paged_mqa_logits(
-                q,
-                kv_cache,
-                weights,
-                context_lens,
-                block_tables,
-                max_model_len,
-            )
+                ref_logits = _ref_fp8_fp4_paged_mqa_logits(
+                    q,
+                    kv_cache,
+                    weights,
+                    context_lens,
+                    block_tables,
+                    max_model_len,
+                )
 
-            positions = (
-                torch.arange(max_model_len, device="cuda")
-                .unsqueeze(0)
-                .expand(batch_size * next_n, -1)
-            )
-            row_indices = torch.arange(batch_size * next_n, device="cuda") // next_n
-            next_n_offset = torch.arange(batch_size * next_n, device="cuda") % next_n
-            mask = positions <= (
-                context_lens[row_indices] - next_n + next_n_offset
-            ).unsqueeze(1)
+                positions = (
+                    torch.arange(max_model_len, device="cuda")
+                    .unsqueeze(0)
+                    .expand(batch_size * next_n, -1)
+                )
+                row_indices = torch.arange(batch_size * next_n, device="cuda") // next_n
+                next_n_offset = (
+                    torch.arange(batch_size * next_n, device="cuda") % next_n
+                )
+                mask = positions <= (
+                    context_lens[row_indices] - next_n + next_n_offset
+                ).unsqueeze(1)
 
-            logits = logits.masked_fill(~mask, 0)
-            ref_logits = ref_logits.masked_fill(~mask, 0)
-            diff = calc_diff(logits, ref_logits)
-            assert diff < 1e-3, f"{diff=}"
+                logits = logits.masked_fill(~mask, 0)
+                ref_logits = ref_logits.masked_fill(~mask, 0)
+                diff = calc_diff(logits, ref_logits)
+                assert diff < 1e-3, f"{diff=}"
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA only")
+@pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
+@pytest.mark.skipif(
+    not current_platform.has_device_capability(90), reason="SM90 and SM100 only"
+)
+@pytest.mark.parametrize("context_len", [512, 513, 2052])
+def test_deepgemm_paged_and_contiguous_indexer_logits_exact(context_len: int):
+    """P/D gate: identical FP8 Q/K bytes must produce identical logits.
+
+    The 513 case is the first DS4 position where top-512 selection observes
+    logits instead of returning every candidate. 2052 covers the exact first
+    mismatch seen in the fixed DAPO 2K capsule.
+    """
+    torch.manual_seed(20260815)
+    # DeepGEMM consumes the cache's storage block size (64), not the
+    # uncompressed sparse-attention scheduling page size (256).
+    heads, head_dim, block_size = 64, 128, 64
+    max_model_len = 2304
+    num_blocks = cdiv(context_len, block_size)
+    q = torch.randn(
+        (1, 1, heads, head_dim), device="cuda", dtype=torch.bfloat16
+    ).to(torch.float8_e4m3fn)
+    kv = torch.randn(
+        (num_blocks, block_size, 1, head_dim),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    weights = torch.randn((1, heads), device="cuda", dtype=torch.float32)
+    packed = kv_cache_cast_to_fp8(kv)
+    packed_bytes = packed.view(num_blocks, -1)
+    contiguous_k = packed_bytes[:, : block_size * head_dim].reshape(
+        num_blocks * block_size, head_dim
+    ).view(torch.float8_e4m3fn)[:context_len]
+    contiguous_scale = packed_bytes[:, block_size * head_dim :].reshape(
+        num_blocks * block_size, 4
+    ).view(torch.float32).reshape(-1)[:context_len]
+
+    context_lens = torch.tensor([[context_len]], device="cuda", dtype=torch.int32)
+    block_table = torch.arange(
+        num_blocks, device="cuda", dtype=torch.int32
+    ).unsqueeze(0)
+    schedule = get_paged_mqa_logits_metadata(
+        context_lens, block_size, get_num_sms()
+    )
+    paged = fp8_fp4_paged_mqa_logits(
+        (q, None),
+        packed,
+        weights,
+        context_lens,
+        block_table,
+        schedule,
+        max_model_len,
+        clean_logits=False,
+    )[0, :context_len]
+    # The target request must also be invariant to a co-batched request and
+    # the resulting scheduler metadata/layout.
+    q_batched = torch.cat(
+        [
+            q,
+            torch.randn_like(q.to(torch.bfloat16)).to(torch.float8_e4m3fn),
+        ],
+        dim=0,
+    )
+    weights_batched = torch.cat(
+        [weights, torch.randn_like(weights)], dim=0
+    )
+    context_lens_batched = torch.tensor(
+        [[context_len], [max(1, context_len - 7)]],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    block_table_batched = block_table.expand(2, -1).contiguous()
+    schedule_batched = get_paged_mqa_logits_metadata(
+        context_lens_batched, block_size, get_num_sms()
+    )
+    paged_batched = fp8_fp4_paged_mqa_logits(
+        (q_batched, None),
+        packed,
+        weights_batched,
+        context_lens_batched,
+        block_table_batched,
+        schedule_batched,
+        max_model_len,
+        clean_logits=False,
+    )[0, :context_len]
+    assert torch.equal(paged, paged_batched), (
+        context_len,
+        "paged target changed under co-batching",
+        int((paged != paged_batched).sum().item()),
+        float((paged - paged_batched).abs().max().item()),
+    )
+    contiguous = fp8_fp4_mqa_logits(
+        (q.reshape(1, heads, head_dim), None),
+        (contiguous_k, contiguous_scale),
+        weights,
+        torch.tensor([0], device="cuda", dtype=torch.int32),
+        torch.tensor([context_len], device="cuda", dtype=torch.int32),
+        clean_logits=False,
+    )[0, :context_len]
+    assert torch.equal(paged, contiguous), (
+        context_len,
+        int((paged != contiguous).sum().item()),
+        float((paged - contiguous).abs().max().item()),
+    )

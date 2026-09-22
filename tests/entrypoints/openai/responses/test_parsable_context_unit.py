@@ -11,7 +11,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from vllm.entrypoints.generate.base.protocol import (
+from vllm.entrypoints.openai.engine.protocol import (
     DeltaMessage,
     ExtractedToolCallInformation,
     FunctionCall,

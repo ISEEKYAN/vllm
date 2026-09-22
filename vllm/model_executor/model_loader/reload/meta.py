@@ -124,14 +124,11 @@ def restore_layer_on_meta(layer: torch.nn.Module, info: LayerReloadingInfo):
         return
 
     non_persistent = set(layer._non_persistent_buffers_set)
-    restore_params, restore_buffers = info.restore_metadata
-    tensor_names = (
-        get_layer_tensors(layer).keys() | restore_params.keys() | restore_buffers.keys()
-    )
-    for name in tensor_names:
-        if name not in SKIP_TENSORS and hasattr(layer, name):
+    for name in get_layer_tensors(layer):
+        if name not in SKIP_TENSORS:
             delattr(layer, name)
 
+    restore_params, restore_buffers = info.restore_metadata
     for name, param in restore_params.items():
         if name not in SKIP_TENSORS:
             param = restore_layer_refs(param, layer)

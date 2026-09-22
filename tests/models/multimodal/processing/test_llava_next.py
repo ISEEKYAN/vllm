@@ -11,7 +11,6 @@ from pqdm.threads import pqdm
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.parse import ImageSize
 from vllm.multimodal.processing import BaseMultiModalProcessor
-from vllm.tokenizers.hf import maybe_make_thread_pool
 
 from ...utils import build_model_context
 
@@ -145,14 +144,7 @@ def test_processor_prompt_replacements_regression(model_id, num_imgs):
         mm_processor_kwargs=None,
         limit_mm_per_prompt={"image": num_imgs},
     )
-
-    # Avoid tokenizer already borrowed error
-    maybe_make_thread_pool(ctx.tokenizer)
-
-    processor = MULTIMODAL_REGISTRY.create_processor(
-        ctx.model_config,
-        tokenizer=ctx.tokenizer,
-    )
+    processor = MULTIMODAL_REGISTRY.create_processor(ctx.model_config)
 
     image_ratios = [
         (171, 152),
@@ -185,14 +177,7 @@ def test_processor_prompt_replacements_all(model_id, num_imgs):
         mm_processor_kwargs=None,
         limit_mm_per_prompt={"image": num_imgs},
     )
-
-    # Avoid tokenizer already borrowed error
-    maybe_make_thread_pool(ctx.tokenizer)
-
-    processor = MULTIMODAL_REGISTRY.create_processor(
-        ctx.model_config,
-        tokenizer=ctx.tokenizer,
-    )
+    processor = MULTIMODAL_REGISTRY.create_processor(ctx.model_config)
 
     seen_aspect_ratios = set[float]()
     image_sizes = list[ImageSize]()

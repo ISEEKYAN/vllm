@@ -37,7 +37,6 @@ from vllm.multimodal.parse import (
     DictEmbeddingItems,
     ModalityData,
     ModalityDataItems,
-    MultiModalDataItems,
     MultiModalDataParser,
 )
 from vllm.multimodal.processing import (
@@ -202,7 +201,7 @@ class KimiAudioDummyInputsBuilder(BaseDummyInputsBuilder[KimiAudioProcessingInfo
 # Field config for Kimi-Audio multimodal data
 _KIMIAUDIO_FIELD_CONFIG = {
     "whisper_input_features": MultiModalFieldConfig.batched("audio"),
-    "feature_attention_mask": MultiModalFieldConfig.batched("audio", keep_on_cpu=True),
+    "feature_attention_mask": MultiModalFieldConfig.batched("audio"),
 }
 
 
@@ -227,20 +226,14 @@ class KimiAudioMultiModalDataParser(MultiModalDataParser):
 class KimiAudioMultiModalProcessor(BaseMultiModalProcessor[KimiAudioProcessingInfo]):
     """vLLM multi-modal processor wrapper for Kimi-Audio."""
 
-    def _apply_hf_processor_main(
+    def _call_hf_processor(
         self,
-        mm_items: MultiModalDataItems,
-        hf_processor_mm_kwargs: Mapping[str, object],
+        prompt: str,
+        mm_data: Mapping[str, object],
+        mm_kwargs: Mapping[str, object],
+        tok_kwargs: Mapping[str, object],
     ) -> BatchFeature:
         """Call the HuggingFace processor."""
-        valid_mm_items = mm_items.select(
-            {k for k, c in mm_items.get_all_counts().items() if c > 0}
-        )
-        mm_data, passthrough_data = self._get_hf_mm_data(valid_mm_items)
-
-        if not mm_data:
-            return BatchFeature(dict(passthrough_data))
-
         # Convert mm_data format: {'audios': [...]} -> {'audio': ...}
         mm_data = dict(mm_data)
         audios = mm_data.pop("audios", [])
@@ -260,13 +253,11 @@ class KimiAudioMultiModalProcessor(BaseMultiModalProcessor[KimiAudioProcessingIn
             mm_data["audio"] = audio_arrays
 
         # Use the context's call_hf_processor for proper handling
-        processed_data = self.info.ctx.call_hf_processor(
-            self.info.get_hf_processor(**hf_processor_mm_kwargs),
-            mm_data,
-            hf_processor_mm_kwargs,
+        return self.info.ctx.call_hf_processor(
+            self.info.get_hf_processor(**mm_kwargs),
+            dict(text=prompt, **mm_data),
+            dict(**mm_kwargs, **tok_kwargs),
         )
-        processed_data.update(passthrough_data)
-        return processed_data
 
     def _get_mm_fields_config(
         self,
@@ -389,12 +380,6 @@ class KimiAudioForConditionalGeneration(
             "model.embed_tokens.": "language_model.model.embed_tokens.",
             "model.norm.": "language_model.model.norm.",
             "lm_head.": "language_model.lm_head.",
-            # MIMO/TTS weights and any `model.` residue no rule above
-            # claimed: this model only does ASR (speech-to-text).
-            "model.": None,
-            "mimo_layers.": None,
-            "mimo_output.": None,
-            "mimo_norm.": None,
         },
         orig_to_new_substr={
             ".fc1.": ".mlp.fc1.",
@@ -588,8 +573,21 @@ class KimiAudioForConditionalGeneration(
         return self.language_model.compute_logits(hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        """Load weights, skipping MIMO layers (TTS-only) for ASR."""
+        # Filter out MIMO/TTS weights since we only do ASR (speech-to-text)
+        skipped_patterns = [
+            # Audio tower
+            "model.",
+            # MIMO/TTS
+            "mimo_layers.",
+            "mimo_output.",
+            "mimo_norm.",
+        ]
+
+        # Load main model weights (LLM + projector) with mapper
+        loader = AutoWeightsLoader(self, skip_prefixes=skipped_patterns)
+        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        return loaded
 
     @classmethod
     def get_speech_to_text_config(

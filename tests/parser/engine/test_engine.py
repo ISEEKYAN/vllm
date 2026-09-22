@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for the streaming parser engine core pipeline."""
 
-from dataclasses import replace
 from unittest.mock import MagicMock
 
 import pytest
@@ -68,16 +67,6 @@ def _think_config() -> ParserEngineConfig:
                 ParserState.CONTENT,
                 (EventType.REASONING_END,),
             ),
-        },
-    )
-
-
-def _token_think_config() -> ParserEngineConfig:
-    return replace(
-        _think_config(),
-        token_id_terminals={
-            "THINK_START": "<think>",
-            "THINK_END": "</think>",
         },
     )
 
@@ -450,46 +439,6 @@ class TestTokenIdFiltering:
 
         assert sum(1 for e in all_events if e.type == EventType.TOOL_CALL_START) == 1
         assert sum(1 for e in all_events if e.type == EventType.TOOL_CALL_END) == 1
-
-
-class TestReasoningTokenCounts:
-    def test_counts_reasoning_and_excludes_boundaries_and_content(self):
-        engine = StreamingParserEngine(_token_think_config(), _make_think_tokenizer())
-
-        events = engine.feed(
-            "<think>tok1tok2</think>tok3",
-            [_START_ID, 1, 2, _END_ID, 3],
-        )
-        events.extend(engine.finish())
-
-        reasoning = [e for e in events if e.type == EventType.REASONING_CHUNK]
-        assert "".join(e.value for e in reasoning) == "tok1tok2"
-        assert sum(e.token_count for e in reasoning) == 2
-        assert engine.reasoning_token_count == 2
-
-    def test_counts_tokens_after_final_deferred_start_terminal(self):
-        engine = StreamingParserEngine(_token_think_config(), _make_think_tokenizer())
-
-        assert engine.feed("", [_START_ID, 1, 2]) == []
-        events = engine.feed("<think>tok1tok2", [])
-
-        reasoning = [e for e in events if e.type == EventType.REASONING_CHUNK]
-        assert "".join(e.value for e in reasoning) == "tok1tok2"
-        assert sum(e.token_count for e in reasoning) == 2
-        assert engine.reasoning_token_count == 2
-
-    def test_deferred_reasoning_tokens_stay_before_next_end_terminal(self):
-        engine = StreamingParserEngine(_token_think_config(), _make_think_tokenizer())
-
-        assert engine.feed("", [_START_ID, 1, 2]) == []
-        events = engine.feed("<think>tok1tok2</think>tok3", [_END_ID, 3])
-
-        assert (
-            sum(e.token_count for e in events if e.type == EventType.REASONING_CHUNK)
-            == 2
-        )
-        assert sum(e.token_count for e in events if e.type == EventType.TEXT_CHUNK) == 1
-        assert engine.reasoning_token_count == 2
 
 
 def _func_prefix_config() -> ParserEngineConfig:

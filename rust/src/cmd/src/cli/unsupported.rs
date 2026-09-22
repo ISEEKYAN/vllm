@@ -240,12 +240,15 @@ pub struct EngineUnsupportedArgs {
     #[arg(long)]
     pub hf_overrides: Option<Unsupported>,
 
-    /// Overrides or sets generation config. e.g. `{"temperature": 0.5}`. If
-    /// used with `--generation-config auto`, the override parameters will be
-    /// merged with the default config from the model. If used with
-    /// `--generation-config vllm`, only the override parameters are used.
+    /// The folder path to the generation config. Defaults to `"auto"`, the
+    /// generation config will be loaded from model path. If set to `"vllm"`, no
+    /// generation config is loaded, vLLM defaults will be used. If set to a
+    /// folder path, the generation config will be loaded from the specified
+    /// folder path. If `max_new_tokens` is specified in generation config,
+    /// then it sets a server-wide limit on the number of output tokens for
+    /// all requests.
     #[arg(long)]
-    pub override_generation_config: Option<Unsupported>,
+    pub generation_config: Option<Unsupported>,
 
     /// IOProcessor plugin name to load at model startup
     #[arg(long)]

@@ -458,10 +458,9 @@ class P2PSession:
                 )
             if msg[ConnectMsg.HASH_SEED] != self._local_hash_seed:
                 raise ValueError(
-                    f"hash seed mismatch from {self.peer_id}: "
+                    f"PYTHONHASHSEED mismatch from {self.peer_id}: "
                     f"remote={msg[ConnectMsg.HASH_SEED]!r}, "
-                    f"local={self._local_hash_seed!r}. Ensure PYTHONHASHSEED "
-                    "(if set) matches on all P2P peers."
+                    f"local={self._local_hash_seed!r}"
                 )
             self._transport.add_remote_peer(
                 self.peer_id,

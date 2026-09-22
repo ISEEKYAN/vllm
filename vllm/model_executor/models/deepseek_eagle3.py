@@ -159,7 +159,6 @@ class DeepseekV2Eagle3Model(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        assert vllm_config.speculative_config is not None
         self.config = vllm_config.speculative_config.draft_model_config.hf_config
         self.vocab_size = self.config.vocab_size
 
@@ -277,7 +276,6 @@ class Eagle3DeepseekV2ForCausalLM(LocalArgmaxMixin, DeepseekV2ForCausalLM):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         nn.Module.__init__(self)
-        assert vllm_config.speculative_config is not None
         self.config = vllm_config.speculative_config.draft_model_config.hf_config
 
         # Ensure draft_vocab_size is set
@@ -320,7 +318,7 @@ class Eagle3DeepseekV2ForCausalLM(LocalArgmaxMixin, DeepseekV2ForCausalLM):
     ) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
-    def forward(  # type: ignore[override]
+    def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
@@ -384,17 +382,18 @@ class Eagle3DeepseekV2ForCausalLM(LocalArgmaxMixin, DeepseekV2ForCausalLM):
             model_weights[name] = loaded_weight
             process_eagle_weight(self, name)
 
-        orig_to_new_substr: dict[str, str | None] = {}
+        skip_substrs = []
         if not includes_draft_id_mapping:
-            orig_to_new_substr["draft_id_to_target_id"] = None
+            skip_substrs.append("draft_id_to_target_id")
         if not includes_embed_tokens:
-            orig_to_new_substr["embed_tokens"] = None
+            skip_substrs.append("embed_tokens")
 
-        loader = AutoWeightsLoader(self)
-        loader.load_weights(
-            model_weights.items(),
-            mapper=WeightsMapper(orig_to_new_substr=orig_to_new_substr),
+        loader = AutoWeightsLoader(
+            self,
+            skip_prefixes=None,
+            skip_substrs=skip_substrs,
         )
+        loader.load_weights(model_weights.items())
 
 
 # Aliases for compatibility

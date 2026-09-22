@@ -14,7 +14,6 @@ from vllm.distributed.ec_transfer.ec_connector.base import (
     ECConnectorRole,
 )
 from vllm.logger import init_logger
-from vllm.utils.collection_utils import is_list_of
 from vllm.v1.core.sched.output import SchedulerOutput
 
 if TYPE_CHECKING:
@@ -222,15 +221,11 @@ class ECExampleConnector(ECConnectorBase):
             # back to processing the media itself.
             if feature.data is not None:
                 wanted = self._placeholder_metadata_fields(feature.modality)
-                for key, value in feature.data.get_data().items():
-                    if key not in wanted:
-                        continue
-                    if isinstance(value, torch.Tensor):
-                        metadata[key] = value.tolist()
-                    elif is_list_of(value, (int, float)):
-                        # Some metadata (e.g. Qwen3-VL video timestamps) is
-                        # produced as a plain list rather than a tensor.
-                        metadata[key] = value
+                metadata = {
+                    key: value.tolist()
+                    for key, value in feature.data.get_data().items()
+                    if key in wanted and isinstance(value, torch.Tensor)
+                }
             items.append({"mm_hash": feature.identifier, **metadata})
 
         if not items:

@@ -91,9 +91,7 @@ def _make_kv_cache_config(
         tensors.append(
             KVCacheTensor(
                 size=_BYTES_PER_BLOCK * num_blocks,
-                layers=layer_names,
-                layer_stride=_BYTES_PER_BLOCK * num_blocks,
-                block_stride=_BYTES_PER_BLOCK,
+                shared_by=layer_names,
             )
         )
     return KVCacheConfig(

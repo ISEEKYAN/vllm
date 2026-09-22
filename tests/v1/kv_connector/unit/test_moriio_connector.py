@@ -43,7 +43,6 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheTensor,
-    compute_layer_kv_cache_shape_bytes,
 )
 
 from .utils import create_request, create_scheduler
@@ -57,25 +56,20 @@ def _find_free_port() -> int:
 
 def _make_test_kv_cache_config() -> KVCacheConfig:
     layer_names = ["layer0", "layer1", "layer2"]
-    num_blocks = 2
-    spec = FullAttentionSpec(
-        block_size=16,
-        num_kv_heads=4,
-        head_size=64,
-        dtype=torch.float16,
-    )
-    page = spec.page_size_bytes
     return KVCacheConfig(
-        num_blocks=num_blocks,
-        kv_cache_tensors=[
-            KVCacheTensor(
-                size=len(layer_names) * num_blocks * page,
-                layers=layer_names,
-                layer_stride=num_blocks * page,
-                block_stride=page,
+        num_blocks=2,
+        kv_cache_tensors=[KVCacheTensor(size=0, shared_by=layer_names)],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                layer_names=layer_names,
+                kv_cache_spec=FullAttentionSpec(
+                    block_size=16,
+                    num_kv_heads=4,
+                    head_size=64,
+                    dtype=torch.float16,
+                ),
             )
         ],
-        kv_cache_groups=[KVCacheGroupSpec(layer_names=layer_names, kv_cache_spec=spec)],
     )
 
 
@@ -231,7 +225,7 @@ class FakeMoRIIOConnectorWorker(MoRIIOConnectorWorker):
         engine_id,
         *args,
         hand_shake_latency: float = 1.8,
-        kv_cache_layout="LBHNC",
+        kv_cache_layout="HND",
         kv_cache_config=None,
         **kwargs,
     ):
@@ -537,15 +531,16 @@ def test_register_kv_caches(mock_parallel_groups):
     DEFAULT_PORT = 6301
     TP_RANK = 0
     DP_RANK = 0
-    # Create test kv cache tensors using KVCacheSpec layout
-    shape = compute_layer_kv_cache_shape_bytes(
-        FullAttentionSpec(
-            block_size=16, num_kv_heads=4, head_size=64, dtype=torch.float16
-        ),
-        2,
+    from vllm.v1.attention.backends.rocm_aiter_fa import AiterFlashAttentionBackend
+
+    backend_cls = AiterFlashAttentionBackend
+
+    # Create test kv cache tensors using proper backend shape
+    kv_cache_shape = backend_cls.get_kv_cache_shape(
+        num_blocks=2, block_size=16, num_kv_heads=4, head_size=64
     )
-    shared_tensor = torch.zeros(*shape, dtype=torch.int8).view(torch.float16)
-    unique_tensor = torch.zeros(*shape, dtype=torch.int8).view(torch.float16)
+    shared_tensor = torch.zeros(*kv_cache_shape, dtype=torch.float16)
+    unique_tensor = torch.zeros(*kv_cache_shape, dtype=torch.float16)
     kv_caches = {
         "layer0": shared_tensor,
         "layer1": unique_tensor,
@@ -632,15 +627,16 @@ def test_moriio_handshake_returns_metadata(mock_parallel_groups):
 
     ROLE = "kv_consumer"
     vllm_config = create_vllm_config(role=ROLE)
-    # Create test kv cache tensors using KVCacheSpec layout
-    shape = compute_layer_kv_cache_shape_bytes(
-        FullAttentionSpec(
-            block_size=16, num_kv_heads=4, head_size=64, dtype=torch.float16
-        ),
-        2,
+    from vllm.v1.attention.backends.rocm_aiter_fa import AiterFlashAttentionBackend
+
+    backend_cls = AiterFlashAttentionBackend
+
+    # Create test kv cache tensors using proper backend shape
+    kv_cache_shape = backend_cls.get_kv_cache_shape(
+        num_blocks=2, block_size=16, num_kv_heads=4, head_size=64
     )
-    shared_tensor = torch.zeros(*shape, dtype=torch.int8).view(torch.float16)
-    unique_tensor = torch.zeros(*shape, dtype=torch.int8).view(torch.float16)
+    shared_tensor = torch.zeros(*kv_cache_shape, dtype=torch.float16)
+    unique_tensor = torch.zeros(*kv_cache_shape, dtype=torch.float16)
     kv_caches = {
         "layer0": shared_tensor,
         "layer1": unique_tensor,

@@ -129,11 +129,8 @@ pub(super) async fn load_model_backends(
     options: LoadModelBackendsOptions,
 ) -> Result<LoadedModelBackends> {
     let files = ResolvedModelFiles::new(model_id).await?;
-    let text_backend = HfTextBackend::from_resolved_model_files(
-        files.clone(),
-        model_id.to_string(),
-        options.generation_config,
-    )?;
+    let text_backend =
+        HfTextBackend::from_resolved_model_files(files.clone(), model_id.to_string())?;
     let tokenizer = text_backend.tokenizer();
     let text_backend: DynTextBackend = Arc::new(text_backend);
 
@@ -230,7 +227,6 @@ mod tests {
             resolved_files(config_json, tokenizer_config_json),
             "test-model".to_string(),
             LoadModelBackendsOptions {
-                generation_config: Default::default(),
                 renderer,
                 language_model_only: false,
                 chat_template_content_format: Default::default(),

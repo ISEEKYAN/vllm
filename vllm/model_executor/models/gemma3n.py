@@ -77,7 +77,7 @@ class Gemma3nAltUp(nn.Module):
         altup_num_inputs: int,
         altup_coef_clip: float,
         altup_active_idx: int,
-        quant_config: QuantizationConfig | None,
+        quant_config: QuantizationConfig,
         prefix: str,
     ):
         super().__init__()
@@ -114,10 +114,8 @@ class Gemma3nAltUp(nn.Module):
             hidden_size=hidden_size,
             eps=rms_norm_eps,
         )
-        self.register_buffer(
-            "router_input_scale",
-            torch.tensor(hidden_size**-1.0, dtype=self.modality_router.weight.dtype),
-            persistent=False,
+        self.router_input_scale = torch.tensor(
+            hidden_size**-1.0, dtype=self.modality_router.weight.dtype
         )
         self.correct_output_scale = nn.Parameter(
             torch.zeros(hidden_size, dtype=torch.float32)
@@ -599,13 +597,9 @@ class Gemma3nSelfDecoder(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.embed_tokens",
         )
-        self.register_buffer(
-            "embed_scale",
-            torch.tensor(
-                config.hidden_size**0.5,
-                dtype=self.embed_tokens.weight.dtype,
-            ),
-            persistent=False,
+        self.embed_scale = torch.tensor(
+            config.hidden_size**0.5,
+            dtype=self.embed_tokens.weight.dtype,
         )
         # Additional per-layer embeddings (PLE)
         self.embed_tokens_per_layer = VocabParallelEmbedding(
@@ -614,13 +608,9 @@ class Gemma3nSelfDecoder(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.per_layer_embed_tokens",
         )
-        self.register_buffer(
-            "embed_scale_per_layer",
-            torch.tensor(
-                config.hidden_size_per_layer_input**0.5,
-                dtype=self.embed_tokens.weight.dtype,
-            ),
-            persistent=False,
+        self.embed_scale_per_layer = torch.tensor(
+            config.hidden_size_per_layer_input**0.5,
+            dtype=self.embed_tokens.weight.dtype,
         )
         self.per_layer_model_projection = ColumnParallelLinear(
             config.hidden_size,
@@ -635,18 +625,12 @@ class Gemma3nSelfDecoder(nn.Module):
             hidden_size=config.hidden_size_per_layer_input,
             eps=config.rms_norm_eps,
         )
-        self.register_buffer(
-            "per_layer_input_scale",
-            torch.rsqrt(torch.tensor(2.0)).to(self.embed_tokens.weight.dtype),
-            persistent=False,
+        self.per_layer_input_scale = torch.rsqrt(torch.tensor(2.0)).to(
+            self.embed_tokens.weight.dtype
         )
-        self.register_buffer(
-            "per_layer_projection_scale",
-            torch.tensor(
-                config.hidden_size**0.5,
-                dtype=self.embed_tokens.weight.dtype,
-            ),
-            persistent=False,
+        self.per_layer_projection_scale = torch.tensor(
+            config.hidden_size**0.5,
+            dtype=self.embed_tokens.weight.dtype,
         )
         self.altup_projections = nn.ModuleList(
             [
@@ -1072,14 +1056,6 @@ class Gemma3nTextModel(nn.Module, SupportsQuant):
 
 
 class Gemma3nForCausalLM(nn.Module):
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={
-            "embed_audio.": None,
-            "embed_vision.": None,
-            "audio_tower.": None,
-            "vision_tower.": None,
-        }
-    )
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -1136,5 +1112,10 @@ class Gemma3nForCausalLM(nn.Module):
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        loader = AutoWeightsLoader(
+            self,
+            skip_substrs=(
+                ["embed_audio.", "embed_vision.", "audio_tower.", "vision_tower."]
+            ),
+        )
+        return loader.load_weights(weights)

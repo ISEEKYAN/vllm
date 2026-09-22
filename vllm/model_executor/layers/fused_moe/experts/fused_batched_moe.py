@@ -37,10 +37,9 @@ from vllm.triton_utils.allocation import set_triton_allocator
 
 
 def _is_capturing_or_compiling() -> bool:
-    # The accelerator API dispatches to the active backend.
-    return (
-        torch.compiler.is_compiling()
-        or torch.accelerator.current_stream().is_capturing()
+    # torch.cuda.is_current_stream_capturing() is unavailable on non-CUDA (XPU) torch.
+    return torch.compiler.is_compiling() or (
+        current_platform.is_cuda_alike() and torch.cuda.is_current_stream_capturing()
     )
 
 
@@ -668,7 +667,6 @@ class NaiveBatchedExperts(mk.FusedMoEExpertsModular):
         assert hidden_states.dim() == 3
         assert expert_tokens_meta is not None
         expert_num_tokens = expert_tokens_meta.expert_num_tokens
-        assert expert_num_tokens is not None
 
         num_local_experts = w1.size(0)
         assert num_local_experts == w1.size(0), f"{num_local_experts} == {w1.size(0)}"

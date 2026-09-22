@@ -218,21 +218,6 @@ def test_reload_lifecycle():
         assert tensor.__dict__ == materialized_tensor.__dict__
 
 
-def test_restore_layer_replaces_postprocessed_tensor_attribute():
-    layer = torch.nn.Linear(2, 3, bias=False)
-    info = LayerReloadingInfo(
-        restore_metadata=capture_layer_to_meta(layer),
-        restore_device=torch.device("cpu"),
-    )
-    del layer.weight
-    layer.weight = torch.empty(3, 2)
-
-    restore_layer_on_meta(layer, info)
-
-    assert isinstance(layer.weight, torch.nn.Parameter)
-    assert layer.weight.is_meta
-
-
 def test_materialize_layer_preserves_non_meta_tensors():
     """Ensure that materialize_layer does not overwrite non meta tensors."""
     layer = torch.nn.Linear(2, 3, bias=True)
@@ -678,6 +663,33 @@ def test_layerwise_reload_composed_loader_does_not_drop_params(monkeypatch):
     assert torch.equal(layer.A, -torch.exp(loaded["A"]))
     assert torch.equal(layer.dt_bias, loaded["dt_bias"])
     assert torch.equal(layer.D, loaded["D"])
+
+
+class _ModelWithPostReloadCache(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.source = torch.nn.Parameter(torch.zeros(4))
+        self.source.weight_loader = default_weight_loader
+        self.register_buffer("derived", torch.zeros(1), persistent=False)
+        self.finalize_calls = 0
+
+    def finalize_weights_after_layerwise_reload(self) -> None:
+        self.derived.copy_(self.source.sum().reshape_as(self.derived))
+        self.finalize_calls += 1
+
+
+def test_layerwise_reload_refreshes_model_derived_cache():
+    model = _ModelWithPostReloadCache()
+    loaded = torch.arange(1, 5, dtype=torch.float32)
+
+    record_metadata_for_reloading(model)
+    initialize_layerwise_reload(model)
+    model.source.weight_loader(model.source, loaded)
+    finalize_layerwise_reload(model, model_config=None)
+
+    assert torch.equal(model.source, loaded)
+    assert torch.equal(model.derived, loaded.sum().reshape_as(model.derived))
+    assert model.finalize_calls == 1
 
 
 class _RecordingQuantMethod(QuantizeMethodBase):

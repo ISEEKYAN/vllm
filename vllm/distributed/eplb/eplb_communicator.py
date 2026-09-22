@@ -33,7 +33,6 @@ from vllm.distributed.stateless_coordinator import StatelessGroupCoordinator
 from vllm.distributed.utils import is_weak_contiguous
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
-from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 
 logger = init_logger(__name__)
 
@@ -223,11 +222,10 @@ class TorchDistGlooStagedEplbCommunicator(EplbCommunicator):
 
         # Wait for all D2H copies to finish
         # before issuing gloo batch_isend_irecv operations.
-        with gpu_sync_allowed():
-            if self._cuda_stream is not None:
-                self._cuda_stream.synchronize()
-            else:
-                torch.cuda.current_stream().synchronize()
+        if self._cuda_stream is not None:
+            self._cuda_stream.synchronize()
+        else:
+            torch.cuda.current_stream().synchronize()
 
         reqs = batch_isend_irecv(p2p_ops)
         for req in reqs:
@@ -248,6 +246,7 @@ class NixlEplbCommunicator(EplbCommunicator):
         cpu_group: ProcessGroup,
         all_expert_weights: Sequence[Sequence[torch.Tensor]],
         expert_buffer: Sequence[torch.Tensor],
+        defer_remote_setup: bool = False,
     ) -> None:
         """Create a NIXL-backed EPLB communicator.
 
@@ -255,6 +254,11 @@ class NixlEplbCommunicator(EplbCommunicator):
             cpu_group: CPU process group for metadata exchange.
             all_expert_weights: Expert weight tensors for all MoE layers.
             expert_buffer: Pre-allocated receive buffer tensors.
+            defer_remote_setup: If True, postpone the collective
+                all-gather of NIXL agent metadata until the first
+                ``set_transfer_context`` call.  Required for elastic EP
+                where ranks join asynchronously and cannot participate
+                in collectives at construction time.
         """
         assert all_expert_weights, (
             "NixlEplbCommunicator requires non-empty all_expert_weights."
@@ -311,17 +315,29 @@ class NixlEplbCommunicator(EplbCommunicator):
         ] = {}
 
         self._cuda_device_id = int(self._device.index or 0)
+        self._remote_state_initialized = False
         self._init_step("buffers", self._init_registered_buffers)
-        self._init_remote_state()
+        if defer_remote_setup:
+            logger.info_once("NIXL EPLB: deferring remote agent setup (elastic EP).")
+        else:
+            self._init_remote_state()
         self._log_initialized()
 
     def _init_remote_state(self) -> None:
         """Exchange NIXL agent metadata and RDMA pointer info with all peers.
 
         This is a collective operation (uses ``all_gather_object`` twice).
+        Under elastic EP the call is deferred to the first
+        ``set_transfer_context`` invocation, where all ranks are
+        guaranteed to be synchronized.
         """
         self._init_step("agents", self._init_remote_agents)
         self._init_step("send meta", self._exchange_remote_send_meta)
+        self._remote_state_initialized = True
+
+    def _ensure_remote_state(self) -> None:
+        if not self._remote_state_initialized:
+            self._init_remote_state()
 
     @property
     def needs_profile_buffer_reservation(self) -> bool:
@@ -355,6 +371,7 @@ class NixlEplbCommunicator(EplbCommunicator):
         pass
 
     def set_transfer_context(self, old_indices: np.ndarray, layer_idx: int) -> None:
+        self._ensure_remote_state()
         assert not self._xfer_entries, (
             f"set_transfer_context() called with {len(self._xfer_entries)} "
             f"pending transfers from layer {self._layer_idx}; "
@@ -654,8 +671,9 @@ def create_eplb_communicator(
             Falls back to ``"torch_nccl"`` when *None*.
             Stateless (elastic EP) groups support ``"torch_nccl"``,
             ``"pynccl"``, and ``"nixl"``; ``"torch_nccl"`` is silently
-            promoted to ``"pynccl"``.  When tensors reside on CPU,
-            ``"torch_gloo"`` or
+            promoted to ``"pynccl"``.  ``"nixl"`` uses deferred remote
+            agent setup to avoid collective deadlocks during elastic
+            scaling.  When tensors reside on CPU, ``"torch_gloo"`` or
             ``"torch_nccl"`` are used via the CPU process group.
         expert_weights: Expert weight tensors for *all* MoE layers.
             Shape ``(num_layers)(num_tensors_per_layer)``.
@@ -709,19 +727,22 @@ def create_eplb_communicator(
             ) from exc
 
     is_stateless = isinstance(group_coordinator, StatelessGroupCoordinator)
-    if is_stateless and backend != "nixl":
-        if backend not in ("torch_nccl", "pynccl"):
+    if is_stateless:
+        if backend == "nixl":
+            pass  # handled below with defer_remote_setup=True
+        elif backend not in ("torch_nccl", "pynccl"):
             raise ValueError(
                 f"Elastic EP requires 'torch_nccl', 'pynccl', or 'nixl' "
                 f"EPLB communicator (got '{backend}')."
             )
-        if backend == "torch_nccl":
-            logger.warning(
-                "Stateless elastic EP requires PyNCCL backend. "
-                "Forcing EPLB communicator to 'pynccl'."
-            )
-            backend = "pynccl"
-        return _create_pynccl()
+        else:
+            if backend == "torch_nccl":
+                logger.warning(
+                    "Stateless elastic EP requires PyNCCL backend. "
+                    "Forcing EPLB communicator to 'pynccl'."
+                )
+                backend = "pynccl"
+            return _create_pynccl()
 
     if backend == "nixl":
         if not has_nixl():
@@ -738,6 +759,7 @@ def create_eplb_communicator(
                 cpu_group=group_coordinator.cpu_group,
                 all_expert_weights=expert_weights,
                 expert_buffer=expert_buffer,
+                defer_remote_setup=is_stateless,
             )
         except Exception as exc:
             raise RuntimeError(

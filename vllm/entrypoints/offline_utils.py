@@ -19,7 +19,6 @@ from vllm.entrypoints.chat_utils import (
     ChatCompletionMessageParam,
     ChatTemplateContentFormatOption,
 )
-from vllm.exceptions import VLLMValidationError
 from vllm.inputs import EngineInput
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
@@ -247,7 +246,7 @@ class OfflineInferenceMixin:
     ) -> Sequence[_P]:
         if isinstance(params, Sequence):
             if len(params) != num_requests:
-                raise VLLMValidationError(
+                raise ValueError(
                     f"The lengths of prompts ({num_requests}) "
                     f"and params ({len(params)}) must be the same."
                 )
@@ -263,7 +262,7 @@ class OfflineInferenceMixin:
     ) -> Sequence[LoRARequest | None]:
         if isinstance(lora_request, Sequence):
             if len(lora_request) != num_requests:
-                raise VLLMValidationError(
+                raise ValueError(
                     f"The lengths of prompts ({num_requests}) "
                     f"and lora_request ({len(lora_request)}) must be the same."
                 )
@@ -279,7 +278,7 @@ class OfflineInferenceMixin:
     ) -> Sequence[int]:
         if priority is not None:
             if len(priority) != num_requests:
-                raise VLLMValidationError(
+                raise ValueError(
                     f"The lengths of prompts ({num_requests}) "
                     f"and priority ({len(priority)}) must be the same."
                 )

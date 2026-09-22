@@ -229,10 +229,6 @@ class CudaPlatformBase(Platform):
         with contextlib.suppress(ImportError):
             import vllm._qutlass_C  # noqa: F401
 
-    @classmethod
-    def check_runner_kv_caches_multi_layer(cls) -> None:
-        pass
-
     @property
     def supported_dtypes(self) -> list[torch.dtype]:
         if self.has_device_capability(80):
@@ -386,11 +382,8 @@ class CudaPlatformBase(Platform):
                     device_capability=device_capability,
                     **attn_selector_config._asdict(),
                 )
-            except (ImportError, OSError) as e:
-                logger.debug(
-                    "Attention backend %s is unavailable", backend.name, exc_info=True
-                )
-                invalid_reasons_i = [f"{type(e).__name__}: {e}"]
+            except ImportError:
+                invalid_reasons_i = ["ImportError"]
             if invalid_reasons_i:
                 invalid_reasons[backend] = (priority, invalid_reasons_i)
             else:
@@ -418,11 +411,8 @@ class CudaPlatformBase(Platform):
                     device_capability=device_capability,
                     **attn_selector_config._asdict(),
                 )
-            except (ImportError, OSError) as e:
-                raise ValueError(
-                    f"Selected backend {selected_backend} is not valid for "
-                    f"this configuration. Reason: [{type(e).__name__}: {e}]"
-                ) from e
+            except ImportError:
+                invalid_reasons = ["ImportError"]
             if invalid_reasons:
                 raise ValueError(
                     f"Selected backend {selected_backend} is not valid for "

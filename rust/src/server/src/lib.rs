@@ -45,9 +45,7 @@ use tonic_health::server::health_reporter;
 use tower::ServiceExt as _;
 use tracing::{info, trace, warn};
 use vllm_chat::{ChatLlm, LoadModelBackendsOptions, load_model_backends};
-pub use vllm_chat::{
-    ChatTemplateContentFormatOption, GenerationConfigMode, ParserSelection, RendererSelection,
-};
+pub use vllm_chat::{ChatTemplateContentFormatOption, ParserSelection, RendererSelection};
 use vllm_engine_core_client::{EngineCoreClient, EngineCoreClientConfig};
 use vllm_llm::Llm;
 use vllm_text::TextLlm;
@@ -98,7 +96,6 @@ async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     let loaded = load_model_backends(
         &config.model,
         LoadModelBackendsOptions {
-            generation_config: config.generation_config,
             renderer: config.renderer,
             language_model_only: config.language_model_only,
             chat_template: config.chat_template.clone(),
@@ -144,6 +141,7 @@ async fn build_state(config: &Config) -> Result<Arc<AppState>> {
             .with_model_path(config.model.clone())
             .with_api_server_options(config.api_server_options)
             .with_server_info(ServerInfoSnapshot::from_config(config))
+            .with_data_parallel_size(config.data_parallel_size)
             .with_api_keys(config.api_keys.clone())
             .with_cors(config.cors.clone())
             .with_profiler(config.profiler.clone()),
@@ -219,8 +217,7 @@ where
         health_reporter.set_serving::<grpc::InferenceGrpcService>().await;
         health_reporter.set_serving::<grpc::ControlGrpcService>().await;
         let control_service =
-            grpc::ControlGrpcService::new(grpc::ControlServiceImpl::new(state.clone()))
-                .max_decoding_message_size(DEFAULT_REQUEST_BODY_LIMIT_BYTES);
+            grpc::ControlGrpcService::new(grpc::ControlServiceImpl::new(state.clone()));
         let inference_service =
             grpc::InferenceGrpcService::new(grpc::InferenceServiceImpl::new(state.clone()))
                 .max_decoding_message_size(DEFAULT_REQUEST_BODY_LIMIT_BYTES);

@@ -90,8 +90,7 @@ class MHCPreOp(CustomOp):
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         hidden_size = residual.shape[-1]
-        hc_mult = residual.shape[-2]
-        if HAS_AITER_MHC and hidden_size % 256 == 0 and hc_mult == 4:
+        if HAS_AITER_MHC and hidden_size % 256 == 0:
             return torch.ops.vllm.mhc_pre_aiter(
                 residual,
                 fn,
@@ -102,9 +101,6 @@ class MHCPreOp(CustomOp):
                 hc_sinkhorn_eps,
                 hc_post_mult_value,
                 sinkhorn_repeat,
-                n_splits,
-                norm_weight,
-                norm_eps,
             )
         elif HAS_TILELANG_MHC:
             return torch.ops.vllm.mhc_pre_tilelang(
@@ -226,8 +222,7 @@ class MHCPostOp(CustomOp):
         comb_res_mix: torch.Tensor,
     ) -> torch.Tensor:
         hidden_size = residual.shape[-1]
-        hc_mult = residual.shape[-2]
-        if HAS_AITER_MHC and hidden_size % 256 == 0 and hc_mult == 4:
+        if HAS_AITER_MHC and hidden_size % 256 == 0:
             return torch.ops.vllm.mhc_post_aiter(
                 x,
                 residual,
@@ -449,27 +444,6 @@ class MHCFusedPostPreOp(CustomOp):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        hidden_size = residual.shape[-1]
-        hc_mult = residual.shape[-2]
-        if HAS_AITER_MHC and hidden_size % 256 == 0 and hc_mult == 4:
-            return torch.ops.vllm.mhc_fused_post_pre_aiter(
-                x,
-                residual,
-                post_layer_mix,
-                comb_res_mix,
-                fn,
-                hc_scale,
-                hc_base,
-                rms_eps,
-                hc_pre_eps,
-                hc_sinkhorn_eps,
-                hc_post_mult_value,
-                sinkhorn_repeat,
-                n_splits,
-                tile_n,
-                norm_weight,
-                norm_eps,
-            )
         if HAS_TILELANG_MHC:
             return torch.ops.vllm.mhc_fused_post_pre_tilelang(
                 x,

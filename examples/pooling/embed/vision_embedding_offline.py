@@ -154,13 +154,7 @@ def run_siglip(seed: int):
     )
 
     print("Text embedding output:")
-    # SigLIP is trained with padding to a fixed length and no attention mask, so
-    # text embeddings only line up with image embeddings when they are padded.
-    outputs = llm.embed(
-        text,
-        tokenization_kwargs={"padding": "max_length"},
-        use_tqdm=False,
-    )
+    outputs = llm.embed(text, use_tqdm=False)
     print_embeddings(outputs[0].outputs.embedding)
 
     print("Image embedding output:")

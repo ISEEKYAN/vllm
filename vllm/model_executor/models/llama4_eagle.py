@@ -206,5 +206,9 @@ class EagleLlama4ForCausalLM(Llama4ForCausalLM, SupportsMultiModalEmbeddings):
             process_eagle_weight(self, name)
             return name, weight
 
-        loader = AutoWeightsLoader(self)
+        loader = AutoWeightsLoader(
+            self,
+            # lm_head is tied with target model (Llama4ForCausalLM)
+            skip_prefixes=([]),
+        )
         loader.load_weights(map(transform, weights))

@@ -56,19 +56,14 @@ TOLERANCES = {
     torch.bfloat16: (3e-2, 2e-2),
 }
 
-pytestmark = [
-    pytest.mark.skipif(
-        not (
-            current_platform.is_cuda_alike()
-            or current_platform.is_cpu()
-            or current_platform.is_xpu()
-        ),
-        reason="Backend not supported",
+pytestmark = pytest.mark.skipif(
+    not (
+        current_platform.is_cuda_alike()
+        or current_platform.is_cpu()
+        or current_platform.is_xpu()
     ),
-    # Tests here either take dist_init, which tears the distributed environment
-    # down itself, or never build one, so the global cleanup only repeats it.
-    pytest.mark.skip_global_cleanup,
-]
+    reason="Backend not supported",
+)
 
 DEVICE_TYPE = current_platform.device_type
 DEVICES = (

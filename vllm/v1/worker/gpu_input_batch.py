@@ -476,7 +476,9 @@ class InputBatch:
 
             self.pooling_params[req_id] = pooling_params
             self.pooling_states[req_id] = pooling_states
-            self.logits_processing_needs_token_ids[req_index] = False
+            self.logits_processing_needs_token_ids[req_index] = (
+                pooling_params.requires_token_ids
+            )
         else:
             raise NotImplementedError("Unrecognized request type")
 
@@ -888,8 +890,8 @@ class InputBatch:
             not self.no_penalties
             or self.logits_processing_needs_token_ids[:num_reqs].any()
         )
-        # The device prompt tokens are used only for applying penalties or
-        # pooling methods that explicitly request GPU token IDs.
+        # The prompt tokens are used only for applying penalties or
+        # step pooling during the sampling/pooling process.
         # Hence copy these tensors only when there are requests which
         # need penalties/step_pooler to be applied.
         prompt_token_ids_cpu = (
@@ -977,7 +979,7 @@ class InputBatch:
 
         return PoolingMetadata(
             prompt_lens=self.num_prompt_tokens_cpu_tensor[: self.num_reqs].clone(),
-            prompt_token_ids=None,
+            prompt_token_ids=self.sampling_metadata.prompt_token_ids,
             prompt_token_ids_cpu=prompt_token_ids_cpu,
             pooling_params=pooling_params,
             pooling_states=pooling_states,

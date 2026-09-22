@@ -11,8 +11,6 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import triton
 from vllm.utils.platform_utils import num_compute_units
 
-pytestmark = pytest.mark.skip_global_cleanup
-
 
 def cal_diff(
     x: torch.Tensor,

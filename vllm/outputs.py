@@ -13,20 +13,9 @@ from typing_extensions import TypeVar
 from vllm.logger import init_logger
 from vllm.logprobs import PromptLogprobs, SampleLogprobs
 from vllm.lora.request import LoRARequest
-from vllm.v1.metrics.stats import RequestSpecDecodeMetrics, RequestStateStats
+from vllm.v1.metrics.stats import RequestStateStats
 
 logger = init_logger(__name__)
-
-
-@dataclass
-class SamplingMask:
-    """Per-token sampling support sets aligned with completion token IDs.
-
-    Each inner list contains the vocabulary token IDs that survived
-    top-k / top-p / min-p filtering for the corresponding generated token.
-    """
-
-    token_ids: list[list[int]]
 
 
 @dataclass
@@ -41,18 +30,11 @@ class CompletionOutput:
             output text.
         logprobs: The log probabilities of the top probability words at each
             position if the logprobs are requested.
-        sampling_mask: The post-processing token support set for each generated
-            token, if requested.
         finish_reason: The reason why the sequence is finished.
         stop_reason: The stop string or token id that caused the completion
             to stop, None if the completion finished for some other reason
             including encountering the EOS token.
         lora_request: The LoRA request that was used to generate the output.
-        spec_decode_metrics: Per-sequence speculative-decoding acceptance metrics,
-            populated on finish when speculative decoding ran and
-            ``--per-request-spec-decode-metrics`` is enabled; None otherwise.
-            Surfaced in the response as ``metrics.speculative_decoding`` for
-            single-sequence (``n == 1``) requests.
     """
 
     index: int
@@ -64,8 +46,6 @@ class CompletionOutput:
     finish_reason: str | None = None
     stop_reason: int | str | None = None
     lora_request: LoRARequest | None = None
-    sampling_mask: SamplingMask | None = None
-    spec_decode_metrics: RequestSpecDecodeMetrics | None = None
 
     def finished(self) -> bool:
         return self.finish_reason is not None
@@ -76,7 +56,6 @@ class CompletionOutput:
             f"text={self.text!r}, "
             f"token_ids={self.token_ids}, "
             f"routed_experts={self.routed_experts}, "
-            f"sampling_mask={self.sampling_mask}, "
             f"cumulative_logprob={self.cumulative_logprob}, "
             f"logprobs={self.logprobs}, "
             f"finish_reason={self.finish_reason}, "
@@ -257,7 +236,7 @@ class PoolingRequestOutput(Generic[_O]):
         self.finished = finished
         self.outputs = outputs
 
-    def __repr__(self) -> str:
+    def __repr__(self):
         return (
             f"{type(self).__name__}(request_id={self.request_id!r}, "
             f"outputs={self.outputs!r}, "
@@ -279,7 +258,7 @@ class EmbeddingOutput:
     embedding: list[float]
 
     @staticmethod
-    def from_base(pooling_output: PoolingOutput) -> "EmbeddingOutput":
+    def from_base(pooling_output: PoolingOutput):
         pooled_data = pooling_output.data
         if pooled_data.ndim != 1:
             raise ValueError("pooled_data should be a 1-D embedding vector")
@@ -296,9 +275,7 @@ class EmbeddingOutput:
 
 class EmbeddingRequestOutput(PoolingRequestOutput[EmbeddingOutput]):
     @staticmethod
-    def from_base(
-        request_output: PoolingRequestOutput,
-    ) -> "EmbeddingRequestOutput":
+    def from_base(request_output: PoolingRequestOutput):
         return EmbeddingRequestOutput(
             request_id=request_output.request_id,
             outputs=EmbeddingOutput.from_base(request_output.outputs),
@@ -320,7 +297,7 @@ class ClassificationOutput:
     probs: list[float]
 
     @staticmethod
-    def from_base(pooling_output: PoolingOutput) -> "ClassificationOutput":
+    def from_base(pooling_output: PoolingOutput):
         # pooling_output shape: (num_classes)
         pooled_data = pooling_output.data
         if pooled_data.ndim != 1:
@@ -338,9 +315,7 @@ class ClassificationOutput:
 
 class ClassificationRequestOutput(PoolingRequestOutput[ClassificationOutput]):
     @staticmethod
-    def from_base(
-        request_output: PoolingRequestOutput,
-    ) -> "ClassificationRequestOutput":
+    def from_base(request_output: PoolingRequestOutput):
         return ClassificationRequestOutput(
             request_id=request_output.request_id,
             outputs=ClassificationOutput.from_base(request_output.outputs),
@@ -361,7 +336,7 @@ class ScoringOutput:
     score: float
 
     @staticmethod
-    def from_base(pooling_output: PoolingOutput) -> "ScoringOutput":
+    def from_base(pooling_output: PoolingOutput):
         # pooling_output shape:
         #   classify task: (num_classes) num_classes == 1
         #   embed task: a scalar value
@@ -377,9 +352,7 @@ class ScoringOutput:
 
 class ScoringRequestOutput(PoolingRequestOutput[ScoringOutput]):
     @staticmethod
-    def from_base(
-        request_output: PoolingRequestOutput,
-    ) -> "ScoringRequestOutput":
+    def from_base(request_output: PoolingRequestOutput):
         return ScoringRequestOutput(
             request_id=request_output.request_id,
             outputs=ScoringOutput.from_base(request_output.outputs),

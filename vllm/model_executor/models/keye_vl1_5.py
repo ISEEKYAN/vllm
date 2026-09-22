@@ -309,15 +309,13 @@ def _keye_field_config(
     return dict(
         pixel_values=MultiModalFieldConfig.flat_from_sizes("image", image_grid_sizes),
         image_embeds=MultiModalFieldConfig.flat_from_sizes("image", image_grid_sizes),
-        image_grid_thw=MultiModalFieldConfig.batched("image", keep_on_cpu=True),
+        image_grid_thw=MultiModalFieldConfig.batched("image"),
         pixel_values_videos=MultiModalFieldConfig.flat_from_sizes(
             "video", video_num_patches
         ),
         video_embeds=MultiModalFieldConfig.flat_from_sizes("video", video_num_patches),
-        video_grid_thw=MultiModalFieldConfig.flat_from_sizes(
-            "video", video_num_grids, keep_on_cpu=True
-        ),
-        num_frames=MultiModalFieldConfig.batched("video", keep_on_cpu=True),
+        video_grid_thw=MultiModalFieldConfig.flat_from_sizes("video", video_num_grids),
+        num_frames=MultiModalFieldConfig.batched("video"),
     )
 
 
@@ -365,7 +363,7 @@ class KeyeVL1_5ProcessingInfo(KeyeProcessingInfo):
     def get_data_parser(self):
         return KeyeVL1_5MultiModalDataParser(
             expected_hidden_size=self._get_expected_hidden_size(),
-            allow_missing_mm_embeddings=self.allow_missing_mm_embeddings,
+            embeds_from_ec_connector=self.embeds_from_ec_connector,
         )
 
     def get_max_frame_per_video(self) -> int:
@@ -378,8 +376,16 @@ class KeyeVL1_5ProcessingInfo(KeyeProcessingInfo):
 
 
 class KeyeVL1_5MultiModalProcessor(BaseMultiModalProcessor[KeyeVL1_5ProcessingInfo]):
-    def _get_hf_processor_text(self, mm_counts: Mapping[str, int]) -> str:
-        return self.dummy_inputs.get_dummy_text(mm_counts)
+    def _call_hf_processor(
+        self,
+        prompt: str,
+        mm_data: Mapping[str, object],
+        mm_kwargs: Mapping[str, object],
+        tok_kwargs: Mapping[str, object],
+    ) -> BatchFeature:
+        # Override to use the text path instead of token path to use the
+        # video-specific logic in processing_keye.py
+        return super()._call_hf_processor(prompt, mm_data, mm_kwargs, tok_kwargs)
 
     def _get_prompt_updates(
         self,

@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use vllm_engine_core_client::protocol::lora::LoraRequest;
 pub use vllm_parser::tool::Tool as ChatTool;
+pub use vllm_text::SamplingParams;
 use vllm_text::TextDecodeOptions;
-pub use vllm_text::{PromptTruncation, SamplingParams};
 
 use crate::AssistantMessageExt;
 use crate::error::{Error, Result};
@@ -570,8 +570,6 @@ pub struct ChatRequest {
     /// output. If `true`, callers may receive zero or more incremental
     /// content events before the final terminal one.
     pub intermediate: bool,
-    /// Prompt-truncation policy resolved by the caller.
-    pub prompt_truncation: Option<PromptTruncation>,
     /// Request scheduling priority (lower means earlier handling; default 0).
     pub priority: i32,
     /// Documents for RAG (retrieval-augmented generation), passed to the chat
@@ -603,7 +601,6 @@ impl ChatRequest {
             tool_context: ResolvedToolContext::default(),
             decode_options: TextDecodeOptions::default(),
             intermediate: true,
-            prompt_truncation: None,
             priority: 0,
             documents: None,
             cache_salt: None,
@@ -629,11 +626,6 @@ impl ChatRequest {
             }
             (GenerationPromptMode::NoGenerationPrompt, _)
             | (GenerationPromptMode::StartNewAssistant, _) => {}
-        }
-        if self.has_multimodal() && self.prompt_truncation.is_some() {
-            return Err(Error::Text(
-                vllm_text::Error::TruncateUnsupportedWithMultimodal,
-            ));
         }
         Ok(())
     }

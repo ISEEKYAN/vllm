@@ -8,10 +8,7 @@ import torch
 
 from vllm.exceptions import VLLMValidationError
 from vllm.utils.async_utils import make_async
-from vllm.utils.sparse_utils import (
-    check_sparse_tensor_invariants_threadsafe,
-    safe_to_dense,
-)
+from vllm.utils.sparse_utils import check_sparse_tensor_invariants_threadsafe
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
@@ -33,7 +30,12 @@ def safe_load_prompt_embeds(
             weights_only=True,
             map_location=torch.device("cpu"),
         )
-        tensor = safe_to_dense(tensor, parameter="prompt_embeds")
+        if not isinstance(tensor, torch.Tensor):
+            raise VLLMValidationError(
+                "`prompt_embeds` payload did not deserialize to a torch.Tensor.",
+                parameter="prompt_embeds",
+            )
+        tensor = tensor.to_dense()
 
     if tensor.dim() > 2:
         tensor = tensor.squeeze(0)

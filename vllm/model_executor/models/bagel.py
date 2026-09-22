@@ -273,6 +273,15 @@ class BagelDummyInputsBuilder(BaseDummyInputsBuilder[BagelProcessingInfo]):
 class BagelMultiModalProcessor(BaseMultiModalProcessor[BagelProcessingInfo]):
     """Multimodal processor for BAGEL model."""
 
+    def _hf_processor_applies_updates(
+        self,
+        prompt_text: str,
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
+        tokenization_kwargs: Mapping[str, object],
+    ) -> bool:
+        return False
+
     def _get_prompt_updates(
         self,
         mm_items: MultiModalDataItems,
@@ -329,9 +338,14 @@ class BagelForConditionalGeneration(
     The image generation part is not supported in vLLM.
     """
 
-    # pos_embed is handled by the PositionEmbedding module
+    # Weight mapping from HF to vLLM
     hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={"vit_pos_embed.pos_embed": None}
+        orig_to_new_prefix={
+            "language_model.": "language_model.",
+            "vit_model.": "vit_model.",
+            "connector.": "connector.",
+            "vit_pos_embed.": "vit_pos_embed.",
+        }
     )
 
     @classmethod
@@ -566,5 +580,6 @@ class BagelForConditionalGeneration(
 
             filtered_weights.append((name, tensor))
 
-        loader = AutoWeightsLoader(self)
+        # Skip vit_pos_embed.pos_embed as it's handled by PositionEmbedding module
+        loader = AutoWeightsLoader(self, skip_prefixes=["vit_pos_embed.pos_embed"])
         return loader.load_weights(filtered_weights, mapper=self.hf_to_vllm_mapper)

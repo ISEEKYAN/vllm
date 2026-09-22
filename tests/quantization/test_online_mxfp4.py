@@ -35,10 +35,6 @@ from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
     mxfp4_quantize,
     quant_dequant_mxfp4,
 )
-from vllm.model_executor.layers.quantization.utils.quant_utils import (
-    kMxfp4Dynamic,
-    kMxfp4Static,
-)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import PlatformEnum, current_platform
@@ -350,9 +346,9 @@ def test_online_mxfp4_moe_matches_quark(
         online_layer = make_layer("online_layer")
 
         checkpoint_method = QuarkOCP_MX_MoEMethod(
+            weight_config={"qscheme": "per_group", "dtype": "fp4"},
+            input_config={"dtype": "fp4", "is_dynamic": True},
             moe=checkpoint_layer.moe_config,
-            weight_quant_key=kMxfp4Static,
-            activation_quant_key=kMxfp4Dynamic,
         )
         online_method = Mxfp4OnlineMoEMethod(layer=online_layer)
 
@@ -570,8 +566,8 @@ def test_online_mxfp4_dense_matches_quark(
         checkpoint_weight, checkpoint_weight_scale = mxfp4_quantize(weight)
 
         checkpoint_scheme = QuarkOCP_MX(
-            weight_quant_key=kMxfp4Static,
-            activation_quant_key=kMxfp4Dynamic,
+            weight_quant_spec={"qscheme": "per_group", "dtype": "fp4"},
+            input_quant_spec={"dtype": "fp4", "is_dynamic": True},
         )
         checkpoint_scheme.create_weights(
             layer=checkpoint_layer,
@@ -608,24 +604,3 @@ def test_online_mxfp4_dense_matches_quark(
         keys=("weight", "weight_scale"),
         packed_weight_keys=("weight",),
     )
-
-
-def test_quark_ocp_mx_dense_rejects_unaligned_input_partition():
-    scheme = object.__new__(QuarkOCP_MX)
-    layer = torch.nn.Module()
-    layer.prefix = "model.layers.0.mlp.shared_expert.down_proj"
-
-    with pytest.raises(
-        ValueError,
-        match=(
-            "input size per partition of 80, which must be divisible by "
-            "the OCP MX group size 32"
-        ),
-    ):
-        scheme.create_weights(
-            layer=layer,
-            output_partition_sizes=[2560],
-            input_size_per_partition=80,
-            params_dtype=torch.bfloat16,
-            weight_loader=lambda *_: None,
-        )

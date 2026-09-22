@@ -17,7 +17,6 @@ from vllm.v1.structured_output.backend_types import (
     StructuredOutputGrammar,
 )
 from vllm.v1.structured_output.backend_xgrammar import XgrammarBackend
-from vllm.v1.structured_output.utils import maybe_wrap_mistral_common_tokenizer
 
 if TYPE_CHECKING:
     import numpy as np
@@ -76,8 +75,8 @@ class StructuredOutputManager:
             # of CPUs.
             max_workers = max(1, (multiprocessing.cpu_count() + 1) // 2)
             self.executor = ThreadPoolExecutor(max_workers=max_workers)
-            self.tokenizer = maybe_wrap_mistral_common_tokenizer(
-                cached_tokenizer_from_config(model_config=self.vllm_config.model_config)
+            self.tokenizer = cached_tokenizer_from_config(
+                model_config=self.vllm_config.model_config
             )
             reasoning_parser_plugin = (
                 self.vllm_config.structured_outputs_config.reasoning_parser_plugin
@@ -290,8 +289,12 @@ class StructuredOutputManager:
                     assert isinstance(grammar, StructuredOutputGrammar)
                 apply_bitmask = self.should_fill_bitmask(request)
 
-                reasoner = None if apply_bitmask else self._get_reasoner(request)
-                detect_reasoning_end = reasoner is not None
+                reasoner = self._get_reasoner(request)
+                detect_reasoning_end = (
+                    not apply_bitmask
+                    and reasoner is not None
+                    and not self.enable_in_reasoning
+                )
                 simulated_buf: list[int] | None = None
                 history_len = 0
 
@@ -326,12 +329,7 @@ class StructuredOutputManager:
                             advance_grammar = False
                             post_reasoning_end_in_window = True
                     if advance_grammar and not grammar.is_terminated():
-                        if post_reasoning_end_in_window:
-                            accepted = bool(grammar.validate_tokens([token]))
-                            if accepted:
-                                accepted = grammar.accept_tokens(req_id, [token])
-                        else:
-                            accepted = grammar.accept_tokens(req_id, [token])
+                        accepted = grammar.accept_tokens(req_id, [token])
                         if accepted:
                             state_advancements += 1
                         elif not post_reasoning_end_in_window:
@@ -371,24 +369,20 @@ class StructuredOutputManager:
         # NOTE (Hanchen) if enable_in_reasoning is True, it means that
         # the model needs to be constrained in reasoning. So we should always
         # enable the bitmask filling.
-        structured_req = request.structured_output_request
-        if self.enable_in_reasoning or (
-            structured_req is not None and structured_req.reasoning_ended is True
-        ):
-            return True
-
         reasoner = self._get_reasoner(request)
         if reasoner is not None:
-            assert structured_req is not None
-            if structured_req.reasoning_ended is None:
+            if self.enable_in_reasoning:
+                return True
+            assert request.structured_output_request is not None
+            if request.structured_output_request.reasoning_ended is None:
                 # This should be removed here, but since `openai_gptoss`
                 # is an independent code path, it is kept for now.
                 # After unifying the `openai_gptoss` and non-`openai_gptoss` styles,
                 # it can be removed.
-                structured_req.reasoning_ended = reasoner.is_reasoning_end(
-                    request.prompt_token_ids or []
+                request.structured_output_request.reasoning_ended = (
+                    reasoner.is_reasoning_end(request.prompt_token_ids or [])
                 )
-            return structured_req.reasoning_ended
+            return request.structured_output_request.reasoning_ended
         return True
 
     def should_advance(
@@ -404,19 +398,19 @@ class StructuredOutputManager:
         if TYPE_CHECKING:
             assert request.structured_output_request is not None
             assert request.structured_output_request.grammar is not None
-        structured_req = request.structured_output_request
-        if self.enable_in_reasoning or (
-            structured_req is not None and structured_req.reasoning_ended is True
-        ):
-            return True
-
         # by default, we should always advance
         # for cases that don't use thinking mode.
         reasoner = self._get_reasoner(request)
         if reasoner is None:
             return True
 
-        assert structured_req is not None
+        # if the model needs structured in reasoning, we should advance
+        if self.enable_in_reasoning:
+            return True
+
+        structured_req = request.structured_output_request
+        if structured_req.reasoning_ended:
+            return True
 
         # Check if reasoning ends in *this* step.
         # When the caller passes new_token_ids (the tokens that were just

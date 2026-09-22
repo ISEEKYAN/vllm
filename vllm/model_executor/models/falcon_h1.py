@@ -643,5 +643,8 @@ class FalconH1ForCausalLM(
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
+        loader = AutoWeightsLoader(
+            self,
+            skip_prefixes=(["lm_head."] if self.tie_word_embeddings else None),
+        )
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)

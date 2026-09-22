@@ -60,7 +60,6 @@ from vllm.multimodal.processing import (
     PromptUpdate,
 )
 from vllm.sequence import IntermediateTensors
-from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
 from .interfaces import MultiModalEmbeddings, SupportsMultiModal, SupportsPP
@@ -235,27 +234,38 @@ class Qwen2AudioDummyInputsBuilder(BaseDummyInputsBuilder[Qwen2AudioProcessingIn
 
 
 class Qwen2AudioMultiModalProcessor(BaseMultiModalProcessor[Qwen2AudioProcessingInfo]):
-    def _get_hf_processor_text(self, mm_counts: Mapping[str, int]) -> str:
-        return self.dummy_inputs.get_dummy_text(mm_counts)
-
-    def _preprocess_hf_mm_data(
+    def _call_hf_processor(
         self,
+        prompt: str,
         mm_data: Mapping[str, object],
-        hf_processor_mm_kwargs: Mapping[str, object],
-    ) -> tuple[Mapping[str, object], Mapping[str, object]]:
-        feature_extractor = self.info.get_feature_extractor(**hf_processor_mm_kwargs)
-
-        mm_data = dict(mm_data)
+        mm_kwargs: Mapping[str, Any],
+        tok_kwargs: Mapping[str, object],
+    ) -> BatchFeature:
+        # NOTE - we rename audios -> audio in mm data because transformers has
+        # deprecated audios for the qwen2audio processor and will remove
+        # support for it in transformers 4.54.
         audios = mm_data.pop("audios", [])
         if audios:
             mm_data["audio"] = audios
 
-        hf_processor_mm_kwargs = dict(
-            **hf_processor_mm_kwargs,
+        # Text-only input not supported in composite processor
+        if not mm_data.get("audio", []):
+            prompt_ids = self.info.get_tokenizer().encode(prompt)
+            prompt_ids = self._apply_hf_processor_tokens_only(prompt_ids)
+            return BatchFeature(dict(input_ids=[prompt_ids]), tensor_type="pt")
+
+        feature_extractor = self.info.get_feature_extractor(**mm_kwargs)
+        mm_kwargs = dict(
+            **mm_kwargs,
             sampling_rate=feature_extractor.sampling_rate,
         )
 
-        return mm_data, hf_processor_mm_kwargs
+        return super()._call_hf_processor(
+            prompt=prompt,
+            mm_data=mm_data,
+            mm_kwargs=mm_kwargs,
+            tok_kwargs=tok_kwargs,
+        )
 
     def _get_mm_fields_config(
         self,
@@ -434,15 +444,12 @@ class Qwen2AudioForConditionalGeneration(nn.Module, SupportsMultiModal, Supports
             )
             < audio_output_lengths
         )
-        with gpu_sync_allowed():
-            masked_audio_features = audio_features[audio_features_mask].view(
-                -1, embed_dim
-            )
+        masked_audio_features = audio_features[audio_features_mask].view(-1, embed_dim)
 
-            # Split to tuple of embeddings for individual audio input.
-            return torch.split(
-                masked_audio_features, audio_output_lengths.flatten().tolist()
-            )
+        # Split to tuple of embeddings for individual audio input.
+        return torch.split(
+            masked_audio_features, audio_output_lengths.flatten().tolist()
+        )
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
         audio_input = self._parse_and_validate_audio_input(**kwargs)

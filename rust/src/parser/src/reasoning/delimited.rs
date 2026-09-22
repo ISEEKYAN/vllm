@@ -35,29 +35,25 @@ impl DelimitedReasoningParser {
     /// start or end delimiter, that prompt boundary always wins.
     pub(crate) fn new(
         tokenizer: DynTokenizer,
-        start_token: impl Into<String>,
-        end_token: impl Into<String>,
+        start_token: &'static str,
+        end_token: &'static str,
         default_in_reasoning: bool,
     ) -> Result<Self> {
-        let start_token = start_token.into();
-        let end_token = end_token.into();
         let start_token_id =
-            tokenizer
-                .token_to_id(&start_token)
-                .ok_or_else(|| ReasoningError::MissingToken {
-                    token: start_token.clone(),
-                })?;
+            tokenizer.token_to_id(start_token).ok_or_else(|| ReasoningError::MissingToken {
+                token: start_token.to_string(),
+            })?;
         let end_token_id =
-            tokenizer.token_to_id(&end_token).ok_or_else(|| ReasoningError::MissingToken {
-                token: end_token.clone(),
+            tokenizer.token_to_id(end_token).ok_or_else(|| ReasoningError::MissingToken {
+                token: end_token.to_string(),
             })?;
 
         Ok(Self {
             tokenizer,
             current_in_reasoning: default_in_reasoning,
             buffer: String::new(),
-            start_token,
-            end_token,
+            start_token: start_token.to_string(),
+            end_token: end_token.to_string(),
             start_token_id,
             end_token_id,
             default_in_reasoning,

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+use std::net::TcpListener;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -14,6 +15,13 @@ use vllm_engine_core_client::test_utils::IpcNamespace;
 use vllm_engine_core_client::{EngineCoreClient, EngineCoreClientConfig, TransportMode};
 
 use crate::{Opt, run};
+
+fn free_tcp_address() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind free port");
+    let port = listener.local_addr().expect("local addr").port();
+    drop(listener);
+    format!("tcp://127.0.0.1:{port}")
+}
 
 fn client_config(handshake_address: String, engine_count: usize) -> EngineCoreClientConfig {
     EngineCoreClientConfig {
@@ -88,9 +96,8 @@ async fn shutdown_mock(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mock_engine_connects_over_ipc() {
-    let ipc = IpcNamespace::new().expect("ipc namespace");
-    let handshake_address = ipc.handshake_endpoint();
+async fn mock_engine_connects_over_tcp() {
+    let handshake_address = free_tcp_address();
     let (client, shutdown, task) = connect_with_mock(handshake_address, 1, 1).await;
     assert_eq!(client.engine_count(), 1);
     assert_eq!(client.engine_identities()[0], &[0, 0]);
@@ -100,9 +107,18 @@ async fn mock_engine_connects_over_ipc() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mock_engine_registers_multiple_identities() {
+async fn mock_engine_connects_over_ipc() {
     let ipc = IpcNamespace::new().expect("ipc namespace");
     let handshake_address = ipc.handshake_endpoint();
+    let (client, shutdown, task) = connect_with_mock(handshake_address, 1, 1).await;
+    assert_eq!(client.engine_count(), 1);
+    assert_eq!(client.engine_identities()[0], &[0, 0]);
+    shutdown_mock(client, shutdown, task).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mock_engine_registers_multiple_identities() {
+    let handshake_address = free_tcp_address();
     let (client, shutdown, task) = connect_with_mock(handshake_address, 2, 1).await;
     assert_eq!(client.engine_count(), 2);
     assert_eq!(client.engine_identities(), vec![&[0, 0][..], &[1, 0][..]]);
@@ -111,8 +127,7 @@ async fn mock_engine_registers_multiple_identities() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn chunk_size_one_outputs_one_token_per_update() {
-    let ipc = IpcNamespace::new().expect("ipc namespace");
-    let handshake_address = ipc.handshake_endpoint();
+    let handshake_address = free_tcp_address();
     let (client, shutdown, task) = connect_with_mock(handshake_address, 1, 1).await;
     let mut stream = client.call(sample_request("req-1", 3)).await.expect("call");
 
@@ -132,8 +147,7 @@ async fn chunk_size_one_outputs_one_token_per_update() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn chunk_size_clips_final_output_to_max_tokens() {
-    let ipc = IpcNamespace::new().expect("ipc namespace");
-    let handshake_address = ipc.handshake_endpoint();
+    let handshake_address = free_tcp_address();
     let (client, shutdown, task) = connect_with_mock(handshake_address, 1, 4).await;
     let mut stream = client.call(sample_request("req-clip", 6)).await.expect("call");
 
@@ -150,8 +164,7 @@ async fn chunk_size_clips_final_output_to_max_tokens() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn abort_cancels_active_request_and_emits_terminal_output() {
-    let ipc = IpcNamespace::new().expect("ipc namespace");
-    let handshake_address = ipc.handshake_endpoint();
+    let handshake_address = free_tcp_address();
     let (client, shutdown, task) = connect_with_mock(handshake_address, 1, 1).await;
     let mut stream = client.call(sample_request("req-abort", 1_000_000)).await.expect("call");
     let first = stream.next().await.expect("first").expect("first ok");
@@ -176,8 +189,7 @@ async fn abort_cancels_active_request_and_emits_terminal_output() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn utility_requests_return_minimal_success_responses() {
-    let ipc = IpcNamespace::new().expect("ipc namespace");
-    let handshake_address = ipc.handshake_endpoint();
+    let handshake_address = free_tcp_address();
     let (client, shutdown, task) = connect_with_mock(handshake_address, 1, 1).await;
 
     assert!(!client.is_sleeping().await.expect("is sleeping"));

@@ -8,7 +8,7 @@ use bytes::Bytes;
 use itertools::Itertools as _;
 
 use crate::error::{Error, Result, ext_value_decode};
-use crate::protocol::tensor::{ShapeExt as _, WireNdArray};
+use crate::protocol::tensor::{ShapeExt as _, WireArrayData, WireNdArray};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ScalarType {
@@ -31,11 +31,14 @@ pub(super) struct DecodedArray2<T> {
     pub data: Vec<T>,
 }
 
-pub(super) fn decode_array2_u32(
+pub(super) fn decode_array2_u32<Frame>(
     value: WireNdArray,
     field: &str,
-    frames: &[Bytes],
-) -> Result<DecodedArray2<u32>> {
+    frames: &[Frame],
+) -> Result<DecodedArray2<u32>>
+where
+    Frame: AsRef<[u8]>,
+{
     let (shape, bytes, scalar, endianness) =
         decode_array_metadata(value, field, frames, &[ScalarType::I32, ScalarType::I64])?;
     if shape.len() != 2 {
@@ -63,11 +66,14 @@ pub(super) fn decode_array2_u32(
     })
 }
 
-pub(super) fn decode_array1_u32(
+pub(super) fn decode_array1_u32<Frame>(
     value: WireNdArray,
     field: &str,
-    frames: &[Bytes],
-) -> Result<Vec<u32>> {
+    frames: &[Frame],
+) -> Result<Vec<u32>>
+where
+    Frame: AsRef<[u8]>,
+{
     let (shape, bytes, scalar, endianness) =
         decode_array_metadata(value, field, frames, &[ScalarType::I32, ScalarType::I64])?;
     if shape.len() != 1 {
@@ -91,11 +97,14 @@ pub(super) fn decode_array1_u32(
     Ok(data)
 }
 
-pub(super) fn decode_array2_f32(
+pub(super) fn decode_array2_f32<Frame>(
     value: WireNdArray,
     field: &str,
-    frames: &[Bytes],
-) -> Result<DecodedArray2<f32>> {
+    frames: &[Frame],
+) -> Result<DecodedArray2<f32>>
+where
+    Frame: AsRef<[u8]>,
+{
     let (shape, bytes, _, endianness) =
         decode_array_metadata(value, field, frames, &[ScalarType::F32])?;
     if shape.len() != 2 {
@@ -113,29 +122,25 @@ pub(super) fn decode_array2_f32(
     })
 }
 
-pub(super) fn decode_array_metadata(
+pub(super) fn decode_array_metadata<Frame>(
     value: WireNdArray,
     field: &str,
-    frames: &[Bytes],
+    frames: &[Frame],
     expected_scalars: &[ScalarType],
-) -> Result<(Vec<usize>, Bytes, ScalarType, Endianness)> {
-    let mut value = value;
-    let (scalar, endianness) = parse_dtype(&value.dtype, field)?;
+) -> Result<(Vec<usize>, Bytes, ScalarType, Endianness)>
+where
+    Frame: AsRef<[u8]>,
+{
+    let WireNdArray { dtype, shape, data } = value;
+    let (scalar, endianness) = parse_dtype(&dtype, field)?;
     if !expected_scalars.contains(&scalar) {
         return Err(decode_error(
             field,
-            &format!(
-                "expected dtype in {:?}, got {}",
-                expected_scalars, value.dtype
-            ),
+            &format!("expected dtype in {:?}, got {}", expected_scalars, dtype),
         ));
     }
 
-    value
-        .resolve_aux_frame(frames)
-        .map_err(|message| decode_error(field, &message))?;
-    let WireNdArray { shape, data, .. } = value;
-    let bytes = data.into_raw_view().expect("auxiliary frame reference was resolved above");
+    let bytes = resolve_array_bytes(data, field, frames)?;
     validate_byte_length(shape.as_slice(), bytes.len(), field, scalar)?;
     Ok((shape, bytes, scalar, endianness))
 }
@@ -161,6 +166,31 @@ pub(super) fn parse_dtype(dtype: &str, field: &str) -> Result<(ScalarType, Endia
         }
     };
     Ok((scalar, endianness))
+}
+
+pub(super) fn resolve_array_bytes<Frame>(
+    value: WireArrayData,
+    field: &str,
+    frames: &[Frame],
+) -> Result<Bytes>
+where
+    Frame: AsRef<[u8]>,
+{
+    match value {
+        WireArrayData::RawView(bytes) => Ok(bytes),
+        WireArrayData::AuxIndex(index) => {
+            let frame = frames.get(index).ok_or_else(|| {
+                decode_error(
+                    field,
+                    &format!(
+                        "aux frame index {index} out of range for {} frames",
+                        frames.len()
+                    ),
+                )
+            })?;
+            Ok(Bytes::copy_from_slice(frame.as_ref()))
+        }
+    }
 }
 
 pub(super) fn validate_byte_length(

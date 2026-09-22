@@ -8,13 +8,11 @@ from collections.abc import Callable, Iterable
 import torch
 import torch.nn as nn
 
+from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import VllmConfig
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
-)
-from vllm.model_executor.layers.fused_moe.utils import (
-    is_model_fused_shared_expert_compatible,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -169,11 +167,6 @@ class DeepseekV32MTP(nn.Module, DeepseekV2MixtureOfExperts):
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
         self.set_moe_parameters()
-        self.is_fused_shared_expert_enabled = is_model_fused_shared_expert_compatible(
-            self.model.layers.values(),
-            DeepseekV2MoE,
-            "mtp_block.mlp",
-        )
 
     def set_moe_parameters(self):
         self.num_moe_layers = self.config.num_nextn_predict_layers
@@ -238,6 +231,9 @@ class DeepseekV32MTP(nn.Module, DeepseekV2MixtureOfExperts):
         return name
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        rocm_aiter_moe_shared_expert_enabled = (
+            rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
+        )
         stacked_params_mapping = [
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
@@ -254,7 +250,7 @@ class DeepseekV32MTP(nn.Module, DeepseekV2MixtureOfExperts):
             num_experts=self.config.n_routed_experts
             + (
                 self.config.n_shared_experts
-                if self.is_fused_shared_expert_enabled
+                if rocm_aiter_moe_shared_expert_enabled
                 else 0
             ),
         )
@@ -270,7 +266,7 @@ class DeepseekV32MTP(nn.Module, DeepseekV2MixtureOfExperts):
             if spec_layer is None:
                 continue
             is_fusion_moe_shared_experts_layer = (
-                self.is_fused_shared_expert_enabled and ("mlp.shared_experts" in name)
+                rocm_aiter_moe_shared_expert_enabled and ("mlp.shared_experts" in name)
             )
             name = self._rewrite_spec_layer_name(spec_layer, name)
 
