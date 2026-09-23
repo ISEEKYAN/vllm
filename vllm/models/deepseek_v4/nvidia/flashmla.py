@@ -148,9 +148,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             if not swa_only and self.compress_ratio == 128:
                 # Reserve the same C128 decode buffer used by the real path so
                 # workspace locking cannot be tripped by the first replay.
-                warmup_specs.append(
-                    ((self.max_num_batched_tokens, top_k), torch.int32)
-                )
+                warmup_specs.append(((self.max_num_batched_tokens, top_k), torch.int32))
             current_workspace_manager().get_simultaneous(
                 *warmup_specs,
             )
@@ -353,22 +351,16 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         request_end = request_start + num_decodes
         token_end = token_start + num_decode_tokens
         seq_lens = swa_metadata.seq_lens[request_start:request_end]
-        seq_lens_cpu = swa_metadata.seq_lens_cpu[request_start:request_end]
         query_start_loc = (
-            swa_metadata.query_start_loc[request_start : request_end + 1]
-            - token_start
+            swa_metadata.query_start_loc[request_start : request_end + 1] - token_start
         )
         query_start_loc_cpu = (
             swa_metadata.query_start_loc_cpu[request_start : request_end + 1]
             - token_start
         )
         query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
-        prefix_lens_cpu = seq_lens_cpu - query_lens_cpu
-        gather_lens_cpu = query_lens_cpu + torch.clamp(
-            prefix_lens_cpu, min=0, max=self.window_size - 1
-        )
         # Fuse query-length subtraction, prefix clamp, and addition into one
-        # graph-safe kernel; the CPU copy above remains the source for sizing.
+        # graph-safe kernel.
         gather_lens = torch.empty_like(seq_lens)
         compute_gather_lens(
             seq_lens,
@@ -409,18 +401,11 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     f"Unsupported compress_ratio={self.compress_ratio}; "
                     "expected 1, 4, or 128."
                 )
-            if envs.VLLM_BATCH_INVARIANT:
-                # A batch-local maximum makes the flattened KV stride and all
-                # request base indices depend on neighboring sequence lengths.
-                # Use the model capacity so a request keeps the same address
-                # mapping in singleton and packed decode.
-                max_compressed = (
-                    self.max_model_len + self.compress_ratio - 1
-                ) // self.compress_ratio
-            else:
-                max_compressed = int(
-                    (seq_lens_cpu.numpy() // self.compress_ratio).max()
-                )
+            # CPU sequence lengths are frozen during graph capture. Capacity
+            # must cover later replays, even when batch invariance is disabled.
+            max_compressed = (
+                self.max_model_len + self.compress_ratio - 1
+            ) // self.compress_ratio
 
         if envs.VLLM_BATCH_INVARIANT:
             if int(query_lens_values.max()) != 1:
@@ -429,7 +414,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 )
             max_gather = self.window_size
         else:
-            max_gather = int(gather_lens_cpu.numpy().max())
+            max_gather = self.window_size + num_decode_tokens - 1
         workspace_width = max_compressed + max_gather
         use_fused_c128_decode = (
             envs.VLLM_BATCH_INVARIANT
@@ -505,6 +490,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             )
         elif not swa_only and self.compress_ratio == 128:
             local_topk = workspace[3]
+            assert attn_metadata is not None
             assert attn_metadata.c128a_decode_topk_lens is not None
             fill_c128_topk(
                 local_topk,
