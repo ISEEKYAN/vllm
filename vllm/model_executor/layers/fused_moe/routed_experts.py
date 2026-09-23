@@ -3,6 +3,7 @@
 
 from collections.abc import Callable, Iterable
 from enum import Enum
+from math import prod
 from typing import TYPE_CHECKING, Any, Literal, cast, overload
 
 import torch
@@ -907,6 +908,30 @@ class RoutedExperts(PluggableLayer):
                         f"Layer {self.layer_name} has no parameter {param_name!r} "
                         f"for checkpoint weight {qual_name!r}"
                     )
+                if param.data.ndim == 4 and isinstance(
+                    self.quant_method, UnquantizedFusedMoEMethod
+                ):
+                    num_experts = param.shape[0]
+                    intermediate_size = self.moe_config.intermediate_size_per_partition
+                    hidden_size = self.moe_config.hidden_dim
+                    if shard_id in {"w1", "w3"}:
+                        up_dim = intermediate_size * (
+                            2 if self.moe_config.is_act_and_mul else 1
+                        )
+                        logical_shape = (num_experts, up_dim, hidden_size)
+                    else:
+                        logical_shape = (
+                            num_experts,
+                            hidden_size,
+                            intermediate_size,
+                        )
+                    if param.numel() != prod(logical_shape):
+                        raise ValueError(
+                            f"Cannot restore {param_name} from runtime shape "
+                            f"{tuple(param.shape)} to logical shape {logical_shape}"
+                        )
+                    param.data = param.data.view(logical_shape)
+                    param.data.zero_()
                 if is_fused:
                     quant_method = getattr(param, "quant_method", None)
                     # Block scales share the weight's two-dimensional layout.
