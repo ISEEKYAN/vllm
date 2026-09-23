@@ -47,7 +47,10 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
+from vllm.model_executor.layers.mamba.mamba_mixer2 import (
+    MambaMixer2,
+    Mixer2RMSNormGated,
+)
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
     MambaStateCopyFuncCalculator,
@@ -82,6 +85,34 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.nemotron_h import NemotronHConfig
+
+
+class NemotronHRMSNorm(RMSNorm):
+    def forward(self, x, residual=None):
+        if envs.VLLM_BATCH_INVARIANT:
+            from .nemotron_h_alignment import rms_forward
+
+            if get_tensor_model_parallel_world_size() != 1:
+                raise ValueError("Shared Nemotron normalization requires TP=1")
+            return rms_forward(x, self.weight, self.variance_epsilon, residual)
+        return super().forward(x, residual)
+
+
+class NemotronHGatedRMSNorm(Mixer2RMSNormGated):
+    def forward(self, x, gate):
+        if envs.VLLM_BATCH_INVARIANT:
+            from .nemotron_h_alignment import gated_forward
+
+            if self.tp_size != 1:
+                raise ValueError("Shared Nemotron normalization requires TP=1")
+            if not self.use_rms_norm:
+                raise ValueError(
+                    "Shared gated normalization requires RMS normalization"
+                )
+            return gated_forward(
+                x, gate, self.weight, self.group_size, self.variance_epsilon
+            )
+        return super().forward(x, gate)
 
 
 class NemotronHMLP(nn.Module):
@@ -291,7 +322,7 @@ class NemotronHMLPDecoderLayer(nn.Module):
             prefix=f"{prefix}.mixer",
         )
 
-        self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        self.norm = NemotronHRMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
     def forward(
         self,
@@ -334,7 +365,7 @@ class NemotronHMoEDecoderLayer(nn.Module):
             prefix=f"{prefix}.mixer",
         )
 
-        self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        self.norm = NemotronHRMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
     def forward(
         self,
@@ -377,13 +408,14 @@ class NemotronHMambaDecoderLayer(nn.Module):
             head_dim=config.mamba_head_dim,
             rms_norm_eps=config.layer_norm_epsilon,
             activation=config.mamba_hidden_act,
+            norm_cls=NemotronHGatedRMSNorm,
             model_config=model_config,
             cache_config=cache_config,
             quant_config=quant_config,
             prefix=f"{prefix}.mixer",
         )
 
-        self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        self.norm = NemotronHRMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
     def forward(
         self,
@@ -504,7 +536,7 @@ class NemotronHAttentionDecoderLayer(nn.Module):
             prefix=f"{prefix}.mixer",
         )
 
-        self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        self.norm = NemotronHRMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
     def forward(
         self,
@@ -593,13 +625,9 @@ class NemotronHModel(nn.Module, EagleModelMixin):
             ["hidden_states", "residual"], config.hidden_size
         )
 
-        self.norm_f = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
-        if envs.VLLM_BATCH_INVARIANT and getattr(
-            config, "nemotron_shared_norms", False
-        ):
-            from .nemotron_h_alignment import install_inference_norms
-
-            install_inference_norms(self)
+        self.norm_f = NemotronHRMSNorm(
+            config.hidden_size, eps=config.layer_norm_epsilon
+        )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
