@@ -24,6 +24,7 @@ from itertools import islice
 import torch
 from torch import nn
 
+from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.config.parallel import ParallelConfig
@@ -593,7 +594,9 @@ class NemotronHModel(nn.Module, EagleModelMixin):
         )
 
         self.norm_f = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
-        if getattr(config, "nemotron_shared_norms", False):
+        if envs.VLLM_BATCH_INVARIANT and getattr(
+            config, "nemotron_shared_norms", False
+        ):
             from .nemotron_h_alignment import install_inference_norms
 
             install_inference_norms(self)
