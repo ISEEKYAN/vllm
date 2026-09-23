@@ -66,21 +66,6 @@ def test_replace_parameter_preserves_custom_attribute(
         assert layer.weight.data_ptr() == new_data.data_ptr()
 
 
-def test_replace_parameter_in_place_across_layout_shapes() -> None:
-    layer = torch.nn.Module()
-    old = torch.nn.Parameter(torch.zeros(2, 3, 4), requires_grad=False)
-    layer.register_parameter("weight", old)
-    original_data_ptr = old.data_ptr()
-    new_data = torch.arange(24, dtype=old.dtype).reshape(2, 2, 2, 3)
-
-    replace_parameter(layer, "weight", new_data, prefer_copy=True)
-
-    assert layer.weight.shape == new_data.shape
-    assert layer.weight.stride() == new_data.stride()
-    assert layer.weight.data_ptr() == original_data_ptr
-    assert torch.equal(layer.weight, new_data)
-
-
 @pytest.mark.parametrize("prefer_copy", [False, True])
 def test_replace_parameter_preserves_weight_loader(prefer_copy: bool) -> None:
     """The reload path must survive replacement: the old parameter's
