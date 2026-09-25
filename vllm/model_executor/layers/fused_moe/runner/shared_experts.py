@@ -84,7 +84,6 @@ class SharedExperts(torch.nn.Module):
     def _disable_shared_experts_overlap(self) -> bool:
         # Disable shared expert overlap if:
         #   - we are using eplb with non-safe backend, because of correctness issues
-        #   - we are using flashinfer with DP, since there nothing to gain
 
         # Both these comm backends have been shown to be safe for shared expert overlap.
         _EPLB_OVERLAP_SAFE_BACKENDS = (
@@ -99,7 +98,7 @@ class SharedExperts(torch.nn.Module):
         return (
             parallel_config.enable_eplb
             and parallel_config.all2all_backend not in _EPLB_OVERLAP_SAFE_BACKENDS
-        ) or parallel_config.use_fi_nvl_two_sided_kernels
+        )
 
     @property
     def _should_enable_stream_overlap_heuristic(self) -> bool:
