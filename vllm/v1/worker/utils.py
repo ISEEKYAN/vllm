@@ -216,32 +216,60 @@ class KVBlockZeroer:
             blk_size,
             len(seg_addrs),
         )
+        self._launch_meta = []
+        for page_size in sorted(set(seg_page_sizes)):
+            indices = [i for i, size in enumerate(seg_page_sizes) if size == page_size]
+            block_size = min(largest_power_of_2_divisor(page_size), 1024)
+            self._launch_meta.append(
+                (
+                    torch.tensor(
+                        [seg_addrs[i] for i in indices],
+                        dtype=torch.uint64,
+                        device=self.device,
+                    ),
+                    torch.tensor(
+                        [seg_block_strides[i] for i in indices],
+                        dtype=torch.int64,
+                        device=self.device,
+                    ),
+                    torch.full(
+                        (len(indices),),
+                        page_size,
+                        dtype=torch.int64,
+                        device=self.device,
+                    ),
+                    page_size // block_size,
+                    block_size,
+                    len(indices),
+                )
+            )
 
     def zero_block_ids(self, block_ids: list[int]) -> None:
         """Zero the KV cache memory for the given block IDs."""
         if not block_ids or self._meta is None:
             return
-        (
-            seg_addrs,
-            seg_block_strides,
-            seg_page_sizes,
-            max_chunks,
-            blk_size,
-            n_segs,
-        ) = self._meta
         n_blocks = len(block_ids)
         idx = async_tensor_h2d(block_ids, device=self.device, dtype=torch.int64)
-        grid = (n_blocks * n_segs * max_chunks,)
-        _zero_kv_blocks_kernel[grid](
-            seg_addrs,
-            seg_block_strides,
-            seg_page_sizes,
-            idx,
-            n_blocks,
-            N_SEGS=n_segs,
-            MAX_CHUNKS=max_chunks,
-            BLOCK_SIZE=blk_size,
-        )
+        for meta in getattr(self, "_launch_meta", (self._meta,)):
+            (
+                seg_addrs,
+                seg_block_strides,
+                seg_page_sizes,
+                max_chunks,
+                blk_size,
+                n_segs,
+            ) = meta
+            grid = (n_blocks * n_segs * max_chunks,)
+            _zero_kv_blocks_kernel[grid](
+                seg_addrs,
+                seg_block_strides,
+                seg_page_sizes,
+                idx,
+                n_blocks,
+                N_SEGS=n_segs,
+                MAX_CHUNKS=max_chunks,
+                BLOCK_SIZE=blk_size,
+            )
 
     def warmup(self, num_kv_blocks: int) -> None:
         """JIT-compile the zeroing kernel before the first real request."""
