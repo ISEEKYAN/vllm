@@ -24,6 +24,44 @@ class _BlockFirstBackend:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_grouped_pages_preserve_padding_and_unselected_blocks():
+    """Mixed page sizes clear selected pages, not their packed guard columns."""
+    device = torch.device("cuda")
+    sizes = [292, 9344, 292]
+    backing = [
+        torch.ones((4, size + 4), dtype=torch.int32, device=device) for size in sizes
+    ]
+    layers = [f"layer.{i}" for i in range(len(sizes))]
+    spec = SlidingWindowSpec(
+        block_size=2,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.int32,
+        sliding_window=4,
+    )
+    zeroer = KVBlockZeroer(
+        device,
+        [AttentionGroup(_BlockFirstBackend, layers, spec, 0)],
+        [2],
+        "auto",
+        {
+            name: SimpleNamespace(kv_cache=storage[:, 2:-2])
+            for name, storage in zip(layers, backing)
+        },
+    )
+    zeroer.zero_block_ids([1, 3])
+    torch.accelerator.synchronize()
+    for storage in backing:
+        expected = torch.ones_like(storage)
+        expected[[1, 3], 2:-2] = 0
+        assert torch.equal(storage, expected)
+    assert len(zeroer._launch_meta) == 2
+    assert sum(meta[3] * meta[5] for meta in zeroer._launch_meta) < (
+        zeroer._meta[3] * zeroer._meta[5]
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(
     "spec",
     [
