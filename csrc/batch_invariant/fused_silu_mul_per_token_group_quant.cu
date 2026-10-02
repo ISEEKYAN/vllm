@@ -30,6 +30,7 @@ limitations under the License.
 #include <cuda_fp8.h>
 #include <torch/extension.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <mutex>
@@ -231,14 +232,12 @@ constexpr float LOCAL_ABSMAX_ABS = 1e-10;
 constexpr uint32_t INPUT_PRIMARY_VEC_NUM_BYTES = 32;
 
 struct NaiveScheduler {
-  static void compute_exec_config(
-      int threads_per_subwarp,
-      int num_local_experts,
-      int hidden_dim_num_groups,
-      int num_groups,
-      int& subwarps_per_block,
-      dim3& grid,
-      dim3& block) {
+  static void compute_exec_config(int threads_per_subwarp,
+                                  int num_local_experts,
+                                  int hidden_dim_num_groups, int64_t num_groups,
+                                  int num_tokens_per_expert,
+                                  int& subwarps_per_block, dim3& grid,
+                                  dim3& block) {
     subwarps_per_block = ([=]() -> int {
       if (num_groups % 16 == 0) {
         return 16;
@@ -290,21 +289,23 @@ struct NaiveScheduler {
 };
 
 struct MaskedLayoutScheduler {
-  // TODO can be dynamically determined (which may be good when num rank is small)
-  static constexpr int TOKEN_DIM_BLOCK_NUM_PER_EXPERT = 1024;
+  // Blocks grid-stride over tokens. A fixed 128 avoids launching mostly-empty
+  // blocks when masked_m is far below the padded capacity (decode).
+  static constexpr int DEFAULT_TOKEN_DIM_BLOCKS = 128;
   static constexpr int SUBWARPS_PER_BLOCK = 16;
 
-  static void compute_exec_config(
-      int threads_per_subwarp,
-      int num_local_experts,
-      int hidden_dim_num_groups,
-      int num_groups,
-      int& subwarps_per_block,
-      dim3& grid,
-      dim3& block) {
+  static void compute_exec_config(int threads_per_subwarp,
+                                  int num_local_experts,
+                                  int hidden_dim_num_groups, int64_t num_groups,
+                                  int num_tokens_per_expert,
+                                  int& subwarps_per_block, dim3& grid,
+                                  dim3& block) {
     subwarps_per_block = SUBWARPS_PER_BLOCK;
     TORCH_CHECK(hidden_dim_num_groups % subwarps_per_block == 0);
-    grid = dim3(hidden_dim_num_groups / subwarps_per_block, TOKEN_DIM_BLOCK_NUM_PER_EXPERT, num_local_experts);
+    const int token_dim_blocks =
+        std::min(DEFAULT_TOKEN_DIM_BLOCKS, num_tokens_per_expert);
+    grid = dim3(hidden_dim_num_groups / subwarps_per_block, token_dim_blocks,
+                num_local_experts);
     block = dim3(subwarps_per_block * threads_per_subwarp);
   }
 
@@ -326,7 +327,7 @@ struct MaskedLayoutScheduler {
     const int curr_expert_token_num = masked_m[expert_idx];
 
     for (int token_idx = token_idx_start; token_idx < curr_expert_token_num;
-         token_idx += TOKEN_DIM_BLOCK_NUM_PER_EXPERT) {
+         token_idx += gridDim.y) {
       const int hidden_size = hidden_dim_num_groups * GROUP_SIZE;
       const int64_t input_group_start_offset = compute_input_group_start_offset<FUSE_SILU_AND_MUL>(
           expert_idx, token_idx, hidden_dim_group_idx, hidden_size, num_tokens_per_expert, GROUP_SIZE);
@@ -523,7 +524,8 @@ __global__ void per_token_group_quant_8bit_kernel(
         }
 
         st_global(
-            reinterpret_cast<int4*>(output_q + offset_num_groups * GROUP_SIZE + lane_id * INPUT_PRIMARY_VEC_SIZE),
+            reinterpret_cast<int4*>(
+                output_q + static_cast<int64_t>(offset_num_groups) * GROUP_SIZE + lane_id * INPUT_PRIMARY_VEC_SIZE),
             output_buf);
       });
 
@@ -555,7 +557,7 @@ void fused_silu_mul_per_token_group_quant(
   TORCH_CHECK(std::abs(LOCAL_ABSMAX_ABS - eps) < 1e-13);
 
   CHECK_EQ(input.numel() % group_size, 0);
-  const int num_groups = static_cast<int>(input.numel()) / group_size / (fuse_silu_and_mul ? 2 : 1);
+  const int64_t num_groups = input.numel() / group_size / (fuse_silu_and_mul ? 2 : 1);
 
   const bool masked_layout = masked_m.has_value();
   TORCH_CHECK(output_s.dim() == (masked_layout ? 3 : 2));
@@ -574,37 +576,39 @@ void fused_silu_mul_per_token_group_quant(
   const int scale_expert_stride = masked_layout ? static_cast<int>(output_s.stride(0)) : 0;
   const int scale_hidden_stride = static_cast<int>(output_s.stride(-1));
 
-#define LAUNCH_KERNEL_INNER(SCHEDULER, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, output_s_dtype, ...)           \
-  do {                                                                                                               \
-    int subwarps_per_block;                                                                                          \
-    dim3 grid, block;                                                                                                \
-    SCHEDULER::compute_exec_config(                                                                                  \
-        THREADS_PER_SUBWARP, num_local_experts, hidden_dim_num_groups, num_groups, subwarps_per_block, grid, block); \
-                                                                                                                     \
-    cudaLaunchConfig_t config;                                                                                       \
-    config.gridDim = grid;                                                                                           \
-    config.blockDim = block;                                                                                         \
-    config.dynamicSmemBytes = 0;                                                                                     \
-    config.stream = stream;                                                                                          \
-    cudaLaunchAttribute attrs[1];                                                                                    \
-    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;                                                \
-    attrs[0].val.programmaticStreamSerializationAllowed = get_env_enable_pdl();                                      \
-    config.numAttrs = 1;                                                                                             \
-    config.attrs = attrs;                                                                                            \
-    cudaLaunchKernelEx(                                                                                              \
-        &config,                                                                                                     \
-        per_token_group_quant_8bit_kernel<SCHEDULER, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, __VA_ARGS__>,    \
-        static_cast<T*>(input.data_ptr()),                                                                           \
-        static_cast<DST_DTYPE*>(output_q.data_ptr()),                                                                \
-        static_cast<output_s_dtype*>(output_s.data_ptr()),                                                           \
-        static_cast<int32_t*>(masked_m.has_value() ? masked_m->data_ptr() : 0),                                      \
-        subwarps_per_block,                                                                                          \
-        hidden_dim_num_groups,                                                                                       \
-        scale_expert_stride,                                                                                         \
-        scale_hidden_stride,                                                                                         \
-        num_tokens_per_expert,                                                                                       \
-        static_cast<float>(max_8bit),                                                                                \
-        static_cast<float>(clamp_limit));                                                                            \
+#define LAUNCH_KERNEL_INNER(SCHEDULER, GROUP_SIZE, THREADS_PER_SUBWARP, T,   \
+                            DST_DTYPE, output_s_dtype, ...)                  \
+  do {                                                                       \
+    int subwarps_per_block;                                                  \
+    dim3 grid, block;                                                        \
+    SCHEDULER::compute_exec_config(                                          \
+        THREADS_PER_SUBWARP, num_local_experts, hidden_dim_num_groups,       \
+        num_groups, num_tokens_per_expert, subwarps_per_block, grid, block); \
+                                                                             \
+    cudaLaunchConfig_t config;                                               \
+    config.gridDim = grid;                                                   \
+    config.blockDim = block;                                                 \
+    config.dynamicSmemBytes = 0;                                             \
+    config.stream = stream;                                                  \
+    cudaLaunchAttribute attrs[1];                                            \
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;        \
+    attrs[0].val.programmaticStreamSerializationAllowed =                    \
+        get_env_enable_pdl();                                                \
+    config.numAttrs = 1;                                                     \
+    config.attrs = attrs;                                                    \
+    cudaLaunchKernelEx(                                                      \
+        &config,                                                             \
+        per_token_group_quant_8bit_kernel<SCHEDULER, GROUP_SIZE,             \
+                                          THREADS_PER_SUBWARP, T, DST_DTYPE, \
+                                          __VA_ARGS__>,                      \
+        static_cast<T*>(input.data_ptr()),                                   \
+        static_cast<DST_DTYPE*>(output_q.data_ptr()),                        \
+        static_cast<output_s_dtype*>(output_s.data_ptr()),                   \
+        static_cast<int32_t*>(masked_m.has_value() ? masked_m->data_ptr()    \
+                                                   : 0),                     \
+        subwarps_per_block, hidden_dim_num_groups, scale_expert_stride,      \
+        scale_hidden_stride, num_tokens_per_expert,                          \
+        static_cast<float>(max_8bit), static_cast<float>(clamp_limit));      \
   } while (0)
 
 #define LAUNCH_KERNEL(GROUP_SIZE, T, DST_DTYPE)                                                                     \

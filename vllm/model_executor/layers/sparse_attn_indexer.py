@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom Sparse Attention Indexer layers."""
 
-import os
 
 import torch
 
@@ -58,15 +57,12 @@ def _top_k_per_row_prefill(
     top_k: int,
 ) -> None:
     if envs.VLLM_BATCH_INVARIANT:
-        if not hasattr(torch.ops.ds4_bi, "top_k_per_row_prefill"):
-            library = os.environ.get("DS4_BI_TOPK_LIB")
-            if library:
-                torch.ops.load_library(library)
-        if not hasattr(torch.ops.ds4_bi, "top_k_per_row_prefill"):
-            raise RuntimeError(
-                "VLLM_BATCH_INVARIANT requires the DS4 deterministic Top-K library"
-            )
-        torch.ops.ds4_bi.top_k_per_row_prefill(
+        from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+            require_batch_invariant_quant_kernel,
+        )
+
+        require_batch_invariant_quant_kernel()
+        torch.ops.vllm_batch_invariant.top_k_per_row_prefill(
             logits,
             row_starts,
             row_ends,

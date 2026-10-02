@@ -576,13 +576,8 @@ def combine_topk_swa_indices(
     M: int,
     N: int,
     out: tuple[torch.Tensor, torch.Tensor] | None = None,
+    decode_is_valid: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if envs.VLLM_BATCH_INVARIANT and topk:
-        # The prefill radix top-k kernel guarantees the selected set but not
-        # its order. FlashMLA consumes indices in-order, so different legal
-        # permutations otherwise change the floating-point reduction and make
-        # repeated runs diverge once the candidate count exceeds ``topk``.
-        topk_indices = _canonicalize_sparse_topk_indices(topk_indices)
     num_tokens = topk_indices.shape[0]
     combined_topk = (
         (topk + window_size + _SPARSE_PREFILL_TOPK_ALIGNMENT - 1)
@@ -602,6 +597,40 @@ def combine_topk_swa_indices(
     else:
         combined_indices, combined_lens = out
 
+    use_fused_decode = (
+        envs.VLLM_BATCH_INVARIANT
+        and decode_is_valid is not None
+        and topk <= 512
+        and hasattr(
+            torch.ops.vllm_batch_invariant,
+            "combine_topk_swa_decode",
+        )
+    )
+    if use_fused_decode:
+        torch.ops.vllm_batch_invariant.combine_topk_swa_decode(
+            combined_indices,
+            combined_lens,
+            topk_indices,
+            seq_lens,
+            decode_is_valid,
+            M,
+            N,
+            topk,
+            compress_ratio,
+            window_size,
+        )
+        return combined_indices, combined_lens
+
+    if out is not None:
+        combined_indices.fill_(-1)
+
+    if envs.VLLM_BATCH_INVARIANT and topk:
+        # The prefill radix top-k kernel guarantees the selected set but not
+        # its order. FlashMLA consumes indices in-order, so different legal
+        # permutations otherwise change the floating-point reduction and make
+        # repeated runs diverge once the candidate count exceeds ``topk``.
+        topk_indices = _canonicalize_sparse_topk_indices(topk_indices)
+
     _COMBINE_TOPK_SWA_INDICES_KERNEL(
         combined_indices,
         combined_lens,
@@ -615,6 +644,8 @@ def combine_topk_swa_indices(
         COMPRESS_RATIO=compress_ratio,
         WINDOW_SIZE=window_size,
     )
+    if decode_is_valid is not None:
+        zero_invalid_lens(combined_lens, decode_is_valid)
     return combined_indices, combined_lens
 
 

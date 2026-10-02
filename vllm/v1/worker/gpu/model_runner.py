@@ -137,6 +137,7 @@ from vllm.v1.worker.utils import (
     copy_kv_cache_blocks_inplace,
     get_uniform_decode_token_count,
 )
+from vllm.v1.worker.workspace import lock_workspace
 
 logger = init_logger(__name__)
 
@@ -830,6 +831,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             if self.speculator is not None:
                 self.speculator.capture()
+
+        # Resizing the workspace would invalidate captured buffer addresses.
+        lock_workspace()
 
         end_time = time.perf_counter()
         end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
