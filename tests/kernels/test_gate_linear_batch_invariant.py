@@ -41,8 +41,9 @@ def _make_gate(
     out_dtype: torch.dtype | None = torch.float32,
     input_size: int = 4096,
     output_size: int = 256,
+    blackwell: bool = False,
 ) -> GateLinear:
-    """Build a GateLinear as on Hopper with every specialized tier available."""
+    """Build a GateLinear with mocked Hopper or Blackwell eligibility."""
     for target in (
         "vllm.model_executor.layers.linear",
         "vllm.model_executor.parameter",
@@ -54,9 +55,15 @@ def _make_gate(
     monkeypatch.setattr(platform, "is_cuda", lambda: True)
     monkeypatch.setattr(platform, "is_rocm", lambda: False)
     monkeypatch.setattr(
-        platform, "is_device_capability", lambda capability: capability == (9, 0)
+        platform,
+        "is_device_capability",
+        lambda capability: not blackwell and capability == (9, 0),
     )
-    monkeypatch.setattr(platform, "is_device_capability_family", lambda *a: False)
+    monkeypatch.setattr(
+        platform,
+        "is_device_capability_family",
+        lambda family: blackwell and family == 100,
+    )
     monkeypatch.setattr(
         "vllm.model_executor.kernels.linear.cute_dsl.ll_bf16.is_available",
         lambda: True,
@@ -106,6 +113,11 @@ def _record_gemm_tiers(monkeypatch) -> list[tuple[str, int]]:
     )
     monkeypatch.setattr(
         torch.ops.vllm, "fp32_router_gemm_dispatch", recorder("fp32_kernel")
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.fused_moe.router."
+        "bf16x3_router_gemm_cutedsl.bf16x3_router_gemm",
+        recorder("bf16x3"),
     )
     monkeypatch.setattr(torch, "mm", recorder("cublas"))
     return calls
@@ -185,6 +197,59 @@ def test_fp32_gate_uses_fp32_linear_for_every_m(
         assert calls == [("fp32_kernel", num_tokens)]
 
 
+@pytest.mark.parametrize("batch_invariant", [True, False])
+@pytest.mark.parametrize("num_tokens", [1, 33, 2048])
+def test_bf16x3_tier_respects_batch_invariance(
+    monkeypatch, batch_invariant, num_tokens
+):
+    # An unsupported tier-2 shape reaches tier 3 directly on Blackwell.
+    gate = _make_gate(
+        monkeypatch,
+        batch_invariant=batch_invariant,
+        params_dtype=torch.float32,
+        blackwell=True,
+    )
+    assert gate.allow_bf16x3_router_gemm
+    assert not gate.allow_fp32_router_gemm
+    calls = _record_gemm_tiers(monkeypatch)
+    x = torch.randn(num_tokens, gate.input_size, dtype=torch.bfloat16)
+
+    output, _ = gate(x)
+
+    assert output.dtype == torch.float32
+    torch.testing.assert_close(output, x.float() @ gate.weight.T)
+    assert calls == ([] if batch_invariant else [("bf16x3", num_tokens)])
+
+
+@pytest.mark.parametrize("capability", [(8, 0), (8, 9)])
+def test_bitwise_check_skips_unsupported_device_before_workspace_asserts(
+    monkeypatch, capability
+):
+    def init_unsupported_device():
+        # Family 80 does not set the SM90/SM100 workspace settings.
+        monkeypatch.setattr(torch.backends.cuda.matmul, "fp32_precision", "ieee")
+
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: False)
+    monkeypatch.setattr(
+        "vllm.model_executor.determinism.batch_invariant.init_batch_invariance",
+        init_unsupported_device,
+    )
+    monkeypatch.setattr(
+        current_platform,
+        "is_device_capability",
+        lambda requested: requested == capability,
+    )
+    monkeypatch.setattr(
+        current_platform, "is_device_capability_family", lambda family: family == 80
+    )
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    monkeypatch.delenv("CUBLASLT_WORKSPACE_SIZE", raising=False)
+
+    with pytest.raises(pytest.skip.Exception, match="requires SM90 or SM100"):
+        _bitwise_router_check(*DSV4_ROUTER_SHAPES[0])
+
+
 def _bitwise_router_check(input_size: int, output_size: int) -> None:
     from vllm.model_executor.determinism.batch_invariant import (
         init_batch_invariance,
@@ -197,14 +262,14 @@ def _bitwise_router_check(input_size: int, output_size: int) -> None:
     assert not torch.cuda.is_initialized()
     os.environ["VLLM_BATCH_INVARIANT"] = "1"
     init_batch_invariance()
-    assert os.environ["CUBLAS_WORKSPACE_CONFIG"] == ":16:8"
-    assert os.environ["CUBLASLT_WORKSPACE_SIZE"] == "1"
     assert torch.backends.cuda.matmul.fp32_precision == "ieee"
     if not (
         current_platform.is_device_capability((9, 0))
         or current_platform.is_device_capability_family(100)
     ):
         pytest.skip("Batch-invariant cuBLAS router GEMM requires SM90 or SM100.")
+    assert os.environ["CUBLAS_WORKSPACE_CONFIG"] == ":16:8"
+    assert os.environ["CUBLASLT_WORKSPACE_SIZE"] == "1"
 
     with (
         mock.patch(
