@@ -137,3 +137,184 @@ def test_quant_kernel_gated_on_batch_invariant_flag(monkeypatch, tmp_path):
 
     monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
     assert fp8_utils.is_batch_invariant_quant_kernel_enabled()
+
+
+def test_fp4_probe_does_not_accept_only_a_masked_fp8_api(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm.utils import deep_gemm
+
+    package = SimpleNamespace(
+        set_batch_invariant=lambda _: None,
+        get_batch_invariant=lambda: True,
+        m_grouped_fp8_gemm_nt_masked=lambda: None,
+    )
+    monkeypatch.setattr(deep_gemm, "_import_deep_gemm", lambda: package)
+    deep_gemm.supports_deep_gemm_batch_invariance.cache_clear()
+    try:
+        assert deep_gemm.supports_deep_gemm_batch_invariance()
+        assert not deep_gemm.supports_deep_gemm_batch_invariance(fp4_contiguous=True)
+    finally:
+        deep_gemm.supports_deep_gemm_batch_invariance.cache_clear()
+
+
+@pytest.mark.parametrize("backend", ["auto", "marlin", "flashinfer_trtllm"])
+def test_ds41_bi_rejects_a_different_activation_quantization_backend(
+    monkeypatch, backend
+):
+    from types import SimpleNamespace
+
+    from vllm.models.deepseek_v41 import quant_config
+
+    monkeypatch.setattr(quant_config, "RoutedExperts", SimpleNamespace)
+    monkeypatch.setattr(quant_config, "is_layer_skipped", lambda **_: False)
+    selected = object()
+    monkeypatch.setattr(quant_config, "Mxfp4MoEMethod", lambda _: selected)
+    config = SimpleNamespace(
+        weight_block_size=None,
+        expert_dtype="fp4",
+        moe_quant_algo=None,
+        ignored_layers=[],
+        packed_modules_mapping={},
+    )
+    layer = SimpleNamespace(moe_config=SimpleNamespace(moe_backend=backend))
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    with pytest.raises(RuntimeError, match="explicit.*moe_backend='deep_gemm'"):
+        quant_config.DeepseekV4FP8Config.get_quant_method(config, layer, "experts")
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", False)
+    assert (
+        quant_config.DeepseekV4FP8Config.get_quant_method(config, layer, "experts")
+        is selected
+    )
+
+
+def test_ds41_bi_rejects_mega_moe_before_distributed_initialization(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm.models.deepseek_v41.nvidia.model import DeepseekV4MoE
+
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(expert_dtype="fp4")),
+        kernel_config=SimpleNamespace(moe_backend="deep_gemm_mega_moe"),
+    )
+    with pytest.raises(RuntimeError, match="does not support MegaMoE"):
+        DeepseekV4MoE(config)
+
+
+@pytest.mark.parametrize("m", [1, 31, 32, 33, 128, 513])
+@pytest.mark.parametrize("cpu_counts", [False, True])
+def test_fp4_fixed_alignment_ignores_batch_heuristic(monkeypatch, m, cpu_counts):
+    from types import SimpleNamespace
+
+    from vllm.model_executor.layers.fused_moe.deep_gemm_utils import (
+        compute_aligned_M_and_alignment,
+    )
+    from vllm.utils import deep_gemm
+
+    monkeypatch.setattr(
+        deep_gemm,
+        "get_theoretical_mk_alignment_for_contiguous_layout",
+        lambda **_: 32,
+    )
+    meta = (
+        SimpleNamespace(expert_num_tokens_cpu=torch.tensor([m, 0]))
+        if cpu_counts
+        else None
+    )
+    capacity, alignment = compute_aligned_M_and_alignment(
+        m,
+        1,
+        2,
+        64,
+        meta,
+        fixed_alignment=128,
+    )
+    assert alignment == 128 and capacity % 128 == 0 and capacity >= m
+    _, legacy_alignment = compute_aligned_M_and_alignment(m, 1, 2, 64, meta)
+    assert legacy_alignment == (64 if cpu_counts else 32)
+
+
+@pytest.mark.parametrize("m", [1, 511, 512, 513])
+def test_fp4_a2_keeps_the_same_row_and_scale_tile(monkeypatch, m):
+    launches = []
+
+    class Kernel:
+        def __getitem__(self, grid):
+            return lambda *args, **kwargs: launches.append(kwargs)
+
+    monkeypatch.setattr(fp8_utils, "_silu_mul_quant_fp8_packed_kernel", Kernel())
+    x = torch.zeros(m, 256, dtype=torch.bfloat16)
+    for bi in (True, False):
+        fp8_utils.silu_mul_quant_fp8_packed_triton(x, batch_invariant=bi)
+    assert (launches[0]["BLOCK_M"], launches[0]["PACKS_PER_CTA"]) == (1, 2)
+    assert (launches[1]["BLOCK_M"], launches[1]["PACKS_PER_CTA"]) == (
+        (1, 2) if m < 512 else (4, 1)
+    )
+
+
+@pytest.mark.parametrize(
+    "failure,match",
+    [
+        ("device", "SM100"),
+        ("api", "control APIs"),
+        ("parallel", "TP=EP"),
+        ("activation", "SITU"),
+        ("dtype", "BF16"),
+        ("shape", "divisible"),
+        ("scale", "UE8M0"),
+        ("clamp", "positive clamp"),
+        ("bias", "biases"),
+    ],
+)
+def test_fp4_bi_rejects_unverified_contract(monkeypatch, failure, match):
+    from tests.kernels.moe.utils import make_dummy_moe_config
+    from vllm.model_executor.layers.fused_moe import MoEActivation
+    from vllm.model_executor.layers.fused_moe.experts import deep_gemm_moe
+    from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
+        Mxfp4MoeBackend,
+        make_mxfp4_moe_quant_config,
+    )
+    from vllm.utils.deep_gemm import DeepGemmQuantScaleFMT
+
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    monkeypatch.setattr(
+        deep_gemm_moe.current_platform,
+        "is_device_capability_family",
+        lambda _: failure != "device",
+    )
+    monkeypatch.setattr(
+        deep_gemm_moe,
+        "supports_deep_gemm_batch_invariance",
+        lambda **_: failure != "api",
+    )
+    monkeypatch.setattr(
+        DeepGemmQuantScaleFMT,
+        "from_oracle",
+        lambda: (
+            DeepGemmQuantScaleFMT.FLOAT32
+            if failure == "scale"
+            else DeepGemmQuantScaleFMT.UE8M0
+        ),
+    )
+    config = make_dummy_moe_config(hidden_dim=128, intermediate_size=128)
+    quant = make_mxfp4_moe_quant_config(
+        Mxfp4MoeBackend.DEEPGEMM_MXFP4,
+        torch.ones(1),
+        torch.ones(1),
+        swiglu_limit=float("nan") if failure == "clamp" else 10.0,
+        w1_bias=torch.ones(1) if failure == "bias" else None,
+    )
+    if failure == "parallel":
+        config.moe_parallel_config.ep_size = 2
+    elif failure == "activation":
+        config.activation = MoEActivation.SITU
+    elif failure == "dtype":
+        config.in_dtype = torch.float16
+    elif failure == "shape":
+        config.intermediate_size = 192
+    with pytest.raises(RuntimeError, match=match):
+        deep_gemm_moe.DeepGemmFP4Experts(config, quant)
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", False)
+    # BI=0 retains the previous constructor's acceptance and numeric path.
+    deep_gemm_moe.DeepGemmFP4Experts(config, quant)

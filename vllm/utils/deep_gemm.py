@@ -214,8 +214,12 @@ def _import_deep_gemm():
 
 
 @functools.cache
-def supports_deep_gemm_batch_invariance() -> bool:
-    """Return whether the installed DeepGEMM has invariant masked grouped FP8."""
+def supports_deep_gemm_batch_invariance(*, fp4_contiguous: bool = False) -> bool:
+    """Check APIs needed by the selected BI path, not numerical invariance.
+
+    FP4 contiguous additionally relies on vLLM fixing the MK alignment.
+    The native BI switch alone only covers FP8 weights in the pinned build.
+    """
     deep_gemm = _import_deep_gemm()
     if deep_gemm is None:
         return False
@@ -223,6 +227,15 @@ def supports_deep_gemm_batch_invariance() -> bool:
         callable(getattr(deep_gemm, name, None))
         for name in ("set_batch_invariant", "get_batch_invariant")
     )
+    if fp4_contiguous:
+        return controls_available and all(
+            callable(getattr(deep_gemm, name, None))
+            for name in (
+                "m_grouped_fp8_fp4_gemm_nt_contiguous",
+                "get_mk_alignment_for_contiguous_layout",
+                "set_mk_alignment_for_contiguous_layout",
+            )
+        )
     masked_api_available = any(
         callable(getattr(deep_gemm, name, None))
         for name in (

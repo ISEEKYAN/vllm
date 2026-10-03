@@ -30,6 +30,8 @@ def compute_aligned_M_and_alignment(
     local_num_experts: int,
     alignment: int,
     expert_tokens_meta: mk.ExpertTokensMetadata | None,
+    *,
+    fixed_alignment: int | None = None,
 ) -> tuple[int, int]:
     """Return (M_sum, alignment_used).
 
@@ -43,6 +45,8 @@ def compute_aligned_M_and_alignment(
     GEMM call site needs to wrap itself in ``mk_alignment_scope`` or
     otherwise reason about the actual per-expert padding.
     """
+    if fixed_alignment is not None:
+        alignment = fixed_alignment
     if (expert_tokens_meta is not None) and (
         expert_tokens_meta.expert_num_tokens_cpu is not None
     ):
@@ -59,6 +63,11 @@ def compute_aligned_M_and_alignment(
     # Also shrink `alignment` to DeepGEMM's per-call theoretical BLOCK_M on
     # SM100/SM120 when smaller.
     expected_m = M * num_topk
+    if fixed_alignment is not None:
+        max_active_experts = min(expected_m, local_num_experts)
+        return round_up(
+            expected_m + max_active_experts * (alignment - 1), alignment
+        ), alignment
     try:
         from vllm.utils.deep_gemm import (
             get_theoretical_mk_alignment_for_contiguous_layout,
@@ -464,6 +473,7 @@ def deepgemm_moe_permute(
     expert_tokens_meta: mk.ExpertTokensMetadata | None,
     aq_out: torch.Tensor | None = None,
     block_size: int | None = None,
+    fixed_alignment: int | None = None,
 ):
     assert aq.ndim == 2
     assert topk_ids.dtype.is_signed, "The kernel uses -1 to represent invalid topk_ids"
@@ -482,6 +492,7 @@ def deepgemm_moe_permute(
         local_num_experts=local_num_experts,
         alignment=block_m,
         expert_tokens_meta=expert_tokens_meta,
+        fixed_alignment=fixed_alignment,
     )
 
     expert_start_loc = torch.empty(

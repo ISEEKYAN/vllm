@@ -97,6 +97,15 @@ class DeepseekV4MoE(DeepseekV4MoEBase):
         use_sequence_parallel: bool = False,
     ):
         config = vllm_config.model_config.hf_config
+        if (
+            envs.VLLM_BATCH_INVARIANT
+            and getattr(config, "expert_dtype", "fp4") == "fp4"
+            and vllm_config.kernel_config.moe_backend in MEGA_MOE_BACKENDS
+        ):
+            raise RuntimeError(
+                "DS4.1 FP4 batch invariance does not support MegaMoE; "
+                "use moe_backend='deep_gemm'"
+            )
         n_routed_experts = config.n_routed_experts
         n_activated_experts = config.num_experts_per_tok
         if extract_layer_index(prefix) >= config.num_hidden_layers:
