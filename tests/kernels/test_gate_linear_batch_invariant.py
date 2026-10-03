@@ -83,6 +83,13 @@ def _record_gemm_tiers(monkeypatch) -> list[tuple[str, int]]:
     """
     calls: list[tuple[str, int]] = []
 
+    # Keep the ReplicatedLinear fallback device-free on CUDA hosts too.
+    # Its BI implementation otherwise launches Triton on our CPU tensors.
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.linear.linear_batch_invariant",
+        torch.nn.functional.linear,
+    )
+
     def recorder(tier):
         def gemm(x, weight, *args, **kwargs):
             calls.append((tier, x.shape[0]))
