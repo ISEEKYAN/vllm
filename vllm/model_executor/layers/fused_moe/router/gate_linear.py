@@ -4,6 +4,7 @@ import torch
 from torch.nn.parameter import Parameter
 
 import vllm._custom_ops as ops
+import vllm.envs as envs
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
@@ -32,6 +33,9 @@ class GateLinear(ReplicatedLinear):
 
     A ``quant_config`` that actually quantizes the gate disables every
     specialized tier, leaving plain ``ReplicatedLinear`` behavior.
+
+    With ``VLLM_BATCH_INVARIANT=1`` only tiers 4 and 5 are used, for every
+    number of tokens (see ``forward``).
     """
 
     # (hidden_size, num_experts) pairs with an instantiated fp32 kernel:
@@ -192,9 +196,18 @@ class GateLinear(ReplicatedLinear):
     def forward(
         self, x: torch.Tensor
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+        # Tiers 1-3 pick their kernel and K-reduction scheme from the number
+        # of tokens, so the same token gets different router logits (and can
+        # get different top-k experts) in decode and in prefill. Under batch
+        # invariance, skip them so every M goes through the same GEMM: the
+        # cuBLAS tier (split-K is disabled by enable_batch_invariant_mode() on
+        # Hopper/Blackwell) or F.linear in fp32 (TF32 is disabled).
+        allow_m_dependent_tiers = not envs.VLLM_BATCH_INVARIANT
+
         # Tier 1: cuteDSL ll_bf16_gemm (SM90+, any dims)
         if (
-            self.allow_ll_bf16_gemm
+            allow_m_dependent_tiers
+            and self.allow_ll_bf16_gemm
             and x.shape[0] <= self.LL_BF16_MAX_TOKENS
             and x.dtype == torch.bfloat16
         ):
@@ -208,9 +221,10 @@ class GateLinear(ReplicatedLinear):
         # Tier 2: fp32 specialized kernel (model-specific shapes, M<=32)
         # Dispatch is wrapped in a custom op so that torch.compile/CUDA-graph
         # capture does not freeze the runtime num_tokens branch.
-        if self.allow_fp32_router_gemm and x.dtype in (
-            torch.float32,
-            torch.bfloat16,
+        if (
+            allow_m_dependent_tiers
+            and self.allow_fp32_router_gemm
+            and x.dtype in (torch.float32, torch.bfloat16)
         ):
             output = torch.ops.vllm.fp32_router_gemm_dispatch(
                 x, self.weight, self.allow_bf16x3_router_gemm
@@ -218,7 +232,11 @@ class GateLinear(ReplicatedLinear):
             return self._return(output)
 
         # Tier 3: bf16x3 CuteDSL kernel for fp32 router weights
-        if self.allow_bf16x3_router_gemm and x.dtype == torch.bfloat16:
+        if (
+            allow_m_dependent_tiers
+            and self.allow_bf16x3_router_gemm
+            and x.dtype == torch.bfloat16
+        ):
             from vllm.model_executor.layers.fused_moe.router.bf16x3_router_gemm_cutedsl import (  # noqa: E501
                 bf16x3_router_gemm,
             )
