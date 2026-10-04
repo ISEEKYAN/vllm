@@ -7,6 +7,8 @@ import torch
 import vllm.envs as envs
 from vllm.model_executor.layers.quantization.utils import fp8_utils
 
+pytestmark = [pytest.mark.cpu_test, pytest.mark.skip_global_cleanup]
+
 
 def test_required_batch_invariant_kernel_uses_packaged_default(monkeypatch, tmp_path):
     monkeypatch.delenv("VLLM_BATCH_INVARIANT_KERNEL_LIB", raising=False)
@@ -318,3 +320,93 @@ def test_fp4_bi_rejects_unverified_contract(monkeypatch, failure, match):
     monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", False)
     # BI=0 retains the previous constructor's acceptance and numeric path.
     deep_gemm_moe.DeepGemmFP4Experts(config, quant)
+
+
+@pytest.mark.parametrize(
+    "failure,match",
+    [
+        (None, None),
+        ("device", "batch invariance"),
+        ("api", "batch invariance"),
+        ("scale", "batch invariance"),
+        *[
+            (size, "TP=EP")
+            for size in ("tp_size", "ep_size", "dp_size", "pcp_size", "sp_size")
+        ],
+        ("enable_eplb", "EPLB"),
+        ("SITU", "SITU"),
+        ("SWIGLUSTEP", "SWIGLUSTEP"),
+        ("dtype", "BF16"),
+        ("hidden_dim", "divisible"),
+        ("intermediate_size", "divisible"),
+        ("batched", "activation format"),
+    ],
+)
+@pytest.mark.parametrize("bi", [False, True])
+def test_fp4_selector_batch_invariance_contract(monkeypatch, failure, match, bi):
+    """Select the contiguous BI path and fail closed before kernel construction."""
+    from tests.kernels.moe.utils import make_dummy_moe_config
+    from vllm.model_executor.layers.fused_moe import MoEActivation
+    from vllm.model_executor.layers.fused_moe.experts import deep_gemm_moe
+    from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
+        Mxfp4MoeBackend,
+        make_mxfp4_moe_quant_config,
+        select_deepseek_v4_mxfp4_moe_backend,
+    )
+    from vllm.utils import deep_gemm
+
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", bi)
+    monkeypatch.setattr(deep_gemm_moe, "is_deep_gemm_supported", lambda: True)
+    monkeypatch.setattr(
+        deep_gemm_moe.current_platform,
+        "is_device_capability_family",
+        lambda family: family == (120 if failure == "device" else 100),
+    )
+
+    def supports_bi(*, fp4_contiguous=False):
+        assert fp4_contiguous
+        return failure != "api"
+
+    monkeypatch.setattr(
+        deep_gemm_moe, "supports_deep_gemm_batch_invariance", supports_bi
+    )
+    monkeypatch.setattr(
+        deep_gemm.DeepGemmQuantScaleFMT,
+        "from_oracle",
+        lambda: (
+            deep_gemm.DeepGemmQuantScaleFMT.FLOAT32
+            if failure == "scale"
+            else deep_gemm.DeepGemmQuantScaleFMT.UE8M0
+        ),
+    )
+    config = make_dummy_moe_config(hidden_dim=128, intermediate_size=128)
+    config.moe_backend = "deep_gemm"
+    if failure in ("SITU", "SWIGLUSTEP"):
+        config.activation = MoEActivation[failure]
+    elif failure == "dtype":
+        config.in_dtype = torch.float16
+    elif failure in ("hidden_dim", "intermediate_size"):
+        setattr(config, failure, 192)
+    elif failure in ("tp_size", "ep_size", "dp_size", "pcp_size", "sp_size"):
+        setattr(config.moe_parallel_config, failure, 2)
+    elif failure == "enable_eplb":
+        config.moe_parallel_config.enable_eplb = True
+    elif failure == "batched":
+        monkeypatch.setattr(
+            type(config.moe_parallel_config),
+            "use_batched_activation_format",
+            property(lambda _: True),
+        )
+
+    if (bi and failure is not None) or failure == "batched":
+        with pytest.raises(ValueError, match=match):
+            select_deepseek_v4_mxfp4_moe_backend(config)
+    else:
+        backend, experts_cls = select_deepseek_v4_mxfp4_moe_backend(config)
+        assert backend == Mxfp4MoeBackend.DEEPGEMM_MXFP4
+        assert experts_cls is deep_gemm_moe.DeepGemmFP4Experts
+        for clamp in (None, 10.0):
+            quant = make_mxfp4_moe_quant_config(
+                backend, torch.ones(1), torch.ones(1), swiglu_limit=clamp
+            )
+            experts_cls(config, quant)

@@ -454,7 +454,6 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
         self.gemm1_clamp_limit = quant_config.gemm1_clamp_limit
 
         if envs.VLLM_BATCH_INVARIANT:
-            parallel = moe_config.moe_parallel_config
             if not current_platform.is_device_capability_family(100):
                 raise RuntimeError("FP4 batch invariance requires SM100-family GPUs")
             if not supports_deep_gemm_batch_invariance(fp4_contiguous=True):
@@ -462,36 +461,9 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
                     "FP4 batch invariance requires DeepGEMM contiguous FP8 x FP4 "
                     "and MK alignment control APIs"
                 )
-            if (
-                any(
-                    size != 1
-                    for size in (
-                        parallel.tp_size,
-                        parallel.ep_size,
-                        parallel.dp_size,
-                        parallel.pcp_size,
-                        parallel.sp_size,
-                    )
-                )
-                or parallel.enable_eplb
-            ):
-                raise RuntimeError(
-                    "FP4 batch invariance requires TP=EP=DP=PCP=SP=1 and no EPLB"
-                )
-            if moe_config.activation != MoEActivation.SILU:
-                raise RuntimeError(
-                    "FP4 batch invariance supports only SwiGLU (SILU), with "
-                    "optional clamp; SITU and SWIGLUSTEP are not supported"
-                )
-            if moe_config.in_dtype != torch.bfloat16:
-                raise RuntimeError("FP4 batch invariance requires BF16 inputs")
-            if any(
-                dim % self._ACT_BLOCK_K
-                for dim in (moe_config.hidden_dim, moe_config.intermediate_size)
-            ):
-                raise RuntimeError(
-                    "FP4 batch invariance requires K dimensions divisible by 128"
-                )
+            reason = self._batch_invariance_config_error(moe_config)
+            if reason is not None:
+                raise RuntimeError(reason)
             if DeepGemmQuantScaleFMT.from_oracle() != DeepGemmQuantScaleFMT.UE8M0:
                 raise RuntimeError("FP4 batch invariance requires packed UE8M0 scales")
             if self.gemm1_clamp_limit is not None and (
@@ -511,6 +483,61 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
                 raise RuntimeError(
                     "FP4 batch invariance requires SwiGLU alpha=1, beta=0"
                 )
+
+    @staticmethod
+    def _batch_invariance_config_error(moe_config: FusedMoEConfig) -> str | None:
+        parallel = moe_config.moe_parallel_config
+        if (
+            any(
+                size != 1
+                for size in (
+                    parallel.tp_size,
+                    parallel.ep_size,
+                    parallel.dp_size,
+                    parallel.pcp_size,
+                    parallel.sp_size,
+                )
+            )
+            or parallel.enable_eplb
+        ):
+            return "FP4 batch invariance requires TP=EP=DP=PCP=SP=1 and no EPLB"
+        if moe_config.activation != MoEActivation.SILU:
+            return (
+                "FP4 batch invariance supports only SwiGLU (SILU), with "
+                "optional clamp; SITU and SWIGLUSTEP are not supported"
+            )
+        if moe_config.in_dtype != torch.bfloat16:
+            return "FP4 batch invariance requires BF16 inputs"
+        if any(
+            dim % DeepGemmFP4Experts._ACT_BLOCK_K
+            for dim in (moe_config.hidden_dim, moe_config.intermediate_size)
+        ):
+            return "FP4 batch invariance requires K dimensions divisible by 128"
+        return None
+
+    @staticmethod
+    def _supports_batch_invariance() -> bool:
+        return (
+            current_platform.is_device_capability_family(100)
+            and supports_deep_gemm_batch_invariance(fp4_contiguous=True)
+            and DeepGemmQuantScaleFMT.from_oracle() == DeepGemmQuantScaleFMT.UE8M0
+        )
+
+    @staticmethod
+    def is_supported_config(
+        cls: type[mk.FusedMoEExperts],
+        moe_config: FusedMoEConfig,
+        weight_key: QuantKey | None,
+        activation_key: QuantKey | None,
+        activation_format: mk.FusedMoEActivationFormat,
+    ) -> tuple[bool, str | None]:
+        supported, reason = mk.FusedMoEExpertsModular.is_supported_config(
+            cls, moe_config, weight_key, activation_key, activation_format
+        )
+        if supported and envs.VLLM_BATCH_INVARIANT:
+            reason = DeepGemmFP4Experts._batch_invariance_config_error(moe_config)
+            return reason is None, reason
+        return supported, reason
 
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
