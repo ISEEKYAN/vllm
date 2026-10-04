@@ -43,6 +43,49 @@ def block32_scaled_mm(
     return output.to(output_dtype)
 
 
+def packed_block32_grouped_mm(
+    a: torch.Tensor,
+    packed_a_scale: torch.Tensor,
+    weight: torch.Tensor,
+    packed_weight_scale: torch.Tensor,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Consume DeepGEMM's logical INT32 UE8M0 scales without changing its codec.
+
+    Packed scales keep MN-major TMA strides and padded activation rows. Make
+    their logical order contiguous before the byte view, then discard padding.
+    Weights stay FP8; each group uses the same K32 visible math as ordinary
+    batch-invariant MXFP8 projections.
+    """
+    m, groups, k = a.shape
+    n = weight.shape[-2]
+    assert weight.shape == (groups, n, k)
+    assert packed_a_scale.dtype == packed_weight_scale.dtype == torch.int32
+    a_scale = (
+        packed_a_scale[:m]
+        .clone(memory_format=torch.contiguous_format)
+        .view(torch.uint8)[..., : k // 32]
+    )
+    weight_scale = (
+        packed_weight_scale[:, :n]
+        .clone(memory_format=torch.contiguous_format)
+        .view(torch.uint8)[..., : k // 32]
+    )
+    return torch.stack(
+        [
+            block32_scaled_mm(
+                a[:, group].contiguous(),
+                a_scale[:, group].contiguous(),
+                weight[group],
+                weight_scale[group],
+                output_dtype,
+            )
+            for group in range(groups)
+        ],
+        dim=1,
+    )
+
+
 class BatchInvariantMxfp8LinearKernel(Mxfp8LinearKernel):
     """Fixed-block FP8 GEMM; retain quantized weights through reload."""
 
