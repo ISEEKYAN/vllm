@@ -339,6 +339,18 @@ def _lazy_init() -> None:
     if _dg is None:
         return
 
+    # Metadata and its consumer must come from the same DeepGEMM revision.
+    # Older external BI builds lack 128-row pages used by DS4.1 on SM100.
+    paged_dg = _dg
+    if envs.VLLM_DEEP_GEMM_PAGED_MQA_USE_VENDORED:
+        paged_dg = importlib.import_module("vllm.third_party.deep_gemm")
+        for name in ("fp8_fp4_paged_mqa_logits", "get_paged_mqa_logits_metadata"):
+            if not callable(getattr(paged_dg, name, None)):
+                raise RuntimeError(f"Vendored DeepGEMM is missing {name}")
+        if current_platform.is_arch_support_pdl():
+            _apply_pdl(paged_dg, True)
+        logger.info_once("Using vendored DeepGEMM for paged MQA metadata and logits")
+
     # Enable PDL for DeepGEMM on architectures that support it (SM90+).
     if current_platform.is_arch_support_pdl():
         _apply_pdl(_dg, True)
@@ -355,9 +367,9 @@ def _lazy_init() -> None:
     # DeepGEMM exposes fp8_fp4_*_mqa_logits as the canonical symbols that
     # handle both the FP8 and FP4 Q/K paths via a tuple-typed `q`.
     _fp8_fp4_mqa_logits_impl = getattr(_dg, "fp8_fp4_mqa_logits", None)
-    _fp8_fp4_paged_mqa_logits_impl = getattr(_dg, "fp8_fp4_paged_mqa_logits", None)
+    _fp8_fp4_paged_mqa_logits_impl = getattr(paged_dg, "fp8_fp4_paged_mqa_logits", None)
     _get_paged_mqa_logits_metadata_impl = getattr(
-        _dg, "get_paged_mqa_logits_metadata", None
+        paged_dg, "get_paged_mqa_logits_metadata", None
     )
     # Sparse-indexer kernels (DeepGEMM >= 2.8, SM100 only).
     _fp8_fp4_sparse_mqa_logits_impl = getattr(_dg, "fp8_fp4_sparse_mqa_logits", None)
