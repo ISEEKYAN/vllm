@@ -10,7 +10,7 @@ from vllm.model_executor.kernels.mhc.tilelang import (
 )
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import (
-    _import_deep_gemm,
+    has_deep_gemm_mega_mhc,
     is_deep_gemm_supported,
     mega_mhc,
 )
@@ -27,8 +27,7 @@ def is_mega_mhc_supported(hidden_size: int, hc_mult: int) -> bool:
         and hc_mult == 4
     ):
         return False
-    deep_gemm = _import_deep_gemm()
-    return deep_gemm is not None and callable(getattr(deep_gemm, "mega_mhc", None))
+    return has_deep_gemm_mega_mhc()
 
 
 def mhc_shifted_post_pre_deep_gemm(

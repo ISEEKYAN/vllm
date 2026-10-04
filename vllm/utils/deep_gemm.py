@@ -286,6 +286,16 @@ def _apply_pdl(mod, enable: bool = True) -> None:
         logger.warning_once("Failed to set DeepGEMM PDL on %s: %s", mod_name, e)
 
 
+def _resolve_mega_mhc_impl(external: Any) -> Callable[..., Any] | None:
+    provider = external
+    if envs.VLLM_DEEP_GEMM_MEGA_MHC_USE_VENDORED:
+        provider = importlib.import_module("vllm.third_party.deep_gemm")
+        if not callable(getattr(provider, "mega_mhc", None)):
+            raise RuntimeError("Vendored DeepGEMM is missing mega_mhc")
+        logger.info_once("Using vendored DeepGEMM for Mega-mHC")
+    return getattr(provider, "mega_mhc", None)
+
+
 def _lazy_init() -> None:
     """Import deep_gemm and resolve symbols on first use."""
     global _cublaslt_gemm_nt_impl
@@ -383,7 +393,7 @@ def _lazy_init() -> None:
         _dg, "get_paged_sparse_mqa_logits_metadata", None
     )
     _tf32_hc_prenorm_gemm_impl = getattr(_dg, "tf32_hc_prenorm_gemm", None)
-    _mega_mhc_impl = getattr(_dg, "mega_mhc", None)
+    _mega_mhc_impl = _resolve_mega_mhc_impl(_dg)
     _get_mn_major_tma_aligned_tensor_impl = getattr(
         _dg, "get_mn_major_tma_aligned_tensor", None
     )
@@ -967,6 +977,12 @@ def tf32_hc_prenorm_gemm(
         sqrsum,
         num_split,
     )
+
+
+def has_deep_gemm_mega_mhc() -> bool:
+    """Probe the same provider used by the generic Mega-mHC call."""
+    _lazy_init()
+    return callable(_mega_mhc_impl)
 
 
 def mega_mhc(*args: Any, **kwargs: Any) -> None:
