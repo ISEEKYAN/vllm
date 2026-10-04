@@ -410,3 +410,38 @@ def test_fp4_selector_batch_invariance_contract(monkeypatch, failure, match, bi)
                 backend, torch.ones(1), torch.ones(1), swiglu_limit=clamp
             )
             experts_cls(config, quant)
+
+
+@pytest.mark.parametrize("bi", [False, True])
+@pytest.mark.parametrize("original_threshold", [1, 5])
+def test_ds41_bi_classifies_all_queries_for_the_same_sparse_kernel(
+    monkeypatch, bi, original_threshold
+):
+    """BI must not switch arithmetic for single-token or speculative queries."""
+    from types import SimpleNamespace
+
+    from vllm.models.deepseek_v41.nvidia.flashmla import (
+        DeepseekSparseSWAFlashMLAMetadataBuilder,
+        DeepseekV41SparseSWAMetadataBuilder,
+    )
+    from vllm.v1.attention.backend import AttentionCGSupport
+    from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+
+    def init_metadata(self):
+        self.decode_threshold = original_threshold
+
+    monkeypatch.setattr(DeepseekV41SparseSWAMetadataBuilder, "__init__", init_metadata)
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", bi)
+    builder = DeepseekSparseSWAFlashMLAMetadataBuilder()
+    batch = SimpleNamespace(
+        max_query_len=8,
+        num_reqs=3,
+        num_actual_tokens=10,
+        query_start_loc_cpu=torch.tensor([0, 1, 2, 10], dtype=torch.int32),
+    )
+    assert split_decodes_and_prefills(batch, builder.decode_threshold) == (
+        (0, 3, 0, 10) if bi else (2, 1, 2, 8)
+    )
+    assert builder.get_cudagraph_support(None, None) == (
+        AttentionCGSupport.NEVER if bi else AttentionCGSupport.ALWAYS
+    )
