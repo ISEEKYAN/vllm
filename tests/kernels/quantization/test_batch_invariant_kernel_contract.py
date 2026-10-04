@@ -445,3 +445,42 @@ def test_ds41_bi_classifies_all_queries_for_the_same_sparse_kernel(
     assert builder.get_cudagraph_support(None, None) == (
         AttentionCGSupport.NEVER if bi else AttentionCGSupport.ALWAYS
     )
+
+
+@pytest.mark.parametrize("bi", [False, True])
+@pytest.mark.parametrize("hidden_size,splits", [(512, 4), (1280, 2)])
+def test_bi_mhc_keeps_post_pre_rounding_across_token_batches(
+    monkeypatch, bi, hidden_size, splits
+):
+    """M>32 must not introduce an intermediate BF16 store in BI mode."""
+    from vllm.model_executor.kernels.mhc.tilelang_kernels import (
+        mhc_fused_post_pre_split_config,
+    )
+
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", bi)
+    sizes = [1, 15, 16, 32, 33, 64, 513]
+    configs = [mhc_fused_post_pre_split_config(m, hidden_size, 4) for m in sizes]
+    expected = (
+        [(2, splits, 128)] * len(sizes)
+        if bi
+        else [
+            (2, splits, 128),
+            (2, splits, 128),
+            (6, splits, 128),
+            (6, splits, 128),
+            None,
+            None,
+            None,
+        ]
+    )
+    assert configs == expected
+
+
+@pytest.mark.parametrize("bi", [False, True])
+def test_bi_mhc_retains_unsupported_row_geometry(monkeypatch, bi):
+    from vllm.model_executor.kernels.mhc.tilelang_kernels import (
+        mhc_fused_post_pre_split_config,
+    )
+
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", bi)
+    assert mhc_fused_post_pre_split_config(64, 65, 4) is None
