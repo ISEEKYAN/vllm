@@ -7,6 +7,7 @@ Run `pytest tests/quantization/test_fp8.py --forked`.
 
 import logging
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import regex as re
@@ -299,11 +300,18 @@ def test_deepgemm_mxfp8_preserves_weight_and_scale_values(
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="DeepGEMM requires CUDA")
+@pytest.mark.parametrize("batch_invariant", [False, True])
 @pytest.mark.parametrize("prequantized", [False, True])
 @pytest.mark.parametrize("config_source", ["deepseek", "mxfp8"])
 @pytest.mark.parametrize("num_tokens", [1, 7, 128])
 def test_mxfp8_bmm_loads_and_projects_grouped_weights(
-    dist_init, default_vllm_config, prequantized, config_source, num_tokens
+    dist_init,
+    default_vllm_config,
+    prequantized,
+    config_source,
+    num_tokens,
+    batch_invariant,
+    monkeypatch,
 ):
     """BMM metadata set after construction selects grouped weight processing."""
     from vllm.model_executor.kernels.linear.mxfp8.deep_gemm import (
@@ -327,6 +335,8 @@ def test_mxfp8_bmm_loads_and_projects_grouped_weights(
     ):
         pytest.skip("DeepGEMM MXFP8 BMM requires Blackwell")
 
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1" if batch_invariant else "0")
+    torch.manual_seed(733)
     default_vllm_config.model_config = SimpleNamespace(dtype=torch.bfloat16)
     quant_config = DeepseekV4FP8Config(
         is_checkpoint_fp8_serialized=True, weight_block_size=[32, 32]
@@ -421,21 +431,39 @@ def test_mxfp8_bmm_loads_and_projects_grouped_weights(
     assert (output.float() - reference).norm() / reference.norm() < 0.06
     if prequantized:
         recipe, tma_aligned_scales = compute_fp8_einsum_recipe(block_size=32)
-        projected = deep_gemm_fp8_o_proj(
-            x.permute(1, 0, 2),
-            torch.arange(num_tokens, device="cuda"),
-            cache,
-            linear,
-            torch.nn.Identity(),
-            n_groups=2,
-            heads_per_group=1,
-            nope_dim=448,
-            rope_dim=64,
-            o_lora_rank=128,
-            einsum_recipe=recipe,
-            tma_aligned_scales=tma_aligned_scales,
+        from vllm.models.deepseek_v4.nvidia.ops import o_proj
+        from vllm.utils.deep_gemm import fp8_einsum
+
+        assert recipe == (1, 1, 32) and tma_aligned_scales
+        expected = torch.empty_like(output)
+        fp8_einsum(
+            "bhr,hdr->bhd",
+            inputs,
+            (linear.weight, linear.weight_scale),
+            expected,
+            recipe=recipe,
         )
-        torch.testing.assert_close(projected, output.flatten(1), rtol=0, atol=0)
+        with patch.object(
+            o_proj, "packed_block32_grouped_mm", wraps=o_proj.packed_block32_grouped_mm
+        ) as grouped_mm:
+            projected = deep_gemm_fp8_o_proj(
+                x.permute(1, 0, 2),
+                torch.arange(num_tokens, device="cuda"),
+                cache,
+                linear,
+                torch.nn.Identity(),
+                n_groups=2,
+                heads_per_group=1,
+                nope_dim=448,
+                rope_dim=64,
+                o_lora_rank=128,
+                einsum_recipe=recipe,
+                tma_aligned_scales=tma_aligned_scales,
+            )
+        assert grouped_mm.call_count == int(batch_invariant)
+        torch.testing.assert_close(projected, expected.flatten(1), rtol=0.02, atol=0.5)
+        if not batch_invariant:
+            assert torch.equal(projected, output.flatten(1))
     compiled = torch.compile(linear, backend="eager", fullgraph=True)
     with torch.no_grad():
         torch.testing.assert_close(compiled(inputs), output, rtol=0, atol=0)
