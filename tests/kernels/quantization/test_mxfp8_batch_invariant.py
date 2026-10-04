@@ -75,8 +75,8 @@ def test_block32_same_row_decode_prefill_and_graph(grouped):
     def run(rows):
         return mm(a[:rows], sa[:rows], b, sb, torch.bfloat16)
 
-    expected = run(1)
-    assert torch.equal(expected, run(m)[:1])
+    eager = {rows: run(rows) for rows in (1, m)}
+    assert torch.equal(eager[1], eager[m][:1])
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
@@ -89,7 +89,7 @@ def test_block32_same_row_decode_prefill_and_graph(grouped):
             captured = run(rows)
         for _ in range(2):
             graph.replay()
-            assert torch.equal(expected, captured[:1])
+            assert torch.equal(eager[rows], captured)
 
 
 def test_batch_invariant_linear_selection_loading_and_apply(

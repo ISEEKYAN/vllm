@@ -425,10 +425,15 @@ def test_mxfp8_bmm_loads_and_projects_grouped_weights(
             quant_group_size=32,
             tma_aligned_scales=current_platform.has_device_capability(100),
         )
-    with torch.no_grad():
-        output = linear(inputs)
-    assert output.shape == reference.shape
-    assert (output.float() - reference).norm() / reference.norm() < 0.06
+    if batch_invariant:
+        with pytest.raises(RuntimeError, match="Grouped MXFP8 linear"):
+            linear(inputs)
+        output = torch.empty_like(reference, dtype=torch.bfloat16)
+    else:
+        with torch.no_grad():
+            output = linear(inputs)
+        assert output.shape == reference.shape
+        assert (output.float() - reference).norm() / reference.norm() < 0.06
     if prequantized:
         recipe, tma_aligned_scales = compute_fp8_einsum_recipe(block_size=32)
         from vllm.models.deepseek_v4.nvidia.ops import o_proj
@@ -462,11 +467,111 @@ def test_mxfp8_bmm_loads_and_projects_grouped_weights(
             )
         assert grouped_mm.call_count == int(batch_invariant)
         torch.testing.assert_close(projected, expected.flatten(1), rtol=0.02, atol=0.5)
-        if not batch_invariant:
+        if batch_invariant:
+            from tests.kernels.quantization.test_mxfp8_batch_invariant import (
+                _k32_oracle,
+            )
+
+            input_scales = inputs[1].contiguous().view(torch.uint8)
+            exact = torch.stack(
+                [
+                    _k32_oracle(
+                        inputs[0][:, g],
+                        input_scales[:, g],
+                        linear.weight[g],
+                        scales.repeat_interleave(32, dim=0).reshape(2, 128, 16)[g],
+                    )
+                    for g in range(2)
+                ],
+                dim=1,
+            ).bfloat16()
+            assert torch.equal(projected, exact.flatten(1))
+        else:
             assert torch.equal(projected, output.flatten(1))
-    compiled = torch.compile(linear, backend="eager", fullgraph=True)
-    with torch.no_grad():
-        torch.testing.assert_close(compiled(inputs), output, rtol=0, atol=0)
+    if not batch_invariant:
+        compiled = torch.compile(linear, backend="eager", fullgraph=True)
+        with torch.no_grad():
+            torch.testing.assert_close(compiled(inputs), output, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="DSV4.1 requires CUDA")
+def test_mxfp8_v41_attention_selects_batch_invariant_o_proj(
+    dist_init, default_vllm_config, monkeypatch
+):
+    """MXFP8 weight metadata selects K32 through the real attention constructor."""
+    from vllm.models.deepseek_v4.nvidia.ops import o_proj
+    from vllm.models.deepseek_v41.nvidia.flashmla import DeepseekV4FlashMLAAttention
+    from vllm.models.deepseek_v41.quant_config import DeepseekV4FP8Config
+    from vllm.transformers_utils.configs.deepseek_v41 import DeepseekV41Config
+    from vllm.utils.deep_gemm import is_deep_gemm_supported
+
+    if not is_deep_gemm_supported() or not current_platform.is_device_capability_family(
+        100
+    ):
+        pytest.skip("DeepGEMM MXFP8 BMM requires Blackwell")
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    torch.manual_seed(739)
+    config = default_vllm_config
+    config.model_config = SimpleNamespace(
+        dtype=torch.bfloat16,
+        max_model_len=32,
+        logits_processors=None,
+        hf_config=DeepseekV41Config(
+            text_config=dict(
+                hidden_size=512,
+                num_attention_heads=2,
+                q_lora_rank=512,
+                o_lora_rank=128,
+                head_dim=512,
+                qk_rope_head_dim=64,
+                o_groups=2,
+                sliding_window=32,
+                compress_ratios=[0],
+                num_hidden_layers=1,
+                rms_norm_eps=1e-6,
+                max_position_embeddings=32,
+                rope_theta=10000,
+                rope_scaling={"rope_type": "default"},
+            )
+        ),
+    )
+    config.quant_config = DeepseekV4FP8Config(
+        is_checkpoint_fp8_serialized=True, weight_block_size=[32, 32]
+    )
+    config.kernel_config.enable_jit_warmup = False
+    with torch.device("cuda"):
+        attention = DeepseekV4FlashMLAAttention(config, prefix="layers.0.attn")
+    assert attention.wo_a.weight_block_size == [1, 32]
+    assert attention._einsum_recipe == (1, 1, 32)
+    assert attention._tma_aligned_scales
+    linear = attention.wo_a
+    linear.weight.data.copy_(torch.randn_like(linear.weight.float()))
+    linear.weight_scale.data.fill_(127)
+    linear.quant_method.process_weights_after_loading(linear)
+    # Isolate wo_a's output while retaining the real attention dispatch.
+    attention.wo_b = torch.nn.Identity()
+    x = torch.randn(7, 2, 512, device="cuda", dtype=torch.bfloat16)
+    positions = torch.arange(7, device="cuda")
+    with (
+        patch.object(
+            o_proj, "packed_block32_grouped_mm", wraps=o_proj.packed_block32_grouped_mm
+        ) as grouped_mm,
+        patch.object(
+            linear, "forward", side_effect=AssertionError("wo_a.linear called")
+        ),
+    ):
+        actual = attention._o_proj(x, positions)
+    assert grouped_mm.call_count == 1
+    assert actual.shape == (7, 256)
+    from tests.kernels.quantization.test_mxfp8_batch_invariant import _k32_oracle
+
+    qa, sa, qw, sw, _ = grouped_mm.call_args.args
+    sa = sa.contiguous().view(torch.uint8)
+    sw = sw.contiguous().view(torch.uint8)
+    expected = torch.stack(
+        [_k32_oracle(qa[:, g], sa[:, g], qw[g], sw[g]) for g in range(2)], dim=1
+    ).bfloat16()
+    assert torch.equal(actual, expected.flatten(1))
 
 
 def test_prepare_gated_trtllm_fp8_moe_weights_pads_each_projection(monkeypatch):
