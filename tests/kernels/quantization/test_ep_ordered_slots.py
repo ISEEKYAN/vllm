@@ -10,11 +10,14 @@ import pytest
 import torch
 from tests.kernels.quantization.w4a8_reference import topk_fma
 
-from vllm.model_executor.layers.fused_moe.deep_gemm_utils import (
-    _ep_ordered_combine_kernel,
-    _ep_unweighted_slots_kernel,
-)
 from vllm.platforms import current_platform
+
+# CPU contract hosts do not need to import the CUDA kernel module.
+if current_platform.is_cuda():
+    from vllm.model_executor.layers.fused_moe.deep_gemm_utils import (
+        _ep_ordered_combine_kernel,
+        _ep_unweighted_slots_kernel,
+    )
 
 pytestmark = [
     pytest.mark.skip_global_cleanup,
