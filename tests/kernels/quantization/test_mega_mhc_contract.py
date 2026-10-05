@@ -149,7 +149,7 @@ def test_sm100_bi_mega_all_outputs_equal_across_batch_sizes(monkeypatch, width):
         "comb_res_mix": torch.randn(n, 4, 4, device="cuda"),
     }
     metadata = {
-        "fn": torch.randn(24, width, device="cuda") * 0.01,
+        "fn": torch.randn(24, 4 * width, device="cuda") * 0.01,
         "mix_scales": torch.ones(3, device="cuda"),
         "mix_bases": torch.randn(24, device="cuda"),
         "hc_mult": 4,
