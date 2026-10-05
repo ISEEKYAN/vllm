@@ -592,15 +592,19 @@ def _ep_unweighted_slots_kernel(
     VALUE_STRIDE: tl.constexpr,
     ROUTE_STRIDE: tl.constexpr,
     INVERSE_STRIDE: tl.constexpr,
+    GLOBAL_EXPERTS: tl.constexpr,
+    VALUE_ROWS: tl.constexpr,
 ):
     token, slot, block = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     columns = block * BLOCK + tl.arange(0, BLOCK)
     expert = tl.load(routes + token * ROUTE_STRIDE + slot)
-    local = tl.load(expert_map + expert)
-    row = tl.load(inverse + token * INVERSE_STRIDE + slot)
+    valid_route = (expert >= 0) & (expert < GLOBAL_EXPERTS)
+    local = tl.load(expert_map + expert, mask=valid_route, other=-1)
+    owned = valid_route & (local >= 0)
+    row = tl.load(inverse + token * INVERSE_STRIDE + slot, mask=owned, other=-1)
     value = tl.load(
         values + row * VALUE_STRIDE + columns,
-        mask=(local >= 0) & (columns < WIDTH),
+        mask=owned & (row >= 0) & (row < VALUE_ROWS) & (columns < WIDTH),
         other=0,
     ).to(tl.float32)
     tl.store(
@@ -612,10 +616,13 @@ def _ep_unweighted_slots_kernel(
 def _ep_ordered_combine_kernel(
     slots,
     weights,
+    routes,
     output,
     WIDTH: tl.constexpr,
     TOPK: tl.constexpr,
     WEIGHT_STRIDE: tl.constexpr,
+    ROUTE_STRIDE: tl.constexpr,
+    GLOBAL_EXPERTS: tl.constexpr,
     OUTPUT_STRIDE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -628,7 +635,12 @@ def _ep_ordered_combine_kernel(
             mask=columns < WIDTH,
             other=0,
         )
-        weight = tl.load(weights + token * WEIGHT_STRIDE + slot)
+        expert = tl.load(routes + token * ROUTE_STRIDE + slot)
+        weight = tl.load(
+            weights + token * WEIGHT_STRIDE + slot,
+            mask=(expert >= 0) & (expert < GLOBAL_EXPERTS),
+            other=0.0,
+        )
         total = tl.fma(row, weight, total)
     tl.store(
         output + token * OUTPUT_STRIDE + columns,
@@ -674,16 +686,21 @@ def deepgemm_ep_ordered_unpermute_and_reduce(
         VALUE_STRIDE=a.stride(0),
         ROUTE_STRIDE=topk_ids.stride(0),
         INVERSE_STRIDE=inv_perm.stride(0),
+        GLOBAL_EXPERTS=expert_map.numel(),
+        VALUE_ROWS=a.shape[0],
     )
     slots = group.all_reduce(slots)
     if group.rank_in_group == 0:
         _ep_ordered_combine_kernel[(tokens, triton.cdiv(width, block))](
             slots,
             topk_weights,
+            topk_ids,
             output,
             WIDTH=width,
             TOPK=topk,
             WEIGHT_STRIDE=topk_weights.stride(0),
+            ROUTE_STRIDE=topk_ids.stride(0),
+            GLOBAL_EXPERTS=expert_map.numel(),
             OUTPUT_STRIDE=output.stride(0),
             BLOCK=block,
         )
