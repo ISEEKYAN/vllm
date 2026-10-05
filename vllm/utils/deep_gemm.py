@@ -991,7 +991,65 @@ def mega_mhc(*args: Any, **kwargs: Any) -> None:
     if _mega_mhc_impl is None:
         _missing()
         return
-    _mega_mhc_impl(*args, **kwargs)
+    if envs.VLLM_BATCH_INVARIANT:
+        if args:
+            raise ValueError("Batch-invariant Mega-mHC requires named buffers")
+        _mega_mhc_fixed_rows(kwargs)
+    else:
+        _mega_mhc_impl(*args, **kwargs)
+
+
+_MEGA_MHC_BATCH_ROWS = 128
+_MEGA_MHC_INPUT_ROWS = ("x", "residual", "shifted_prev_mix", "post_mix", "comb_res_mix")
+_MEGA_MHC_OUTPUT_ROWS = (
+    "new_residual",
+    "new_prev_mix",
+    "new_post_mix",
+    "new_comb_res_mix",
+    "y_bf16",
+)
+
+
+def _mega_mhc_fixed_rows(kwargs: dict[str, Any]) -> None:
+    """Fix the provider's M specialization without mixing independent tokens.
+
+    Mega-mHC changes FP32 reduction order with M, which can change both the
+    carried coefficients and rounded BF16 normed values. Every call sees 128
+    rows in BI mode. Only the tail needs padding; caller-owned output buffers
+    and non-batch operands retain their owners. Workspace is bounded by one
+    chunk, independent of the caller's token count.
+    """
+    x = kwargs.get("x")
+    if not isinstance(x, torch.Tensor) or x.ndim != 2:
+        raise ValueError("Batch-invariant Mega-mHC requires 2D x")
+    rows = x.shape[0]
+    if rows > 1 << 20:
+        raise ValueError("Batch-invariant Mega-mHC requires at most 2**20 rows")
+    for name in _MEGA_MHC_INPUT_ROWS + _MEGA_MHC_OUTPUT_ROWS:
+        value = kwargs.get(name)
+        if (
+            not isinstance(value, torch.Tensor)
+            or value.ndim == 0
+            or value.shape[0] != rows
+        ):
+            raise ValueError(f"Batch-invariant Mega-mHC requires {name} rows={rows}")
+    for start in range(0, rows, _MEGA_MHC_BATCH_ROWS):
+        count = min(rows - start, _MEGA_MHC_BATCH_ROWS)
+        call = dict(kwargs)
+        for name in _MEGA_MHC_INPUT_ROWS + _MEGA_MHC_OUTPUT_ROWS:
+            value = kwargs[name]
+            if count == _MEGA_MHC_BATCH_ROWS:
+                call[name] = value[start : start + count]
+            else:
+                padded = value.new_zeros((_MEGA_MHC_BATCH_ROWS, *value.shape[1:]))
+                if name in _MEGA_MHC_INPUT_ROWS:
+                    padded[:count].copy_(value[start : start + count])
+                call[name] = padded
+        assert _mega_mhc_impl is not None
+        _mega_mhc_impl(**call)
+        if count != _MEGA_MHC_BATCH_ROWS:
+            for name in _MEGA_MHC_OUTPUT_ROWS:
+                kwargs[name][start : start + count].copy_(call[name][:count])
 
 
 def _ceil_to_ue8m0(x: torch.Tensor):
