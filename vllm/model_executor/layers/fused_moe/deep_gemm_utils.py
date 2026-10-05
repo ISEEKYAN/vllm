@@ -577,3 +577,115 @@ def deepgemm_unpermute_and_reduce(
         expert_map=expert_map,
         output_tensor=output,
     )
+
+
+@triton.jit
+def _ep_unweighted_slots_kernel(
+    values,
+    routes,
+    inverse,
+    expert_map,
+    slots,
+    WIDTH: tl.constexpr,
+    TOPK: tl.constexpr,
+    BLOCK: tl.constexpr,
+    VALUE_STRIDE: tl.constexpr,
+    ROUTE_STRIDE: tl.constexpr,
+    INVERSE_STRIDE: tl.constexpr,
+):
+    token, slot, block = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    columns = block * BLOCK + tl.arange(0, BLOCK)
+    expert = tl.load(routes + token * ROUTE_STRIDE + slot)
+    local = tl.load(expert_map + expert)
+    row = tl.load(inverse + token * INVERSE_STRIDE + slot)
+    value = tl.load(
+        values + row * VALUE_STRIDE + columns,
+        mask=(local >= 0) & (columns < WIDTH),
+        other=0,
+    ).to(tl.float32)
+    tl.store(
+        slots + (token * TOPK + slot) * WIDTH + columns, value, mask=columns < WIDTH
+    )
+
+
+@triton.jit
+def _ep_ordered_combine_kernel(
+    slots,
+    weights,
+    output,
+    WIDTH: tl.constexpr,
+    TOPK: tl.constexpr,
+    WEIGHT_STRIDE: tl.constexpr,
+    OUTPUT_STRIDE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    token, block = tl.program_id(0), tl.program_id(1)
+    columns = block * BLOCK + tl.arange(0, BLOCK)
+    total = tl.full((BLOCK,), 0, tl.float32)
+    for slot in range(TOPK):
+        row = tl.load(
+            slots + (token * TOPK + slot) * WIDTH + columns,
+            mask=columns < WIDTH,
+            other=0,
+        )
+        weight = tl.load(weights + token * WEIGHT_STRIDE + slot)
+        total = tl.fma(row, weight, total)
+    tl.store(
+        output + token * OUTPUT_STRIDE + columns,
+        total.to(output.dtype.element_ty),
+        mask=columns < WIDTH,
+    )
+
+
+@torch.no_grad()
+def deepgemm_ep_ordered_unpermute_and_reduce(
+    a: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    inv_perm: torch.Tensor,
+    expert_map: torch.Tensor,
+    output: torch.Tensor,
+):
+    """Return single-owner FP32 slots before top-k FMA for AG/RS EP.
+
+    Every gathered token/slot has exactly one owner; communicating its BF16
+    value as FP32 with zero contributions is exact. Only EP rank zero emits
+    the final BF16 result, so the existing reduce-scatter does not regroup
+    nonzero partial top-k sums. No dense TP or EPLB ownership is supported.
+    """
+    from vllm.distributed import get_ep_group
+
+    group = get_ep_group()
+    tokens, width = output.shape
+    topk = topk_ids.shape[1]
+    if tokens == 0:
+        return
+    slots = torch.empty((tokens, topk, width), device=a.device, dtype=torch.float32)
+    block = min(triton.next_power_of_2(width), 1024)
+    _ep_unweighted_slots_kernel[(tokens, topk, triton.cdiv(width, block))](
+        a,
+        topk_ids,
+        inv_perm,
+        expert_map,
+        slots,
+        WIDTH=width,
+        TOPK=topk,
+        BLOCK=block,
+        VALUE_STRIDE=a.stride(0),
+        ROUTE_STRIDE=topk_ids.stride(0),
+        INVERSE_STRIDE=inv_perm.stride(0),
+    )
+    slots = group.all_reduce(slots)
+    if group.rank_in_group == 0:
+        _ep_ordered_combine_kernel[(tokens, triton.cdiv(width, block))](
+            slots,
+            topk_weights,
+            output,
+            WIDTH=width,
+            TOPK=topk,
+            WEIGHT_STRIDE=topk_weights.stride(0),
+            OUTPUT_STRIDE=output.stride(0),
+            BLOCK=block,
+        )
+    else:
+        output.zero_()

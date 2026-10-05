@@ -260,7 +260,7 @@ def test_fp4_a2_keeps_the_same_row_and_scale_tile(monkeypatch, m):
     [
         ("device", "SM100"),
         ("api", "control APIs"),
-        ("parallel", "TP=EP"),
+        ("parallel", "DP=EP"),
         ("activation", "SITU"),
         ("dtype", "BF16"),
         ("shape", "divisible"),
@@ -329,10 +329,8 @@ def test_fp4_bi_rejects_unverified_contract(monkeypatch, failure, match):
         ("device", "batch invariance"),
         ("api", "batch invariance"),
         ("scale", "batch invariance"),
-        *[
-            (size, "TP=EP")
-            for size in ("tp_size", "ep_size", "dp_size", "pcp_size", "sp_size")
-        ],
+        *[(size, "TP=PCP") for size in ("tp_size", "pcp_size", "sp_size")],
+        *[(size, "DP=") for size in ("ep_size", "dp_size")],
         ("enable_eplb", "EPLB"),
         ("SITU", "SITU"),
         ("SWIGLUSTEP", "SWIGLUSTEP"),
@@ -484,3 +482,23 @@ def test_bi_mhc_retains_unsupported_row_geometry(monkeypatch, bi):
 
     monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", bi)
     assert mhc_fused_post_pre_split_config(64, 65, 4) is None
+
+
+@pytest.mark.parametrize("ep", [4, 8])
+@pytest.mark.parametrize("valid", [False, True])
+def test_fp4_ep_bi_requires_ordered_ag_rs_transport(monkeypatch, ep, valid):
+    from tests.kernels.moe.utils import make_dummy_moe_config
+    from vllm.model_executor.layers.fused_moe.experts import deep_gemm_moe
+
+    config = make_dummy_moe_config(hidden_dim=128, intermediate_size=128)
+    parallel = config.moe_parallel_config
+    parallel.dp_size = parallel.ep_size = ep
+    parallel.use_ep = True
+    parallel.all2all_backend = (
+        "allgather_reducescatter" if valid else "deepep_high_throughput"
+    )
+    reason = deep_gemm_moe.DeepGemmFP4Experts._batch_invariance_config_error(config)
+    if valid:
+        assert reason is None
+    else:
+        assert "allgather_reducescatter" in reason

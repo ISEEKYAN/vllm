@@ -16,6 +16,7 @@ from vllm.model_executor.layers.fused_moe.config import (
 )
 from vllm.model_executor.layers.fused_moe.deep_gemm_utils import (
     compute_aligned_M_and_alignment,
+    deepgemm_ep_ordered_unpermute_and_reduce,
     deepgemm_moe_permute,
     deepgemm_unpermute_and_reduce,
 )
@@ -492,15 +493,21 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
                 size != 1
                 for size in (
                     parallel.tp_size,
-                    parallel.ep_size,
-                    parallel.dp_size,
                     parallel.pcp_size,
                     parallel.sp_size,
                 )
             )
             or parallel.enable_eplb
         ):
-            return "FP4 batch invariance requires TP=EP=DP=PCP=SP=1 and no EPLB"
+            return "FP4 batch invariance requires TP=PCP=SP=1 and no EPLB"
+        if parallel.ep_size == 1:
+            if parallel.dp_size != 1:
+                return "FP4 batch invariance requires DP=1 without EP"
+        elif (
+            parallel.dp_size != parallel.ep_size
+            or not parallel.use_ag_rs_all2all_kernels
+        ):
+            return "FP4 batch-invariant EP requires DP=EP and allgather_reducescatter"
         if moe_config.activation != MoEActivation.SILU:
             return (
                 "FP4 batch invariance supports only SwiGLU (SILU), with "
@@ -766,7 +773,14 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
         if apply_router_weight_on_input:
             topk_weights = torch.ones_like(topk_weights)
 
-        deepgemm_unpermute_and_reduce(
+        combine = deepgemm_unpermute_and_reduce
+        if envs.VLLM_BATCH_INVARIANT and self.moe_config.ep_size > 1:
+            if expert_map is None:
+                raise RuntimeError(
+                    "FP4 batch-invariant EP requires expert ownership map"
+                )
+            combine = deepgemm_ep_ordered_unpermute_and_reduce
+        combine(
             a=mm2_out,
             topk_ids=topk_ids,
             topk_weights=topk_weights,
