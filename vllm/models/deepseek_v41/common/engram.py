@@ -71,6 +71,8 @@ def _is_prime(n: int) -> bool:
         d //= 2
         r += 1
     for a in (2, 7, 61):
+        if a % n == 0:
+            continue
         x = pow(a, d, n)
         if x in (1, n - 1):
             continue
