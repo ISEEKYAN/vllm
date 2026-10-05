@@ -8,8 +8,8 @@ and AG/RS coverage is separate from this local-kernel test.
 
 import pytest
 import torch
-from tests.kernels.quantization.w4a8_reference import topk_fma
 
+from tests.kernels.moe.w4a8_reference import topk_fma
 from vllm.platforms import current_platform
 
 # CPU contract hosts do not need to import the CUDA kernel module.
