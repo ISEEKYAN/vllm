@@ -10,6 +10,7 @@ from typing import Any
 
 import torch
 
+from vllm import envs
 from vllm.model_executor.warmup.jit_warmup import WarmupIntRange, zip_inputs
 from vllm.model_executor.warmup.jit_warmup_tilelang_helper import (
     TileLangLaunchSpec,
@@ -57,6 +58,9 @@ def mhc_fused_post_pre_split_config(
     fused kernel's block. One source of truth for the dispatch decision, the
     compile key and the launch, which must agree.
     """
+    if envs.VLLM_BATCH_INVARIANT:
+        # Keep post/pre rounding and projection reduction fixed across batches.
+        num_tokens = 1
     if num_tokens > _FUSED_POST_PRE_MAX_TOKENS:
         return None
     n_thr = _FUSED_POST_PRE_N_THR

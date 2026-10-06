@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, cast
 
+import vllm.envs as envs
 from vllm.config import get_current_vllm_config
 from vllm.config.quantization import QuantSpec
 from vllm.model_executor.layers.fused_moe import (
@@ -222,6 +223,14 @@ class DeepseekV4FP8Config(Fp8Config):
                     return ModelOptNvFp4FusedMoE(
                         quant_config=self._get_nvfp4_config(),
                         moe_config=layer.moe_config,
+                    )
+                if (
+                    envs.VLLM_BATCH_INVARIANT
+                    and layer.moe_config.moe_backend != "deep_gemm"
+                ):
+                    raise RuntimeError(
+                        "DS4.1 MXFP4 batch invariance requires explicit "
+                        "moe_backend='deep_gemm' (dynamic FP8 g128 activations)"
                     )
                 return Mxfp4MoEMethod(layer.moe_config)
             # expert_dtype == "fp8": fall through to Fp8Config which
