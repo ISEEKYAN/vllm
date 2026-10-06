@@ -3,6 +3,7 @@
 
 import torch
 
+from vllm import envs
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     deepgemm_post_process_fp8_weight_block,
     per_token_group_quant_fp8_packed_for_deepgemm,
@@ -68,6 +69,11 @@ class DeepGemmMxfp8BmmLinearKernel(Mxfp8LinearKernel):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Project [tokens, groups, K] input to [tokens, groups, N]."""
+        if envs.VLLM_BATCH_INVARIANT:
+            raise RuntimeError(
+                "Grouped MXFP8 linear does not support batch invariance; "
+                "use the K32 grouped attention output projection."
+            )
         if isinstance(x, tuple):
             q_input, input_scale = x
         else:

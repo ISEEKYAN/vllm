@@ -166,17 +166,21 @@ class GateLinear(ReplicatedLinear):
     def forward(
         self, x: torch.Tensor
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
-        # The low-latency router kernels select different K-reduction schemes
-        # as M changes.  That is desirable for normal decode latency, but it
-        # breaks the process-wide batch-invariant contract: the same token can
-        # get different FP32 router logits in decode (typically M=1) and
-        # prefill.  In BI mode use one GEMM family for every M.  Hopper and
-        # Blackwell configure cuBLAS for non-split-K execution in
-        # enable_batch_invariant_mode(); other platforms retain the stable
-        # ReplicatedLinear fallback.
+        # BI must keep the reduction order fixed across decode and prefill.
+        # cuBLASLt preference is insufficient: mixed BF16->FP32 mm can fall
+        # back to cuBLAS for M=1, and larger M can select a different reduction.
         if envs.VLLM_BATCH_INVARIANT:
             if self.allow_cublas_router_gemm and x.dtype == torch.bfloat16:
-                output = torch.mm(x, self.weight.T, out_dtype=torch.float32)
+                if current_platform.is_cuda():
+                    from vllm.model_executor.determinism.batch_invariant import (
+                        matmul_persistent,
+                    )
+
+                    output = matmul_persistent(
+                        x, self.weight.T, out_dtype=torch.float32
+                    )
+                else:
+                    output = torch.mm(x, self.weight.T, out_dtype=torch.float32)
                 return output, None
             if self.out_dtype is not None and x.dtype != self.weight.dtype:
                 x = x.to(self.weight.dtype)

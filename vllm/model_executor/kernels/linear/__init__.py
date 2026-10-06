@@ -892,6 +892,17 @@ def init_mxfp8_linear_kernel(*, bmm_batch_size: int | None = None) -> Mxfp8Linea
     else:
         possible = list(_POSSIBLE_MXFP8_KERNELS.get(platform, []))
 
+    if (
+        envs.VLLM_BATCH_INVARIANT
+        and current_platform.is_cuda()
+        and bmm_batch_size is None
+    ):
+        from vllm.model_executor.kernels.linear.mxfp8.batch_invariant import (
+            BatchInvariantMxfp8LinearKernel,
+        )
+
+        possible.insert(0, BatchInvariantMxfp8LinearKernel)
+
     # Apply --linear-backend filtering when set.
     possible = _resolve_backend_kernels(
         possible,

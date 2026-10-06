@@ -214,8 +214,12 @@ def _import_deep_gemm():
 
 
 @functools.cache
-def supports_deep_gemm_batch_invariance() -> bool:
-    """Return whether the installed DeepGEMM has invariant masked grouped FP8."""
+def supports_deep_gemm_batch_invariance(*, fp4_contiguous: bool = False) -> bool:
+    """Check APIs needed by the selected BI path, not numerical invariance.
+
+    FP4 contiguous additionally relies on vLLM fixing the MK alignment.
+    The native BI switch alone only covers FP8 weights in the pinned build.
+    """
     deep_gemm = _import_deep_gemm()
     if deep_gemm is None:
         return False
@@ -223,6 +227,15 @@ def supports_deep_gemm_batch_invariance() -> bool:
         callable(getattr(deep_gemm, name, None))
         for name in ("set_batch_invariant", "get_batch_invariant")
     )
+    if fp4_contiguous:
+        return controls_available and all(
+            callable(getattr(deep_gemm, name, None))
+            for name in (
+                "m_grouped_fp8_fp4_gemm_nt_contiguous",
+                "get_mk_alignment_for_contiguous_layout",
+                "set_mk_alignment_for_contiguous_layout",
+            )
+        )
     masked_api_available = any(
         callable(getattr(deep_gemm, name, None))
         for name in (
@@ -271,6 +284,16 @@ def _apply_pdl(mod, enable: bool = True) -> None:
         )
     except Exception as e:  # noqa: BLE001
         logger.warning_once("Failed to set DeepGEMM PDL on %s: %s", mod_name, e)
+
+
+def _resolve_mega_mhc_impl(external: Any) -> Callable[..., Any] | None:
+    provider = external
+    if envs.VLLM_DEEP_GEMM_MEGA_MHC_USE_VENDORED:
+        provider = importlib.import_module("vllm.third_party.deep_gemm")
+        if not callable(getattr(provider, "mega_mhc", None)):
+            raise RuntimeError("Vendored DeepGEMM is missing mega_mhc")
+        logger.info_once("Using vendored DeepGEMM for Mega-mHC")
+    return getattr(provider, "mega_mhc", None)
 
 
 def _lazy_init() -> None:
@@ -326,6 +349,18 @@ def _lazy_init() -> None:
     if _dg is None:
         return
 
+    # Metadata and its consumer must come from the same DeepGEMM revision.
+    # Older external BI builds lack 128-row pages used by DS4.1 on SM100.
+    paged_dg = _dg
+    if envs.VLLM_DEEP_GEMM_PAGED_MQA_USE_VENDORED:
+        paged_dg = importlib.import_module("vllm.third_party.deep_gemm")
+        for name in ("fp8_fp4_paged_mqa_logits", "get_paged_mqa_logits_metadata"):
+            if not callable(getattr(paged_dg, name, None)):
+                raise RuntimeError(f"Vendored DeepGEMM is missing {name}")
+        if current_platform.is_arch_support_pdl():
+            _apply_pdl(paged_dg, True)
+        logger.info_once("Using vendored DeepGEMM for paged MQA metadata and logits")
+
     # Enable PDL for DeepGEMM on architectures that support it (SM90+).
     if current_platform.is_arch_support_pdl():
         _apply_pdl(_dg, True)
@@ -342,9 +377,9 @@ def _lazy_init() -> None:
     # DeepGEMM exposes fp8_fp4_*_mqa_logits as the canonical symbols that
     # handle both the FP8 and FP4 Q/K paths via a tuple-typed `q`.
     _fp8_fp4_mqa_logits_impl = getattr(_dg, "fp8_fp4_mqa_logits", None)
-    _fp8_fp4_paged_mqa_logits_impl = getattr(_dg, "fp8_fp4_paged_mqa_logits", None)
+    _fp8_fp4_paged_mqa_logits_impl = getattr(paged_dg, "fp8_fp4_paged_mqa_logits", None)
     _get_paged_mqa_logits_metadata_impl = getattr(
-        _dg, "get_paged_mqa_logits_metadata", None
+        paged_dg, "get_paged_mqa_logits_metadata", None
     )
     # Sparse-indexer kernels (DeepGEMM >= 2.8, SM100 only).
     _fp8_fp4_sparse_mqa_logits_impl = getattr(_dg, "fp8_fp4_sparse_mqa_logits", None)
@@ -358,7 +393,7 @@ def _lazy_init() -> None:
         _dg, "get_paged_sparse_mqa_logits_metadata", None
     )
     _tf32_hc_prenorm_gemm_impl = getattr(_dg, "tf32_hc_prenorm_gemm", None)
-    _mega_mhc_impl = getattr(_dg, "mega_mhc", None)
+    _mega_mhc_impl = _resolve_mega_mhc_impl(_dg)
     _get_mn_major_tma_aligned_tensor_impl = getattr(
         _dg, "get_mn_major_tma_aligned_tensor", None
     )
@@ -944,13 +979,77 @@ def tf32_hc_prenorm_gemm(
     )
 
 
+def has_deep_gemm_mega_mhc() -> bool:
+    """Probe the same provider used by the generic Mega-mHC call."""
+    _lazy_init()
+    return callable(_mega_mhc_impl)
+
+
 def mega_mhc(*args: Any, **kwargs: Any) -> None:
     """Run DeepGEMM Mega mHC with caller-owned output tensors."""
     _lazy_init()
     if _mega_mhc_impl is None:
         _missing()
         return
-    _mega_mhc_impl(*args, **kwargs)
+    if envs.VLLM_BATCH_INVARIANT:
+        if args:
+            raise ValueError("Batch-invariant Mega-mHC requires named buffers")
+        _mega_mhc_fixed_rows(kwargs)
+    else:
+        _mega_mhc_impl(*args, **kwargs)
+
+
+_MEGA_MHC_BATCH_ROWS = 128
+_MEGA_MHC_INPUT_ROWS = ("x", "residual", "shifted_prev_mix", "post_mix", "comb_res_mix")
+_MEGA_MHC_OUTPUT_ROWS = (
+    "new_residual",
+    "new_prev_mix",
+    "new_post_mix",
+    "new_comb_res_mix",
+    "y_bf16",
+)
+
+
+def _mega_mhc_fixed_rows(kwargs: dict[str, Any]) -> None:
+    """Fix the provider's M specialization without mixing independent tokens.
+
+    Mega-mHC changes FP32 reduction order with M, which can change both the
+    carried coefficients and rounded BF16 normed values. Every call sees 128
+    rows in BI mode. Only the tail needs padding; caller-owned output buffers
+    and non-batch operands retain their owners. Workspace is bounded by one
+    chunk, independent of the caller's token count.
+    """
+    x = kwargs.get("x")
+    if not isinstance(x, torch.Tensor) or x.ndim != 2:
+        raise ValueError("Batch-invariant Mega-mHC requires 2D x")
+    rows = x.shape[0]
+    if rows > 1 << 20:
+        raise ValueError("Batch-invariant Mega-mHC requires at most 2**20 rows")
+    for name in _MEGA_MHC_INPUT_ROWS + _MEGA_MHC_OUTPUT_ROWS:
+        value = kwargs.get(name)
+        if (
+            not isinstance(value, torch.Tensor)
+            or value.ndim == 0
+            or value.shape[0] != rows
+        ):
+            raise ValueError(f"Batch-invariant Mega-mHC requires {name} rows={rows}")
+    for start in range(0, rows, _MEGA_MHC_BATCH_ROWS):
+        count = min(rows - start, _MEGA_MHC_BATCH_ROWS)
+        call = dict(kwargs)
+        for name in _MEGA_MHC_INPUT_ROWS + _MEGA_MHC_OUTPUT_ROWS:
+            value = kwargs[name]
+            if count == _MEGA_MHC_BATCH_ROWS:
+                call[name] = value[start : start + count]
+            else:
+                padded = value.new_zeros((_MEGA_MHC_BATCH_ROWS, *value.shape[1:]))
+                if name in _MEGA_MHC_INPUT_ROWS:
+                    padded[:count].copy_(value[start : start + count])
+                call[name] = padded
+        assert _mega_mhc_impl is not None
+        _mega_mhc_impl(**call)
+        if count != _MEGA_MHC_BATCH_ROWS:
+            for name in _MEGA_MHC_OUTPUT_ROWS:
+                kwargs[name][start : start + count].copy_(call[name][:count])
 
 
 def _ceil_to_ue8m0(x: torch.Tensor):

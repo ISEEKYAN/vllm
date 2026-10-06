@@ -420,3 +420,50 @@ def test_deepgemm_paged_and_contiguous_indexer_logits_exact(context_len: int):
         int((paged != contiguous).sum().item()),
         float((paged - contiguous).abs().max().item()),
     )
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability_family(100), reason="SM100 only"
+)
+@pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
+def test_vendored_paged_mqa_128_varlen():
+    """128-row DS4.1 pages preserve varlen groups and partial-page logits."""
+    from vllm import envs
+    from vllm.utils import deep_gemm as dg
+
+    if not envs.VLLM_DEEP_GEMM_PAGED_MQA_USE_VENDORED:
+        pytest.skip("Requires the opt-in vendored paged-MQA backend")
+    torch.manual_seed(17)
+    q = torch.randn((3, 1, 32, 128), device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn((4, 128, 1, 128), device="cuda", dtype=torch.bfloat16)
+    weights = torch.rand((3, 32), device="cuda", dtype=torch.float32)
+    lens = torch.tensor([[64], [65], [129]], device="cuda", dtype=torch.int32)
+    indices = torch.tensor([0, 0, 1], device="cuda", dtype=torch.int32)
+    # The builder expands block-table rows per query. Indices label groups;
+    # they are not a second indirection into that already-expanded table.
+    blocks = torch.tensor([[3, 0], [3, 0], [1, 2]], device="cuda", dtype=torch.int32)
+    metadata = dg.get_paged_mqa_logits_metadata(
+        lens, 128, dg.get_num_sms(), indices=indices
+    )
+    actual = dg.fp8_fp4_paged_mqa_logits(
+        (q.to(torch.float8_e4m3fn), None),
+        kv_cache_cast_to_fp8(kv),
+        weights,
+        lens,
+        blocks,
+        metadata,
+        256,
+        False,
+        indices=indices,
+    )
+    expected = _ref_fp8_fp4_paged_mqa_logits(
+        q,
+        kv,
+        weights,
+        lens.flatten(),
+        blocks,
+        256,
+    )
+    valid = torch.arange(256, device="cuda")[None, :] < lens
+    diff = calc_diff(actual.masked_fill(~valid, 0), expected.masked_fill(~valid, 0))
+    assert diff < 1e-3, f"{diff=}"

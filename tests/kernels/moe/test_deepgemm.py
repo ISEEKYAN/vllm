@@ -383,6 +383,169 @@ FP4_TOPKS = [2]
 FP4_NUM_EXPERTS = [8]
 
 
+@pytest.mark.parametrize(
+    "hidden,intermediate,experts,topk", [(512, 256, 4, 2), (2048, 768, 16, 8)]
+)
+def test_fp4_batch_invariant_clamp_contract(
+    hidden, intermediate, experts, topk, monkeypatch, workspace_init
+):
+    """Compare real FP4 experts across batches and with independent CPU A8/FMA."""
+    import vllm.envs as envs
+    from tests.kernels.moe.w4a8_reference import quantize_a8, swiglu_clamp, topk_fma
+    from vllm.model_executor.layers.fused_moe.experts.deep_gemm_moe import (
+        DeepGemmFP4Experts,
+    )
+    from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
+        Mxfp4MoeBackend,
+        make_mxfp4_moe_quant_config,
+    )
+    from vllm.platforms import current_platform
+    from vllm.utils import deep_gemm as dg
+
+    if not current_platform.is_device_capability_family(100):
+        pytest.skip("requires SM100-family GPU")
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    dg._lazy_init()
+    dg.enable_deep_gemm_batch_invariance()
+    torch.manual_seed(123)
+    w1, w2, s1, s2, _, _ = make_mxfp4_weights(experts, intermediate, hidden)
+    # Same packed operands on both sides; independent dispatch/activation/combine.
+    quant = make_mxfp4_moe_quant_config(
+        Mxfp4MoeBackend.DEEPGEMM_MXFP4, s1, s2, swiglu_limit=10.0
+    )
+    config = make_dummy_moe_config(
+        num_experts=experts,
+        experts_per_token=topk,
+        hidden_dim=hidden,
+        intermediate_size=intermediate,
+        max_num_tokens=1024,
+    )
+    implementation = DeepGemmFP4Experts(config, quant)
+    kernel = mk.FusedMoEKernel(
+        prepare_finalize=maybe_make_prepare_finalize(
+            moe=config,
+            quant_config=quant,
+            allow_new_interface=True,
+            use_monolithic=False,
+        ),
+        fused_experts=implementation,
+    )
+    x = torch.randn(129, hidden, device="cuda", dtype=torch.bfloat16) * 8
+    x[0] = 0
+    x[1] *= 1e-10
+    # Leave one expert empty, keep the original top-k slot order.
+    ids = torch.stack(
+        [torch.randperm(experts - 1, device="cuda")[:topk] for _ in range(len(x))]
+    ).int()
+    weights = torch.softmax(torch.randn(len(x), topk, device="cuda"), -1)
+    a1q, a1s = per_token_group_quant_fp8(x, 128, use_ue8m0=True)
+    a1ref, s1ref = quantize_a8(x.cpu())
+    assert torch.equal(a1q.cpu().view(torch.uint8), a1ref.view(torch.uint8))
+    assert torch.equal(a1s.cpu(), s1ref)
+
+    def run(values, routes, probs):
+        return kernel.apply(
+            hidden_states=values,
+            w1=w1,
+            w2=w2,
+            topk_weights=probs,
+            topk_ids=routes,
+            global_num_experts=experts,
+            activation=MoEActivation.SILU,
+            apply_router_weight_on_input=False,
+            expert_map=None,
+        ).clone()
+
+    expected = run(x, ids, weights)
+    for chunk in (1, 7, 32, 64):
+        result = torch.cat(
+            [
+                run(x[i : i + chunk], ids[i : i + chunk], weights[i : i + chunk])
+                for i in range(0, len(x), chunk)
+            ]
+        )
+        assert torch.equal(result.view(torch.int16), expected.view(torch.int16))
+    order = torch.randperm(len(x), device="cuda")
+    assert torch.equal(
+        run(x[order], ids[order], weights[order]).view(torch.int16),
+        expected[order].view(torch.int16),
+    )
+    partners = torch.randn(513, hidden, device="cuda", dtype=torch.bfloat16)
+    partner_ids = torch.arange(topk, device="cuda").expand(513, -1).int().contiguous()
+    partner_weights = torch.full((513, topk), 1 / topk, device="cuda")
+    together = run(
+        torch.cat([x, partners]),
+        torch.cat([ids, partner_ids]),
+        torch.cat([weights, partner_weights]),
+    )
+    assert torch.equal(together[: len(x)].view(torch.int16), expected.view(torch.int16))
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run(x, ids, weights)
+    graph.replay()
+    assert torch.equal(captured.view(torch.int16), expected.view(torch.int16))
+
+    # Stable CPU dispatch deliberately differs from the atomic production scatter.
+    cpu_ids = ids.cpu()
+    slots = [torch.nonzero(cpu_ids == e) for e in range(experts)]
+    sizes = [(len(s) + 127) // 128 * 128 for s in slots]
+    total = sum(sizes)
+    a = torch.zeros(total, hidden, dtype=torch.bfloat16)
+    layout = torch.full((total,), -1, dtype=torch.int32)
+    offset = 0
+    for e, (s, size) in enumerate(zip(slots, sizes)):
+        a[offset : offset + len(s)] = x.cpu()[s[:, 0]]
+        layout[offset : offset + len(s)] = e
+        offset += size
+    aq, asc = quantize_a8(a)
+    fc1 = torch.empty(total, 2 * intermediate, device="cuda", dtype=torch.bfloat16)
+    fc2 = torch.empty(total, hidden, device="cuda", dtype=torch.bfloat16)
+    with dg.mk_alignment_scope(128):
+        dg.m_grouped_fp8_fp4_gemm_nt_contiguous(
+            (aq.cuda(), asc.cuda()),
+            (w1.view(torch.int8), s1),
+            fc1,
+            layout.cuda(),
+            recipe_a=(1, 128),
+            recipe_b=(1, 32),
+        )
+        a2q, a2s = quantize_a8(swiglu_clamp(fc1.cpu()))
+        q_gpu, scales_gpu = implementation._act_mul_quant(
+            fc1,
+            torch.empty_like(
+                fc1[:, :intermediate], memory_format=torch.contiguous_format
+            ).to(torch.float8_e4m3fn),
+            MoEActivation.SILU,
+        )
+        real = layout >= 0
+        assert torch.equal(
+            q_gpu.cpu().view(torch.uint8)[real], a2q.view(torch.uint8)[real]
+        )
+        scale_bytes = (
+            scales_gpu.cpu().contiguous().view(torch.uint8)[:, : intermediate // 128]
+        )
+        reference_bytes = ((a2s.contiguous().view(torch.int32) >> 23) & 255).byte()
+        assert torch.equal(scale_bytes[real], reference_bytes[real])
+        dg.m_grouped_fp8_fp4_gemm_nt_contiguous(
+            (a2q.cuda(), a2s.cuda()),
+            (w2.view(torch.int8), s2),
+            fc2,
+            layout.cuda(),
+            recipe_a=(1, 128),
+            recipe_b=(1, 32),
+        )
+    rows = torch.empty(len(x), topk, hidden, dtype=torch.bfloat16)
+    offset = 0
+    for s, size in zip(slots, sizes):
+        rows[s[:, 0], s[:, 1]] = fc2.cpu()[offset : offset + len(s)]
+        offset += size
+    assert torch.equal(
+        topk_fma(rows, weights.cpu()).view(torch.int16),
+        expected.cpu().view(torch.int16),
+    )
+
+
 @pytest.mark.parametrize(("m", "n", "k"), FP4_MNKs)
 @pytest.mark.parametrize("topk", FP4_TOPKS)
 @pytest.mark.parametrize("num_experts", FP4_NUM_EXPERTS)

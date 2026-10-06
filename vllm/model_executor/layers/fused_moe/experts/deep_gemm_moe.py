@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
+
 import torch
 
 import vllm.envs as envs
@@ -14,6 +16,7 @@ from vllm.model_executor.layers.fused_moe.config import (
 )
 from vllm.model_executor.layers.fused_moe.deep_gemm_utils import (
     compute_aligned_M_and_alignment,
+    deepgemm_ep_ordered_unpermute_and_reduce,
     deepgemm_moe_permute,
     deepgemm_unpermute_and_reduce,
 )
@@ -441,6 +444,7 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
     _ACT_BLOCK_K = 128
     # FP4 weight block size
     _WEIGHT_BLOCK_K = 32
+    _BI_BLOCK_M = 128
 
     def __init__(self, moe_config: FusedMoEConfig, quant_config: FusedMoEQuantConfig):
         super().__init__(moe_config=moe_config, quant_config=quant_config)
@@ -449,6 +453,98 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
         assert not quant_config.per_out_ch_quant
 
         self.gemm1_clamp_limit = quant_config.gemm1_clamp_limit
+
+        if envs.VLLM_BATCH_INVARIANT:
+            if not current_platform.is_device_capability_family(100):
+                raise RuntimeError("FP4 batch invariance requires SM100-family GPUs")
+            if not supports_deep_gemm_batch_invariance(fp4_contiguous=True):
+                raise RuntimeError(
+                    "FP4 batch invariance requires DeepGEMM contiguous FP8 x FP4 "
+                    "and MK alignment control APIs"
+                )
+            reason = self._batch_invariance_config_error(moe_config)
+            if reason is not None:
+                raise RuntimeError(reason)
+            if DeepGemmQuantScaleFMT.from_oracle() != DeepGemmQuantScaleFMT.UE8M0:
+                raise RuntimeError("FP4 batch invariance requires packed UE8M0 scales")
+            if self.gemm1_clamp_limit is not None and (
+                not math.isfinite(self.gemm1_clamp_limit) or self.gemm1_clamp_limit <= 0
+            ):
+                raise RuntimeError(
+                    "FP4 batch invariance requires a finite positive clamp"
+                )
+            if quant_config.w1_bias is not None or quant_config.w2_bias is not None:
+                raise RuntimeError(
+                    "FP4 batch invariance does not support expert biases"
+                )
+            if quant_config.gemm1_alpha not in (
+                None,
+                1.0,
+            ) or quant_config.gemm1_beta not in (None, 0.0):
+                raise RuntimeError(
+                    "FP4 batch invariance requires SwiGLU alpha=1, beta=0"
+                )
+
+    @staticmethod
+    def _batch_invariance_config_error(moe_config: FusedMoEConfig) -> str | None:
+        parallel = moe_config.moe_parallel_config
+        if (
+            any(
+                size != 1
+                for size in (
+                    parallel.tp_size,
+                    parallel.pcp_size,
+                    parallel.sp_size,
+                )
+            )
+            or parallel.enable_eplb
+        ):
+            return "FP4 batch invariance requires TP=PCP=SP=1 and no EPLB"
+        if parallel.ep_size == 1:
+            if parallel.dp_size != 1:
+                return "FP4 batch invariance requires DP=1 without EP"
+        elif (
+            parallel.dp_size != parallel.ep_size
+            or not parallel.use_ag_rs_all2all_kernels
+        ):
+            return "FP4 batch-invariant EP requires DP=EP and allgather_reducescatter"
+        if moe_config.activation != MoEActivation.SILU:
+            return (
+                "FP4 batch invariance supports only SwiGLU (SILU), with "
+                "optional clamp; SITU and SWIGLUSTEP are not supported"
+            )
+        if moe_config.in_dtype != torch.bfloat16:
+            return "FP4 batch invariance requires BF16 inputs"
+        if any(
+            dim % DeepGemmFP4Experts._ACT_BLOCK_K
+            for dim in (moe_config.hidden_dim, moe_config.intermediate_size)
+        ):
+            return "FP4 batch invariance requires K dimensions divisible by 128"
+        return None
+
+    @staticmethod
+    def _supports_batch_invariance() -> bool:
+        return (
+            current_platform.is_device_capability_family(100)
+            and supports_deep_gemm_batch_invariance(fp4_contiguous=True)
+            and DeepGemmQuantScaleFMT.from_oracle() == DeepGemmQuantScaleFMT.UE8M0
+        )
+
+    @staticmethod
+    def is_supported_config(
+        cls: type[mk.FusedMoEExperts],
+        moe_config: FusedMoEConfig,
+        weight_key: QuantKey | None,
+        activation_key: QuantKey | None,
+        activation_format: mk.FusedMoEActivationFormat,
+    ) -> tuple[bool, str | None]:
+        supported, reason = mk.FusedMoEExpertsModular.is_supported_config(
+            cls, moe_config, weight_key, activation_key, activation_format
+        )
+        if supported and envs.VLLM_BATCH_INVARIANT:
+            reason = DeepGemmFP4Experts._batch_invariance_config_error(moe_config)
+            return reason is None, reason
+        return supported, reason
 
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
@@ -511,7 +607,12 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
         block_m = get_mk_alignment_for_contiguous_layout()[0]
         M_sum, align_used = compute_aligned_M_and_alignment(
-            M, topk, local_num_experts, block_m, expert_tokens_meta
+            M,
+            topk,
+            local_num_experts,
+            block_m,
+            expert_tokens_meta,
+            fixed_alignment=self._BI_BLOCK_M if envs.VLLM_BATCH_INVARIANT else None,
         )
         assert M_sum % align_used == 0
 
@@ -538,6 +639,7 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
                     output_q=output,
                     group_size=block_k,
                     clamp_limit=self.gemm1_clamp_limit,
+                    batch_invariant=envs.VLLM_BATCH_INVARIANT,
                 )
             use_ue8m0 = scale_fmt == DeepGemmQuantScaleFMT.FLOAT32_CEIL_UE8M0
             return silu_mul_per_token_group_quant_fp8_colmajor(
@@ -590,6 +692,15 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
         assert self.w1_scale is not None
         assert self.w2_scale is not None
 
+        if envs.VLLM_BATCH_INVARIANT:
+            if apply_router_weight_on_input or topk_weights.dtype != torch.float32:
+                raise RuntimeError(
+                    "FP4 batch invariance requires FP32 router weights "
+                    "applied after FC2"
+                )
+            if activation != MoEActivation.SILU or output.dtype != torch.bfloat16:
+                raise RuntimeError("FP4 batch invariance requires BF16 SwiGLU output")
+
         a1q = hidden_states
         _, N, _ = w1.size()
         # K comes from activations (full hidden dim), not from w1 which is
@@ -606,6 +717,7 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
             local_num_experts=local_num_experts,
             alignment=get_mk_alignment_for_contiguous_layout()[0],
             expert_tokens_meta=expert_tokens_meta,
+            fixed_alignment=self._BI_BLOCK_M if envs.VLLM_BATCH_INVARIANT else None,
         )
 
         a1q_perm = _resize_cache(
@@ -619,6 +731,7 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
             expert_map=expert_map,
             expert_tokens_meta=expert_tokens_meta,
             aq_out=a1q_perm,
+            fixed_alignment=self._BI_BLOCK_M if envs.VLLM_BATCH_INVARIANT else None,
         )
         assert a1q.size(0) == M_sum
 
@@ -660,7 +773,14 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
         if apply_router_weight_on_input:
             topk_weights = torch.ones_like(topk_weights)
 
-        deepgemm_unpermute_and_reduce(
+        combine = deepgemm_unpermute_and_reduce
+        if envs.VLLM_BATCH_INVARIANT and self.moe_config.ep_size > 1:
+            if expert_map is None:
+                raise RuntimeError(
+                    "FP4 batch-invariant EP requires expert ownership map"
+                )
+            combine = deepgemm_ep_ordered_unpermute_and_reduce
+        combine(
             a=mm2_out,
             topk_ids=topk_ids,
             topk_weights=topk_weights,

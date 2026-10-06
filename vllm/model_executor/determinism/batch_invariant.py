@@ -279,8 +279,13 @@ def matmul_descriptor_persistent(
 
 
 def matmul_persistent(
-    a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None
+    a: torch.Tensor,
+    b: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    *,
+    out_dtype: torch.dtype | None = None,
 ):
+    """Fixed-tile GEMM, optionally retaining the FP32 accumulator on output."""
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     assert a.dtype == b.dtype, "Incompatible dtypes"
@@ -291,8 +296,9 @@ def matmul_persistent(
     M, K = a.shape
     K, N = b.shape
     dtype = a.dtype
-    # Allocates output.
-    c = torch.empty((M, N), device=a.device, dtype=dtype)
+    if out_dtype not in (None, dtype, torch.float32):
+        raise ValueError("out_dtype must match the inputs or be torch.float32")
+    c = torch.empty((M, N), device=a.device, dtype=out_dtype or dtype)
 
     # 1D launch kernel where each block gets its own program.
     def grid(META):

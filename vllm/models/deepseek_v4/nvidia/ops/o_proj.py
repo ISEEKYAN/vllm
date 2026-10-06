@@ -4,6 +4,9 @@ import torch
 import torch.nn as nn
 
 from vllm import envs
+from vllm.model_executor.kernels.linear.mxfp8.batch_invariant import (
+    packed_block32_grouped_mm,
+)
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     w8a8_triton_block_scaled_mm,
 )
@@ -74,7 +77,21 @@ def deep_gemm_fp8_o_proj(
             if hasattr(wo_a, "weight_scale")
             else wo_a.weight_scale_inv
         )
-        if envs.VLLM_BATCH_INVARIANT and not tma_aligned_scales:
+        if (
+            envs.VLLM_BATCH_INVARIANT
+            and tma_aligned_scales
+            and einsum_recipe == (1, 1, 32)
+        ):
+            z.copy_(
+                packed_block32_grouped_mm(
+                    o_proj_input,
+                    o_scale,
+                    wo_a.weight,
+                    weight_scale,
+                    torch.bfloat16,
+                )
+            )
+        elif envs.VLLM_BATCH_INVARIANT and not tma_aligned_scales:
             group_weight = wo_a.weight.reshape(n_groups, o_lora_rank, -1)
             group_weight_scale = weight_scale.reshape(
                 n_groups,

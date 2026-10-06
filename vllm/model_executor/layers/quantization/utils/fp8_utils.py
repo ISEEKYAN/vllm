@@ -387,6 +387,7 @@ def silu_mul_quant_fp8_packed_triton(
     clamp_limit: float | None = None,
     alpha: float = 1.0,
     beta: float = 0.0,
+    batch_invariant: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert input.dim() == 2
     assert input.is_contiguous()
@@ -417,7 +418,10 @@ def silu_mul_quant_fp8_packed_triton(
     # Tuned for group_size=32 (MXFP8) and group_size=128 (DeepSeek-V4)
     num_warps = 4
     num_stages = 2
-    if group_size < 128:
+    if batch_invariant:
+        BM = 1
+        packs_per_cta = 2
+    elif group_size < 128:
         BM = 1
         packs_per_cta = 8
     else:

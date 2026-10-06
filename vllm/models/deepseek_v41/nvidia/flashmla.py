@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, ClassVar, cast
 
 import torch
 
+from vllm import envs
 from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4.nvidia.ops.o_proj import (
     compute_fp8_einsum_recipe,
@@ -38,6 +39,18 @@ class DeepseekSparseSWAFlashMLAMetadataBuilder(DeepseekV41SparseSWAMetadataBuild
     """SWA metadata for the FlashMLA decode path, which allows varlen decode."""
 
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if envs.VLLM_BATCH_INVARIANT:
+            # Use the same bounded BF16 gather/sparse kernel for every query.
+            self.decode_threshold = 0
+
+    @classmethod
+    def get_cudagraph_support(cls, vllm_config, kv_cache_spec):
+        if envs.VLLM_BATCH_INVARIANT:
+            return AttentionCGSupport.NEVER
+        return super().get_cudagraph_support(vllm_config, kv_cache_spec)
 
 
 class DeepseekSparseSWAFlashMLABackend(DeepseekSparseSWABackend):
