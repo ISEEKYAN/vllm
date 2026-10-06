@@ -132,8 +132,8 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
     The generic CUDA backend selector does not instantiate DSv4 layers directly,
     so map generic sparse-MLA choices to the DSv4-specialized attention class.
     Without an explicit backend: SM12 takes FlashInfer, SM100 takes mega
-    attention where the topology allows it, and everything else keeps the
-    FlashMLA path.
+    attention where the topology allows it and batch invariance is disabled;
+    batch-invariant SM100 execution keeps the FlashMLA path.
     """
     backend = vllm_config.attention_config.backend
     device_capability = current_platform.get_device_capability()
@@ -154,6 +154,11 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
             return DeepseekV4FlashInferSM120Attention
         return DeepseekV4FlashInferMLAAttention
     if backend is AttentionBackendEnum.FLASHMLA_MEGA_ATTN_DSV41:
+        if envs.VLLM_BATCH_INVARIANT:
+            raise ValueError(
+                "FLASHMLA_MEGA_ATTN_DSV41 does not support VLLM_BATCH_INVARIANT. "
+                "Use FLASHMLA_SPARSE_DSV41 for batch-invariant DS4.1 attention."
+            )
         return DeepseekV4MegaAttnAttention
     if backend in (
         AttentionBackendEnum.FLASHMLA_SPARSE,
@@ -170,7 +175,10 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
     # implementation itself stores. It declines topologies it cannot serve
     # (non-SM100, TP that leaves fewer than WV_GROUP_SIZE heads per wo_a
     # group, a build without the kernel), which then fall through to FlashMLA.
-    if DeepseekV4MegaAttnAttention.is_available_for(vllm_config):
+    # MegaAttn uses an M-specialized FP8 einsum for o_proj, not the K32 BI path.
+    if not envs.VLLM_BATCH_INVARIANT and DeepseekV4MegaAttnAttention.is_available_for(
+        vllm_config
+    ):
         return DeepseekV4MegaAttnAttention
     return DeepseekV4FlashMLAAttention
 
