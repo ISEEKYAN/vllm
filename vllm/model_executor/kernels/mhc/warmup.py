@@ -5,6 +5,7 @@ from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from vllm import envs
 from vllm.model_executor.kernels.mhc.tilelang_kernels import (
     compute_num_split,
     mhc_pre_big_fuse_with_norm_tilelang,
@@ -16,7 +17,8 @@ from vllm.utils.math_utils import cdiv
 
 
 def compute_mhc_pre_num_splits(input_size: int, num_tokens: int) -> int:
-    splits = compute_num_split(64, input_size, cdiv(num_tokens, 64))
+    split_tokens = 1 if envs.VLLM_BATCH_INVARIANT else num_tokens
+    splits = compute_num_split(64, input_size, cdiv(split_tokens, 64))
     # Bound both GEMM and fused-normalization specializations during startup.
     return 1 if splits == 1 else 4 if splits <= 4 else 16
 

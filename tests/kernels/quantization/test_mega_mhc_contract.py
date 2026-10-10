@@ -187,3 +187,29 @@ def test_sm100_bi_mega_all_outputs_equal_across_batch_sizes(monkeypatch, width):
                 key,
                 rows,
             )
+
+
+@pytest.mark.parametrize("batch_invariant", [False, True])
+def test_mhc_entry_split_order_is_batch_independent_only_in_bi(
+    monkeypatch, batch_invariant
+):
+    """A long teacher-forced batch must use decode's K-reduction in BI mode."""
+    import torch
+
+    from vllm.model_executor.kernels.mhc import warmup
+
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", batch_invariant)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _: SimpleNamespace(multi_processor_count=152),
+    )
+    warmup.compute_num_split.cache_clear()
+    try:
+        actual = [
+            warmup.compute_mhc_pre_num_splits(5120, rows)
+            for rows in (1, 8, 239, 384, 4206)
+        ]
+        assert actual == ([16] * 5 if batch_invariant else [16, 16, 16, 16, 4])
+    finally:
+        warmup.compute_num_split.cache_clear()
