@@ -14,7 +14,8 @@ def test_graph_topk_reads_selected_positions_in_deployment_order(
     monkeypatch, batch_invariant
 ):
     """Replay sees live token counts and preserves the shared buffer and selection."""
-    monkeypatch.setenv("VLLM_BATCH_INVARIANT", str(int(batch_invariant)))
+    monkeypatch.setattr(attention.envs, "VLLM_BATCH_INVARIANT", batch_invariant)
+    assert attention.envs.VLLM_BATCH_INVARIANT is batch_invariant
     indices = torch.tensor(
         [[3, 0, 2, 1, -1, -1], [1, -1, 0, -1, -1, -1], [9, 8, 7, 6, 5, 4]],
         dtype=torch.int32,
