@@ -906,12 +906,15 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             )
             if envs.VLLM_BATCH_INVARIANT:
                 attn_metadata = get_forward_context().attn_metadata
-                assert isinstance(attn_metadata, dict)
-                metadata = cast(Any, attn_metadata[self.indexer.k_cache.prefix])
-                num_tokens = metadata.num_decode_tokens + metadata.num_prefill_tokens
-                assert self.topk_indices_buffer is not None
-                # This eager segment sees live metadata on every graph replay.
-                _sort_valid_topk_indices_(self.topk_indices_buffer[:num_tokens])
+                # Native profile-run dummy forwards have no KV metadata.
+                if isinstance(attn_metadata, dict):
+                    metadata = cast(Any, attn_metadata[self.indexer.k_cache.prefix])
+                    num_tokens = (
+                        metadata.num_decode_tokens + metadata.num_prefill_tokens
+                    )
+                    assert self.topk_indices_buffer is not None
+                    # This eager segment sees live metadata on every graph replay.
+                    _sort_valid_topk_indices_(self.topk_indices_buffer[:num_tokens])
 
         # MLA attention writes into the pre-allocated `out` buffer
         # ([num_tokens, padded_heads, head_dim]).

@@ -66,3 +66,31 @@ def test_graph_topk_reads_selected_positions_in_deployment_order(
     )
     assert len(scored) == 2
     assert torch.equal(reads[-1], expected)
+
+
+def test_profile_run_without_attention_metadata_preserves_dummy_path(monkeypatch):
+    """The native profile run has no KV metadata and performs no attention read."""
+    monkeypatch.setattr(attention.envs, "VLLM_BATCH_INVARIANT", True)
+    monkeypatch.setattr(
+        attention,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata=None),
+    )
+    indices = torch.tensor([[3, 0, 2, 1, -1, -1]], dtype=torch.int32)
+    original = indices.clone()
+    calls = []
+    layer = SimpleNamespace(
+        indexer=SimpleNamespace(
+            k_cache=SimpleNamespace(prefix="index"),
+            indexer_op=lambda *args: calls.append("dummy_indexer"),
+        ),
+        topk_indices_buffer=indices,
+        forward_mqa=lambda *args: calls.append("dummy_attention"),
+    )
+    value = torch.empty(1, 1)
+    positions = torch.tensor([0])
+    attention.DeepseekV4Attention._sparse_indexer_and_attn(
+        layer, value, value, None, value, value, value, positions, value
+    )
+    assert calls == ["dummy_indexer", "dummy_attention"]
+    assert torch.equal(indices, original)
