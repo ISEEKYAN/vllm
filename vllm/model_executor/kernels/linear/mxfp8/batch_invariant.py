@@ -38,8 +38,8 @@ def packed_block32_grouped_mm(
 ) -> torch.Tensor:
     """Consume DeepGEMM's logical INT32 UE8M0 scales without changing its codec.
 
-    Packed scales keep MN-major TMA strides and padded activation rows. Make
-    their logical order contiguous before the byte view, then discard padding.
+    Packed scales keep MN-major TMA strides and padded activation rows. Read
+    their logical UE8M0 bytes directly; masks exclude padded rows.
     Weights stay FP8; each group uses the same K32 visible math as ordinary
     batch-invariant MXFP8 projections.
     """
