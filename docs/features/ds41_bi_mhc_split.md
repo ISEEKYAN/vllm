@@ -9,9 +9,11 @@ from vllm import LLM
 llm = LLM(model="YOUR_DS41_MODEL", enforce_eager=False)
 ```
 
-The mHC entry projection selects its split-K count using a single-token batch in
-BI mode, for both warmup and live dispatch. Teacher-forced and decode calls thus
-use the same K-reduction order on the same hardware. The count still depends on
+The shared unfused/delayed mHC entry selector uses a single-token batch in
+BI mode for both warmup keys and live dispatch. Calls through that selector keep
+the same split count on the same hardware. The small-batch fused post/pre and
+the eager sibling are separate paths; this PR does not unify their reductions.
+The count still depends on
 input width and device SM count; it is not universally fixed to 16. Default mode
 retains the existing batch-size heuristic.
 
