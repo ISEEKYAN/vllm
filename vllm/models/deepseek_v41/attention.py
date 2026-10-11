@@ -95,6 +95,13 @@ def _indexer_k_cache_head_dim(index_head_dim: int, use_fp4_kv: bool) -> int:
     return index_head_dim + index_head_dim // 128 * 4
 
 
+def _sort_valid_topk_indices_(indices: torch.Tensor) -> None:
+    """Match the deployment attention reduction order without changing selection."""
+    sentinel = torch.iinfo(indices.dtype).max
+    ordered = torch.where(indices >= 0, indices, sentinel).sort(dim=-1).values
+    indices.copy_(torch.where(ordered == sentinel, -1, ordered))
+
+
 @triton.jit
 def _fill_short_context_topk_indices(
     output,
@@ -897,6 +904,18 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 None,
                 index_weights,
             )
+            if envs.VLLM_BATCH_INVARIANT:
+                attn_metadata = get_forward_context().attn_metadata
+                # Native profile-run dummy forwards have no KV metadata.
+                if isinstance(attn_metadata, dict):
+                    metadata = cast(Any, attn_metadata[self.indexer.k_cache.prefix])
+                    num_tokens = (
+                        metadata.num_decode_tokens + metadata.num_prefill_tokens
+                    )
+                    assert self.topk_indices_buffer is not None
+                    # Breakable replay sees live metadata; FULL captures the padded
+                    # row count.
+                    _sort_valid_topk_indices_(self.topk_indices_buffer[:num_tokens])
 
         # MLA attention writes into the pre-allocated `out` buffer
         # ([num_tokens, padded_heads, head_dim]).
