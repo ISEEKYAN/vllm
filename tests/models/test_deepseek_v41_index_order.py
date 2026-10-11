@@ -71,7 +71,7 @@ def test_graph_topk_reads_selected_positions_in_deployment_order(
 
 
 def test_profile_run_without_attention_metadata_preserves_dummy_path(monkeypatch):
-    """The native profile run has no KV metadata and performs no attention read."""
+    """The native profile path skips index ordering but still calls dummy attention."""
     monkeypatch.setattr(attention.envs, "VLLM_BATCH_INVARIANT", True)
     monkeypatch.setattr(
         attention,

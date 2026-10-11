@@ -913,7 +913,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                         metadata.num_decode_tokens + metadata.num_prefill_tokens
                     )
                     assert self.topk_indices_buffer is not None
-                    # This eager segment sees live metadata on every graph replay.
+                    # Breakable replay sees live metadata; FULL captures the padded
+                    # row count.
                     _sort_valid_topk_indices_(self.topk_indices_buffer[:num_tokens])
 
         # MLA attention writes into the pre-allocated `out` buffer
