@@ -165,3 +165,32 @@ def test_packed_grouped_mm_padding_strides_known_values_and_token_partition():
                 for i in range(0, m, chunk)
             ]
             assert torch.equal(actual, torch.cat(parts))
+
+
+def test_block32_launches_once_for_all_rows_groups_and_k(monkeypatch):
+    from vllm.model_executor.determinism import mxfp8
+
+    original = mxfp8._block32_mm
+    calls = []
+
+    class LaunchSpy:
+        def __getitem__(self, grid):
+            launch = original[grid]
+
+            def run(*args, **kwargs):
+                calls.append(grid)
+                return launch(*args, **kwargs)
+
+            return run
+
+    monkeypatch.setattr(mxfp8, "_block32_mm", LaunchSpy())
+    for m, groups in ((1, 1), (33, 1), (129, 2)):
+        a = torch.ones(m, groups, 256, device="cuda").to(torch.float8_e4m3fn)
+        w = torch.ones(groups, 64, 256, device="cuda").to(torch.float8_e4m3fn)
+        sa = torch.full((m, groups, 2), 0x7F7F7F7F, dtype=torch.int32, device="cuda")
+        sw = torch.full((groups, 64, 2), 0x7F7F7F7F, dtype=torch.int32, device="cuda")
+        calls.clear()
+        out = packed_block32_grouped_mm(a, sa, w, sw, torch.float32)
+        assert len(calls) == 1
+        assert calls[0][2] == groups
+        assert torch.equal(out, torch.full_like(out, 256))

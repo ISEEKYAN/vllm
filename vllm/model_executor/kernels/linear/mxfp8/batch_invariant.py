@@ -5,6 +5,7 @@
 import torch
 from torch.nn.parameter import Parameter
 
+from vllm.model_executor.determinism.mxfp8 import batched_block32_mm
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     mxfp8_e4m3_quantize,
 )
@@ -25,22 +26,7 @@ def block32_scaled_mm(
     Each K32 product is accumulated before the next block, independently of
     token count, backend autotuning and the physical scale layout.
     """
-    a_scale = a_scale.view(torch.float8_e8m0fnu).float()
-    weight_scale = weight_scale.view(torch.float8_e8m0fnu).float()
-    output = torch.zeros(
-        a.shape[0], weight.shape[0], device=a.device, dtype=torch.float32
-    )
-    unit = torch.ones((), device=a.device, dtype=torch.float32)
-    for block, start in enumerate(range(0, a.shape[1], 32)):
-        product = torch._scaled_mm(
-            a[:, start : start + 32].contiguous(),
-            weight[:, start : start + 32].contiguous().T,
-            unit,
-            unit,
-            out_dtype=torch.float32,
-        )
-        output += product * a_scale[:, block, None] * weight_scale[:, block][None, :]
-    return output.to(output_dtype)
+    return batched_block32_mm(a, a_scale, weight, weight_scale, output_dtype)
 
 
 def packed_block32_grouped_mm(
@@ -57,32 +43,8 @@ def packed_block32_grouped_mm(
     Weights stay FP8; each group uses the same K32 visible math as ordinary
     batch-invariant MXFP8 projections.
     """
-    m, groups, k = a.shape
-    n = weight.shape[-2]
-    assert weight.shape == (groups, n, k)
-    assert packed_a_scale.dtype == packed_weight_scale.dtype == torch.int32
-    a_scale = (
-        packed_a_scale[:m]
-        .clone(memory_format=torch.contiguous_format)
-        .view(torch.uint8)[..., : k // 32]
-    )
-    weight_scale = (
-        packed_weight_scale[:, :n]
-        .clone(memory_format=torch.contiguous_format)
-        .view(torch.uint8)[..., : k // 32]
-    )
-    return torch.stack(
-        [
-            block32_scaled_mm(
-                a[:, group].contiguous(),
-                a_scale[:, group].contiguous(),
-                weight[group],
-                weight_scale[group],
-                output_dtype,
-            )
-            for group in range(groups)
-        ],
-        dim=1,
+    return batched_block32_mm(
+        a, packed_a_scale, weight, packed_weight_scale, output_dtype, grouped=True
     )
 
 

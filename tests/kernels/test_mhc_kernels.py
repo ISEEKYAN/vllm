@@ -1525,3 +1525,54 @@ def test_mhc_fused_post_pre_delayed_falls_back_for_large_batches():
 
     assert not rocm_aiter_ops.mhc_fused_post_pre_delayed_prefers_unfused(1)
     assert rocm_aiter_ops.mhc_fused_post_pre_delayed_prefers_unfused(1 << 20)
+
+
+def test_bi_fused_post_pre_batched_launch_and_row_equality(monkeypatch):
+    from vllm import envs
+    from vllm.model_executor.kernels.mhc import tilelang as ops
+    from vllm.model_executor.kernels.mhc import tilelang_kernels as kernels
+
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    torch.manual_seed(745)
+    m, h, c = 33, 512, 4
+    x = torch.randn(m, h, dtype=torch.bfloat16, device="cuda")
+    residual = torch.randn(m, c, h, dtype=torch.bfloat16, device="cuda")
+    post = torch.randn(m, c, dtype=torch.float32, device="cuda")
+    comb = torch.randn(m, c, c, dtype=torch.float32, device="cuda")
+    fn = torch.randn(c * (c + 2), c * h, dtype=torch.float32, device="cuda") * 0.01
+    scale = torch.randn(3, dtype=torch.float32, device="cuda") * 0.1
+    base = torch.randn(c * (c + 2), dtype=torch.float32, device="cuda") * 0.1
+    weight = torch.randn(h, dtype=torch.bfloat16, device="cuda")
+    calls = []
+    original = kernels._MHC_FUSED_TILELANG_KERNEL
+
+    def launch(*args, **kwargs):
+        calls.append(args[1].shape[0])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(kernels, "_MHC_FUSED_TILELANG_KERNEL", launch)
+
+    def run(rows):
+        return ops.mhc_fused_post_pre_tilelang(
+            x[rows],
+            residual[rows],
+            post[rows],
+            comb[rows],
+            fn,
+            scale,
+            base,
+            1e-6,
+            1e-6,
+            1e-6,
+            2.0,
+            20,
+            norm_weight=weight,
+        )
+
+    batched = run(slice(None))
+    assert calls == [m], "one launch must process the entire batch"
+    for row in (0, 1, 16, 32):
+        single = run(slice(row, row + 1))
+        for actual, expected in zip(batched, single, strict=True):
+            assert torch.equal(actual[row : row + 1], expected)
