@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, ClassVar, cast
 
 import torch
 
+from vllm import envs
 from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4.nvidia.ops.o_proj import compute_fp8_einsum_recipe
 from vllm.models.deepseek_v41.attention import DeepseekV4Attention
@@ -22,6 +23,7 @@ from vllm.models.deepseek_v41.sparse_mla import (
     DeepseekV4FlashMLAMetadata,
     DeepseekV41SparseSWAMetadataBuilder,
 )
+from vllm.platforms import current_platform
 from vllm.utils.math_utils import round_up
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWABackend
@@ -40,8 +42,25 @@ class DeepseekSparseSWAFlashMLAMetadataBuilder(DeepseekV41SparseSWAMetadataBuild
 
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if envs.VLLM_BATCH_INVARIANT:
+            # Keep prefill and decode on the same BF16 sparse kernel.
+            self.decode_threshold = 0
+
+    @classmethod
+    def get_cudagraph_support(cls, vllm_config, kv_cache_spec):
+        if envs.VLLM_BATCH_INVARIANT:
+            return AttentionCGSupport.NEVER
+        return super().get_cudagraph_support(vllm_config, kv_cache_spec)
+
 
 class DeepseekSparseSWAFlashMLABackend(DeepseekSparseSWABackend):
+    @classmethod
+    def supports_batch_invariance(cls) -> bool:
+        """SM100 proof: test_ds41_flashmla_swa_bi_batch_chunk_pd_graph."""
+        return current_platform.is_device_capability_family(100)
+
     @staticmethod
     def get_builder_cls() -> type[DeepseekSparseSWAFlashMLAMetadataBuilder]:
         return DeepseekSparseSWAFlashMLAMetadataBuilder
