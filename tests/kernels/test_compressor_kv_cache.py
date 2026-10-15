@@ -1002,7 +1002,12 @@ def test_v41_bi_compressor_rejects_unproven_ring_geometry(
         CompressorStateCache(state_dim, torch.float32, "state")
 
 
-@pytest.mark.skipif(not current_platform.is_cuda(), reason="SM100 compressor proof")
+@pytest.mark.skipif(
+    not (
+        current_platform.is_cuda() and current_platform.is_device_capability_family(100)
+    ),
+    reason="SM100 compressor proof",
+)
 @pytest.mark.parametrize("length", [129, 12290])
 @torch.inference_mode()
 def test_v41_compressor_bi_batch_chunk_pd_graph_cache_bytes(length, monkeypatch):
@@ -1016,7 +1021,6 @@ def test_v41_compressor_bi_batch_chunk_pd_graph_cache_bytes(length, monkeypatch)
     from vllm.v1.kv_cache_interface import CircularBufferSpec
 
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
-    assert torch.cuda.get_device_capability()[0] == 10
     torch.manual_seed(3741)
     sizes = [length, 65, 127]
     raw = [torch.randn(n, 1024, device="cuda") for n in sizes]
