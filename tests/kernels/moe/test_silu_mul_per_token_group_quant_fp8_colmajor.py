@@ -241,7 +241,7 @@ def test_silu_mul_fp8_quant_deep_gemm_clamp(T: int, N: int, clamp_limit: float):
 @pytest.mark.parametrize("rows", [465920, 466048, 626688])
 @pytest.mark.parametrize("packed", [False, True])
 def test_bi_quant_large_numel_matches_row_chunks(rows, packed, monkeypatch):
-    """EP8 profile activations cross INT32 numel without changing quantization."""
+    """Rows below and above INT32 numel preserve chunkwise quantization."""
     from vllm.model_executor.kernels.batch_invariant import (
         fused_silu_mul_per_token_group_quant_fp8,
     )
