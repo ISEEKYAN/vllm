@@ -316,6 +316,11 @@ def as_fp32_logits(logits: torch.Tensor, row_ends: torch.Tensor) -> torch.Tensor
     if num_rows == 0 or width == 0:
         return out
     assert row_ends.numel() == num_rows and row_ends.dtype == torch.int32
+    if envs.VLLM_BATCH_INVARIANT and current_platform.is_cuda():
+        from vllm.model_executor.kernels.batch_invariant import cast_indexer_logits
+
+        cast_indexer_logits(logits, row_ends, out)
+        return out
     block = 1024
     splits = min(triton.cdiv(width, block), max(1, 1024 // num_rows))
     _upcast_logits_kernel[(num_rows, splits)](
@@ -760,7 +765,13 @@ def sparse_attn_indexer(
                             chunk_candidates,
                             candidate_block_size,
                         )
-                ops.top_k_per_row_prefill(
+                if envs.VLLM_BATCH_INVARIANT and current_platform.is_cuda():
+                    from vllm.model_executor.kernels.batch_invariant import (
+                        top_k_per_row_prefill,
+                    )
+                else:
+                    top_k_per_row_prefill = ops.top_k_per_row_prefill
+                top_k_per_row_prefill(
                     logits,
                     torch.zeros_like(row_ends) if row_starts is None else row_starts,
                     row_ends,
