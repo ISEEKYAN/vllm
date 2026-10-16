@@ -882,3 +882,490 @@ def test_dspark_noncausal_draft_decode_update_matches_build():
     assert md.decode_swa_width == builder.noncausal_index_width
     torch.testing.assert_close(md.decode_swa_lens, expected.decode_swa_lens)
     torch.testing.assert_close(md.decode_swa_indices, expected.decode_swa_indices)
+
+
+def _ds41_swa_bi_config(lengths):
+    from types import SimpleNamespace
+
+    from vllm.config import CacheConfig, set_current_vllm_config
+    from vllm.models.deepseek_v41.nvidia.flashmla import DeepseekV4FlashMLAAttention
+    from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
+
+    window, block_size, dim = 128, 32, 512
+    max_tokens = sum(lengths)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(sliding_window=window, compress_ratios=[0]),
+            max_model_len=max(lengths),
+        ),
+        scheduler_config=SimpleNamespace(
+            max_num_batched_tokens=max_tokens, max_num_seqs=3
+        ),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        speculative_config=None,
+        compilation_config=SimpleNamespace(static_forward_context={}),
+    )
+    cache_config = CacheConfig(cache_dtype="nvfp4_ds_mla")
+    with set_current_vllm_config(config):
+        swa = DeepseekV4SWACache(
+            head_dim=dim,
+            window_size=window,
+            dtype=torch.uint8,
+            prefix="swa",
+            cache_config=cache_config,
+            backend_cls=DeepseekV4FlashMLAAttention.swa_backend_cls,
+            block_size=block_size,
+            packed_bytes_per_token=528,
+            packed_page_alignment=512,
+        )
+    return config, swa
+
+
+def _ds41_cr2_bi_builder(config, device):
+    from vllm.models.deepseek_v41.sparse_mla import (
+        DeepseekV4FlashMLAMetadataBuilder,
+    )
+    from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+    spec = MLAAttentionSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.uint8,
+        tokens_per_state=2,
+        state_content_bytes=288,
+        cache_dtype_str="nvfp4_ds_mla",
+        model_version="deepseek_v4",
+    )
+    return DeepseekV4FlashMLAMetadataBuilder(spec, ["compressed"], config, device)
+
+
+def test_ds41_flashmla_cr2_bi_builder_constructs_on_cpu(monkeypatch):
+    """Construct the same CR2 builder before requesting a GPU arithmetic proof."""
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    config, _ = _ds41_swa_bi_config([12290, 65, 129])
+    config.model_config.hf_config.compress_ratios = [0, 0, 2, 2]
+    config.model_config.hf_config.index_topk = 512
+    builder = _ds41_cr2_bi_builder(config, torch.device("cpu"))
+    assert builder.compress_ratio == 2 and builder.topk_tokens == 512
+    assert builder.req_id_per_token_buffer.numel() == 12484
+    assert builder.compressed_slot_mapping_buffer.device.type == "cpu"
+
+
+def test_ds41_flashmla_swa_bi_builder_policy(monkeypatch):
+    """CPU construction must retain BI decode routing and disable engine graphs."""
+    from vllm.models.deepseek_v41.nvidia.flashmla import (
+        DeepseekSparseSWAFlashMLAMetadataBuilder,
+    )
+    from vllm.v1.attention.backend import AttentionCGSupport
+
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    config, swa = _ds41_swa_bi_config([12290, 65, 129])
+    spec = swa.get_kv_cache_spec(config)
+    builder = DeepseekSparseSWAFlashMLAMetadataBuilder(
+        spec, [swa.prefix], config, torch.device("cpu")
+    )
+    assert builder.decode_threshold == 0
+    assert builder.get_cudagraph_support(config, spec) == AttentionCGSupport.NEVER
+
+
+@pytest.mark.parametrize("major,supported", [(9, False), (10, True), (12, False)])
+def test_ds41_swa_bi_declaration_stays_scoped(monkeypatch, major, supported):
+    """The tested SM100 route must not grant BI to DS4 or FlashInfer."""
+    from vllm.models.deepseek_v41.nvidia.flashinfer_sparse import (
+        DeepseekSparseSWAFlashInferBackend,
+    )
+    from vllm.models.deepseek_v41.nvidia.flashmla import (
+        DeepseekSparseSWAFlashMLABackend,
+    )
+    from vllm.platforms import current_platform
+    from vllm.platforms.interface import DeviceCapability
+    from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWABackend
+
+    monkeypatch.setattr(
+        type(current_platform),
+        "get_device_capability",
+        classmethod(lambda cls, device_id=0: DeviceCapability(major, 0)),
+    )
+    assert DeepseekSparseSWAFlashMLABackend.supports_batch_invariance() == supported
+    assert not DeepseekSparseSWABackend.supports_batch_invariance()
+    assert not DeepseekSparseSWAFlashInferBackend.supports_batch_invariance()
+
+
+@pytest.mark.parametrize("major,supported", [(9, False), (10, True), (12, False)])
+def test_ds41_cr2_indexer_bi_declaration_stays_scoped(monkeypatch, major, supported):
+    """The CR2 proof must not grant BI to DS4, mega attention or sparse indexer."""
+    from vllm.models.deepseek_v41.sparse_mla import (
+        DeepseekV4FlashMLABackend,
+        FlashMLAMegaAttnBackend,
+    )
+    from vllm.platforms import current_platform
+    from vllm.platforms.interface import DeviceCapability
+    from vllm.v1.attention.backends.mla.indexer import (
+        DeepseekV4IndexerBackend,
+        DeepseekV41IndexerBackend,
+    )
+    from vllm.v1.attention.backends.mla.sparse_indexer import (
+        DeepseekV41SparseIndexerBackend,
+    )
+
+    monkeypatch.setattr(
+        type(current_platform),
+        "get_device_capability",
+        classmethod(lambda cls, device_id=0: DeviceCapability(major, 0)),
+    )
+    assert DeepseekV4FlashMLABackend.supports_batch_invariance() == supported
+    assert DeepseekV41IndexerBackend.supports_batch_invariance() == supported
+    assert not DeepseekV4IndexerBackend.supports_batch_invariance()
+    assert not FlashMLAMegaAttnBackend.supports_batch_invariance()
+    assert not DeepseekV41SparseIndexerBackend.supports_batch_invariance()
+
+
+@pytest.mark.parametrize("length", [127, 129, 12290])
+def test_ds41_flashmla_swa_bi_batch_chunk_pd_graph(monkeypatch, length):
+    _assert_ds41_flashmla_bi_schedule(monkeypatch, length, compress_ratio=0)
+
+
+@pytest.mark.parametrize("length", [129, 12290])
+def test_ds41_flashmla_cr2_indexer_bi_batch_chunk_pd_graph(monkeypatch, length):
+    """Actual BF16 DeepGEMM -> stable Top-K -> CR2 attention is schedule invariant."""
+    _assert_ds41_flashmla_bi_schedule(monkeypatch, length, compress_ratio=2)
+
+
+def _assert_ds41_flashmla_bi_schedule(monkeypatch, length, compress_ratio):
+    """Scheduling cannot change actual DS41 SWA attention output bits.
+
+    Cover window edges, all query rows across 12288, request permutation,
+    chunked prefill, single-token decode and static-metadata graph replay.
+    Full engine graphs remain disabled by the production BI builder.
+    """
+    from vllm.forward_context import ForwardContext, override_forward_context
+    from vllm.models.deepseek_v41.common.ops.cache_utils import (
+        quantize_and_insert_k_cache,
+    )
+    from vllm.models.deepseek_v41.nvidia.flashmla import (
+        DeepseekSparseSWAFlashMLAMetadataBuilder,
+        DeepseekV4FlashMLAAttention,
+    )
+    from vllm.v1.attention.backend import AttentionCGSupport
+    from vllm.v1.worker.workspace import (
+        init_workspace_manager,
+        reset_workspace_manager,
+    )
+
+    if not torch.cuda.is_available():
+        pytest.skip("DS41 FlashMLA requires CUDA")
+    assert torch.cuda.get_device_capability()[0] == 10
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    torch.manual_seed(1949)
+    device = torch.device("cuda")
+    window, block_size, heads, dim = 128, 32, 64, 512
+    lengths = [length, 65, 129]
+    max_tokens = sum(lengths)
+    config, swa = _ds41_swa_bi_config(lengths)
+    config.model_config.hf_config.compress_ratios = (
+        [0, 0, 2, 2] if compress_ratio else [0]
+    )
+    config.model_config.hf_config.index_topk = 512
+    spec = swa.get_kv_cache_spec(config)
+    builder = DeepseekSparseSWAFlashMLAMetadataBuilder(
+        spec, [swa.prefix], config, device
+    )
+    assert builder.decode_threshold == 0
+    assert builder.get_cudagraph_support(config, spec) == AttentionCGSupport.NEVER
+
+    pages = (max(lengths) + block_size - 1) // block_size
+    tables = torch.arange(3 * pages, dtype=torch.int32, device=device).view(3, pages)
+    packed = torch.zeros(3 * pages, block_size * 528, device=device, dtype=torch.uint8)
+    swa.kv_cache = packed.view(3 * pages, block_size, 528)
+    queries = []
+    for request, size in enumerate(lengths):
+        queries.append(
+            torch.randn(size, heads, dim, device=device, dtype=torch.bfloat16)
+        )
+        values = torch.randn(size, dim, device=device, dtype=torch.bfloat16)
+        slots = torch.arange(size, device=device, dtype=torch.int64)
+        slots += request * pages * block_size
+        quantize_and_insert_k_cache(
+            values, packed, slots, block_size=block_size, bytes_per_token=528
+        )
+
+    # Exercise the production attention subpath without allocating projections,
+    # experts or embedding tables unrelated to its scheduling contract.
+    attention = DeepseekV4FlashMLAAttention.__new__(DeepseekV4FlashMLAAttention)
+    torch.nn.Module.__init__(attention)
+    attention.compress_ratio = compress_ratio
+    attention.compressed_cache_prefix = "compressed" if compress_ratio else None
+    attention.swa_cache_layer = swa
+    attention.window_size = window
+    attention.max_num_batched_tokens = max_tokens
+    attention.topk_indices_buffer = torch.full(
+        (max_tokens, 512), -1, device=device, dtype=torch.int32
+    )
+    attention.scale = dim**-0.5
+    attention.attn_sink = torch.randn(heads, device=device, dtype=torch.float32)
+    compressed_builder = None
+    if compress_ratio:
+        from vllm.model_executor.kernels.batch_invariant import top_k_per_row_prefill
+        from vllm.model_executor.layers.sparse_attn_indexer import as_fp32_logits
+        from vllm.utils.deep_gemm import fp8_fp4_mqa_logits, mqa_logits_mx_inputs
+
+        compressed_pages = (max(lengths) + 127) // 128
+        compressed_tables = torch.arange(
+            3 * compressed_pages, device=device, dtype=torch.int32
+        ).view(3, compressed_pages)
+        compressed = torch.empty(
+            3 * compressed_pages, 64 * 288, device=device, dtype=torch.uint8
+        )
+        compressed[:, : 64 * 256] = torch.randint(
+            256, (3 * compressed_pages, 64 * 256), device=device, dtype=torch.uint8
+        )
+        scales = (torch.rand(3 * compressed_pages, 64 * 32, device=device) + 0.25).to(
+            torch.float8_e4m3fn
+        )
+        compressed[:, 64 * 256 :] = scales.view(torch.uint8)
+        attention.is_kv_source = True
+        attention.kv_cache = compressed.view(-1, 64, 288)
+        attention._static_forward_context = {"compressed": attention}
+        compressed_builder = _ds41_cr2_bi_builder(config, device)
+        key_lengths = [(size + 1) // 2 for size in lengths]
+        key_offsets = [0, key_lengths[0], sum(key_lengths[:2])]
+        index_keys = torch.randint(
+            -128, 128, (sum(key_lengths), 64), device=device, dtype=torch.int8
+        )
+        index_key_scales = torch.full(
+            (sum(key_lengths),), 0x7F7F7F7F, device=device, dtype=torch.int32
+        )
+        index_queries = [
+            torch.randint(-128, 128, (size, 32, 64), device=device, dtype=torch.int8)
+            for size in lengths
+        ]
+        index_weights = [torch.randn(size, 32, device=device) for size in lengths]
+        for weights in index_weights:
+            weights[::97].zero_()
+        if length > 12288:
+            index_weights[0][12288].zero_()
+    init_workspace_manager(device)
+
+    def prepare(schedule):
+        sizes = [end - start for _, start, end in schedule]
+        ends = [end for _, _, end in schedule]
+        starts_cpu = torch.tensor([0, *sizes], dtype=torch.int32).cumsum(0).int()
+        starts = starts_cpu.to(device)
+        q = torch.cat([queries[r][start:end] for r, start, end in schedule])
+        positions = torch.cat(
+            [torch.arange(start, end, device=device) for _, start, end in schedule]
+        )
+        common = CommonAttentionMetadata(
+            query_start_loc=starts,
+            query_start_loc_cpu=starts_cpu,
+            seq_lens=torch.tensor(ends, device=device, dtype=torch.int32),
+            seq_lens_cpu_upper_bound=torch.tensor(ends, dtype=torch.int32),
+            num_reqs=len(schedule),
+            num_actual_tokens=sum(sizes),
+            max_query_len=max(sizes),
+            max_seq_len=max(ends),
+            block_table_tensor=torch.stack([tables[r] for r, _, _ in schedule]),
+            slot_mapping=torch.arange(sum(sizes), device=device, dtype=torch.int64),
+            causal=True,
+        )
+        metadata = builder.build(0, common)
+        assert metadata.num_decodes == 0 and metadata.num_prefills == len(schedule)
+        assert metadata.num_prefill_tokens == sum(sizes)
+        all_metadata = {swa.prefix: metadata}
+        if compressed_builder is not None:
+            from dataclasses import replace
+
+            compressed_common = replace(
+                common,
+                block_table_tensor=torch.stack(
+                    [compressed_tables[r] for r, _, _ in schedule]
+                ),
+            )
+            all_metadata["compressed"] = compressed_builder.build(0, compressed_common)
+            index_q = torch.cat(
+                [index_queries[r][start:end] for r, start, end in schedule]
+            )
+            weights = torch.cat(
+                [index_weights[r][start:end] for r, start, end in schedule]
+            )
+            row_starts = torch.cat(
+                [
+                    torch.full(
+                        (end - start,), key_offsets[r], device=device, dtype=torch.int32
+                    )
+                    for r, start, end in schedule
+                ]
+            )
+            row_ends = row_starts + (positions.int() + 1) // 2
+            valid_ends = row_ends - row_starts
+            query_scales, native_weights = mqa_logits_mx_inputs(index_q, None, weights)
+        context = ForwardContext({}, all_metadata, {})
+        output = torch.empty_like(q)
+
+        def forward():
+            if compressed_builder is not None:
+                scores = fp8_fp4_mqa_logits(
+                    (index_q, query_scales),
+                    (index_keys, index_key_scales),
+                    native_weights,
+                    row_starts,
+                    row_ends,
+                    max(key_lengths),
+                )
+                assert scores.dtype == torch.bfloat16
+                logits = as_fp32_logits(scores, valid_ends)
+                top_k_per_row_prefill(
+                    logits,
+                    torch.zeros_like(valid_ends),
+                    valid_ends,
+                    attention.topk_indices_buffer[: q.shape[0]],
+                    q.shape[0],
+                    logits.stride(0),
+                    logits.stride(1),
+                    512,
+                )
+            with override_forward_context(context):
+                attention.forward_mqa(q, q[:, 0], positions, output)
+
+        return forward, output, metadata, q
+
+    def run(schedule):
+        forward, output, _, _ = prepare(schedule)
+        forward()
+        return output.clone()
+
+    try:
+        expected = [run([(r, 0, size)]) for r, size in enumerate(lengths)]
+        schedule = [(1, 0, lengths[1]), (0, 0, length), (2, 0, lengths[2])]
+        for order in (schedule, schedule[::-1]):
+            actual = run(order)
+            assert torch.equal(actual, torch.cat([expected[r] for r, _, _ in order]))
+
+        attention.PREFILL_CHUNK_SIZE = 1
+        forward, output, metadata, _ = prepare(schedule)
+        plan = metadata.get_prefill_chunk_plan(
+            compress_ratio, 1, has_compressed=bool(compress_ratio)
+        )
+        # Small cases can fit one workspace chunk; the long case must split.
+        if length > 12288:
+            assert len(plan) > 1
+        forward()
+        wanted = torch.cat([expected[r] for r, _, _ in schedule])
+        assert torch.equal(output, wanted)
+        attention.PREFILL_CHUNK_SIZE = 4
+        if compress_ratio:
+            attention.is_kv_source = False
+            assert torch.equal(run([(0, 0, length)]), expected[0])
+            attention.is_kv_source = True
+
+        cuts = sorted({0, 64, 127, 128, length - 2, length - 1, length})
+        cuts = [cut for cut in cuts if 0 <= cut <= length]
+        chunks = [run([(0, start, end)]) for start, end in zip(cuts, cuts[1:])]
+        assert torch.equal(torch.cat(chunks), expected[0])
+        for position in sorted({0, 126, 127, 128, length - 1}):
+            if position < length:
+                assert torch.equal(
+                    run([(0, position, position + 1)]),
+                    expected[0][position : position + 1],
+                )
+
+        forward, output, _, q = prepare(schedule)
+        forward()
+        torch.accelerator.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            forward()
+        for multiplier in (1, -1):
+            q.mul_(multiplier)
+            forward()
+            eager = output.clone()
+            output.fill_(float("nan"))
+            graph.replay()
+            assert torch.equal(output, eager)
+            assert torch.isfinite(output).all()
+    finally:
+        torch.accelerator.synchronize()
+        reset_workspace_manager()
+
+
+@pytest.mark.parametrize("bounded", [False, True])
+def test_ds41_bi_nvfp4_gather_matches_paged_record_and_graph(monkeypatch, bounded):
+    """BI gathers the same packed records, preserving offsets and page strides."""
+    if not torch.cuda.is_available():
+        pytest.skip("DS41 NVFP4 CUDA gather")
+    from vllm.models.deepseek_v41.common.ops.cache_utils import (
+        dequantize_and_gather_k_cache,
+    )
+
+    torch.manual_seed(1959)
+    device = torch.device("cuda")
+    block, requests, pages = 64, 3, 3
+    page_stride = block * 288 + 512
+    packed = torch.full(
+        (requests * pages, page_stride), 165, dtype=torch.uint8, device=device
+    )
+    packed[:, : block * 256] = torch.randint(
+        256, (requests * pages, block * 256), dtype=torch.uint8, device=device
+    )
+    scales = (torch.rand(requests * pages, block * 32, device=device) + 0.25).to(
+        torch.float8_e4m3fn
+    )
+    packed[:, block * 256 : block * 288] = scales.view(torch.uint8)
+    cache = packed.as_strided((requests * pages, block, 288), (page_stride, 288, 1))
+    table = torch.randperm(requests * pages, device=device).int().view(requests, pages)
+    seq_lens = torch.tensor([130, 127, 65], dtype=torch.int32, device=device)
+    gather_lens = seq_lens.clamp(max=63) if bounded else None
+    offset, max_gather = 17, 63 if bounded else 130
+    shape = (requests, offset + max_gather + 3, 512)
+    strides = (shape[1] * 512 + 64, 512, 1)
+
+    def allocate(count=requests):
+        return torch.empty_strided(
+            (count, *shape[1:]), strides, dtype=torch.bfloat16, device=device
+        ).fill_(-7.25)
+
+    def gather(output, lengths=seq_lens, tables=table, limits=gather_lens):
+        dequantize_and_gather_k_cache(
+            output, cache, lengths, limits, tables, block, offset
+        )
+
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
+    expected = allocate()
+    gather(expected)
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    actual = allocate()
+    gather(actual)
+    assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+    for request in range(requests):
+        alone = allocate(1)
+        gather(
+            alone,
+            seq_lens[request : request + 1],
+            table[request : request + 1],
+            None if gather_lens is None else gather_lens[request : request + 1],
+        )
+        assert torch.equal(alone, expected[request : request + 1])
+
+    permutation = torch.tensor([2, 0, 1], device=device)
+    shuffled = allocate()
+    gather(
+        shuffled,
+        seq_lens[permutation],
+        table[permutation],
+        None if gather_lens is None else gather_lens[permutation],
+    )
+    assert torch.equal(shuffled, expected[permutation])
+    gather(actual)
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        gather(actual)
+    seq_lens.sub_(1)
+    if gather_lens is not None:
+        gather_lens.clamp_(max=62)
+    expected.fill_(-7.25)
+    gather(expected)
+    actual.fill_(-7.25)
+    graph.replay()
+    assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))

@@ -9,6 +9,7 @@ import math
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm import envs
 from vllm.model_executor.layers.fused_moe.utils import count_expert_num_tokens
 from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import get_mk_alignment_for_contiguous_layout
@@ -43,6 +44,12 @@ def compute_aligned_M_and_alignment(
     GEMM call site needs to wrap itself in ``mk_alignment_scope`` or
     otherwise reason about the actual per-expert padding.
     """
+    expected_m = M * num_topk
+    if envs.VLLM_BATCH_INVARIANT:
+        max_active_experts = min(expected_m, local_num_experts)
+        return round_up(
+            expected_m + max_active_experts * (alignment - 1), alignment
+        ), alignment
     if (expert_tokens_meta is not None) and (
         expert_tokens_meta.expert_num_tokens_cpu is not None
     ):
@@ -58,7 +65,6 @@ def compute_aligned_M_and_alignment(
     # active, so the worst-case `local_num_experts*(align-1)` is too loose.
     # Also shrink `alignment` to DeepGEMM's per-call theoretical BLOCK_M on
     # SM100/SM120 when smaller.
-    expected_m = M * num_topk
     try:
         from vllm.utils.deep_gemm import (
             get_theoretical_mk_alignment_for_contiguous_layout,
@@ -494,6 +500,23 @@ def deepgemm_moe_permute(
         expert_tokens_meta=expert_tokens_meta,
     )
 
+    if envs.VLLM_BATCH_INVARIANT:
+        if use_psum_layout or aq_scale.dtype != torch.float32:
+            raise ValueError("CUDA BI permutation requires FP8/FP32 scales")
+        from vllm.model_executor.kernels.batch_invariant import stable_expert_permute
+
+        permuted, scales, grouped_layout, inverse = stable_expert_permute(
+            aq,
+            aq_scale,
+            topk_ids,
+            local_num_experts,
+            M_sum,
+            align_used,
+            expert_map=expert_map,
+            output=aq_out,
+        )
+        return permuted, scales, grouped_layout, inverse, align_used
+
     expert_start_loc = torch.empty(
         (local_num_experts), device=device, dtype=torch.int32
     )
@@ -575,3 +598,37 @@ def deepgemm_unpermute_and_reduce(
         expert_map=expert_map,
         output_tensor=output,
     )
+
+
+@torch.no_grad()
+def deepgemm_ep_ordered_unpermute_and_reduce(
+    a: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    inv_perm: torch.Tensor,
+    expert_map: torch.Tensor,
+    output: torch.Tensor,
+):
+    """Communicate single-owner rows before the FP32 top-k FMA in AG/RS EP."""
+    from vllm.distributed import get_ep_group
+    from vllm.model_executor.kernels.batch_invariant import (
+        gather_expert_slots,
+        ordered_topk_combine,
+    )
+
+    if output.shape[0] == 0:
+        return
+    group = get_ep_group()
+    slots = gather_expert_slots(a, topk_ids, inv_perm, expert_map)
+    slots = group.all_reduce(slots)
+    if group.rank_in_group == 0:
+        ordered_topk_combine(
+            slots,
+            topk_weights,
+            output.dtype,
+            routes=topk_ids,
+            global_num_experts=expert_map.numel(),
+            output=output,
+        )
+    else:
+        output.zero_()

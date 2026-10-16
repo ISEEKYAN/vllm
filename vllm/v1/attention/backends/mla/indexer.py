@@ -358,6 +358,19 @@ class DeepseekV4IndexerBackend(DeepseekV32IndexerBackend):
 
 class DeepseekV41IndexerBackend(DeepseekV4IndexerBackend):
     @classmethod
+    def supports_batch_invariance(cls) -> bool:
+        """SM100 proof: test_ds41_flashmla_cr2_indexer_bi_batch_chunk_pd_graph."""
+        return cls is DeepseekV41IndexerBackend and (
+            current_platform.is_device_capability_family(100)
+        )
+
+    @staticmethod
+    def get_builder_cls() -> type["DeepseekV32IndexerMetadataBuilder"]:
+        if envs.VLLM_BATCH_INVARIANT:
+            return DeepseekV41BIIndexerMetadataBuilder
+        return DeepseekV32IndexerMetadataBuilder
+
+    @classmethod
     def supports_device_cpu_query_lens_mismatch(cls) -> bool:
         # The ROCm flattened-query support above is validated for the
         # DeepSeek-V4 adaptive DSpark path only.
@@ -1974,3 +1987,16 @@ def build_prefill_chunk_metadata(
 
 _PREPARE_UNIFORM_DECODE_KERNEL = PrepareUniformDecodeKernel()
 _BUILD_PREFILL_CHUNK_METADATA_KERNEL = BuildPrefillChunkMetadataKernel()
+
+
+class DeepseekV41BIIndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder):
+    """Use dense prefill scoring and selection for both BI query phases."""
+
+    @classmethod
+    def get_cudagraph_support(cls, vllm_config, kv_cache_spec):
+        return AttentionCGSupport.NEVER
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.decode_threshold = 0
+        logger.info_once("DS4.1 batch-invariant indexer uses the prefill scorer")
