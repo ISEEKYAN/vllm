@@ -188,6 +188,8 @@ class DeepseekV4MegaAttnAttention(DeepseekV4FlashMLAAttention):
                 f"{self.prefix}: mega attention needs {WV_GROUP_SIZE} heads per "
                 "wo_a group."
             )
+        if self.wo_a.weight.dtype != torch.float8_e4m3fn:
+            raise ValueError(f"{self.prefix}: mega attention needs an FP8 wo_a.")
         self.n_wv_group = self.padded_heads // WV_GROUP_SIZE
         q_perm = q_fused_permutation(self.n_local_heads, self.head_dim)
         permute_on_load(self.wq_b.weight, q_perm, dim=0)

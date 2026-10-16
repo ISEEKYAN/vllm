@@ -1035,3 +1035,74 @@ def test_with_real_deepseek_v4_rope(num_tokens, default_vllm_config):
     assert_dequant_close(
         ref_fp8, ref_scale, fused_fp8, fused_scale, msg="Real DeepSeek V4 rope"
     )
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability_family(100),
+    reason="bf16_fixed_mm is SM100-only",
+)
+@torch.inference_mode()
+def test_bf16_wo_a_batch_invariant_groups(monkeypatch):
+    """BF16 wo_a under batch invariance: per-group FP32 GEMM, one BF16 rounding."""
+    from vllm.model_executor.kernels.linear.cute_dsl.batch_invariant import (
+        bf16_fixed_mm,
+    )
+    from vllm.models.deepseek_v4.nvidia.ops.o_proj import deep_gemm_fp8_o_proj
+
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    torch.manual_seed(5)
+    num_heads, n_groups, o_lora_rank, max_pos = 64, 8, 1024, 4096
+    heads_per_group = num_heads // n_groups
+    tokens = 77
+    o = torch.randn(tokens, num_heads, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    positions = torch.randint(0, max_pos, (tokens,), device="cuda")
+    cache = make_cos_sin_cache(max_pos, device="cuda")
+    wo_a = torch.nn.Module()
+    wo_a.register_buffer(
+        "weight",
+        torch.randn(
+            n_groups * o_lora_rank,
+            heads_per_group * HEAD_DIM,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        / 64,
+    )
+
+    def project(rows):
+        return deep_gemm_fp8_o_proj(
+            o[:rows].clone(),
+            positions[:rows],
+            cache,
+            wo_a,
+            torch.nn.Identity(),
+            n_groups=n_groups,
+            heads_per_group=heads_per_group,
+            nope_dim=NOPE_DIM,
+            rope_dim=ROPE_DIM,
+            o_lora_rank=o_lora_rank,
+            einsum_recipe=(1, 1, 128),
+            tma_aligned_scales=True,
+        ).view(rows, n_groups, o_lora_rank)
+
+    z = project(tokens)
+    rotated, _ = fused_inv_rope_fp8_quant(
+        o.clone(),
+        positions,
+        cache,
+        n_groups=n_groups,
+        heads_per_group=heads_per_group,
+        nope_dim=NOPE_DIM,
+        rope_dim=ROPE_DIM,
+        quant_group_size=QUANT_GROUP_SIZE,
+        quantize=False,
+    )
+    weight = wo_a.weight.view(n_groups, o_lora_rank, -1)
+    for group in range(n_groups):
+        expected = bf16_fixed_mm(rotated[:, group].contiguous(), weight[group])
+        assert torch.equal(z[:, group], expected.to(torch.bfloat16))
+    for rows in (1, 7):
+        assert torch.equal(project(rows), z[:rows])
+    # cuBLAS bmm is the non-invariant path this replaces; same math.
+    reference = torch.bmm(rotated.transpose(0, 1), weight.transpose(1, 2))
+    torch.testing.assert_close(z, reference.transpose(0, 1), rtol=1.6e-2, atol=1e-2)

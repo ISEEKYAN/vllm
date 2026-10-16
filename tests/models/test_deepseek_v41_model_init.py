@@ -72,3 +72,32 @@ def test_prefix_replay_requires_an_uncompressed_kv_source(
     model = model_module.DeepseekV4Model(vllm_config=vllm_config)
     assert (model.decoder_replay_layers is not None) == replay
     assert model.decoder_replay_start == (1 if replay else 3)
+
+
+def test_wo_a_dtype_defaults_to_fp8_and_rejects_unknown():
+    from vllm.models.deepseek_v41.quant_config import deepseek_v4_wo_a_dtype
+
+    assert deepseek_v4_wo_a_dtype(SimpleNamespace()) == "fp8"
+    assert deepseek_v4_wo_a_dtype(SimpleNamespace(wo_a_dtype="bf16")) == "bf16"
+    with pytest.raises(ValueError, match="wo_a_dtype"):
+        deepseek_v4_wo_a_dtype(SimpleNamespace(wo_a_dtype="fp16"))
+
+
+def test_fp8_wo_a_dequantizes_exactly_to_bf16():
+    from vllm.models.deepseek_v41.quant_config import dequantize_wo_a
+
+    torch.manual_seed(0)
+    codes = (torch.randn(64, 128) * 100).to(torch.float8_e4m3fn)
+    exponents = torch.randint(110, 135, (64, 4), dtype=torch.uint8)
+    weight = dequantize_wo_a(codes, exponents.view(torch.float8_e8m0fnu))
+    assert weight.dtype == torch.bfloat16
+    expected = codes.float() * torch.exp2(exponents.float() - 127).repeat_interleave(
+        32, 1
+    )
+    assert torch.equal(weight.float(), expected)
+    # Raw exponent bytes, as some loaders hand them over, decode the same way.
+    assert torch.equal(dequantize_wo_a(codes, exponents), weight)
+    with pytest.raises(ValueError, match="tile"):
+        dequantize_wo_a(codes, exponents[:, :3])
+    with pytest.raises(ValueError, match="exactly"):
+        dequantize_wo_a(codes, torch.full((64, 4), 0.3))

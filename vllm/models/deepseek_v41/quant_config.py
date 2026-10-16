@@ -8,6 +8,7 @@ import fnmatch
 from typing import TYPE_CHECKING, cast
 
 import regex as re
+import torch
 
 from vllm.config import get_current_vllm_config
 from vllm.config.quantization import QuantSpec
@@ -26,12 +27,50 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 
 _DEEPSEEK_V4_EXPERT_DTYPES = ("fp4", "fp8")
+_DEEPSEEK_V4_WO_A_DTYPES = ("fp8", "bf16")
 _EXPERTS_LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.ffn\.experts$")
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.modelopt import (
         ModelOptNvFp4Config,
     )
+
+
+def deepseek_v4_wo_a_dtype(hf_text_config) -> str:
+    """``wo_a_dtype``: ``"fp8"`` (default) or ``"bf16"``.
+
+    ``"bf16"`` is the reference inference contract: the attention output
+    projection's first stage runs unquantized, and an FP8 checkpoint's wo_a is
+    dequantized exactly on load (see ``dequantize_wo_a``).
+    """
+    wo_a_dtype = getattr(hf_text_config, "wo_a_dtype", "fp8")
+    if wo_a_dtype not in _DEEPSEEK_V4_WO_A_DTYPES:
+        raise ValueError(
+            f"Unsupported DeepSeek V4 wo_a_dtype={wo_a_dtype!r}; "
+            f"expected one of {_DEEPSEEK_V4_WO_A_DTYPES}."
+        )
+    return wo_a_dtype
+
+
+def dequantize_wo_a(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """BF16 value of a block-scaled E4M3 ``wo_a``, exactly.
+
+    E4M3 has 3 mantissa bits and the block scales are powers of two, so every
+    product is a BF16 value; a scale that breaks this is rejected.
+    """
+    if scale.dtype == torch.uint8:
+        scale = scale.view(torch.float8_e8m0fnu)
+    rows, cols = weight.shape[0] // scale.shape[0], weight.shape[1] // scale.shape[1]
+    if (rows * scale.shape[0], cols * scale.shape[1]) != tuple(weight.shape):
+        raise ValueError(
+            f"wo_a scale {tuple(scale.shape)} does not tile {tuple(weight.shape)}"
+        )
+    expanded = scale.float().repeat_interleave(rows, 0).repeat_interleave(cols, 1)
+    value = weight.float() * expanded
+    dequantized = value.to(torch.bfloat16)
+    if not torch.equal(dequantized.float(), value):
+        raise ValueError("wo_a does not dequantize exactly to BF16")
+    return dequantized
 
 
 class DeepseekV4FP8Config(Fp8Config):
@@ -219,6 +258,15 @@ class DeepseekV4FP8Config(Fp8Config):
         return quant_config
 
     def get_quant_method(self, layer, prefix):
+        if (
+            isinstance(layer, LinearBase)
+            and prefix.endswith(".attn.wo_a")
+            and deepseek_v4_wo_a_dtype(
+                get_current_vllm_config().model_config.hf_text_config
+            )
+            == "bf16"
+        ):
+            return UnquantizedLinearMethod()
         if (
             isinstance(layer, LinearBase)
             and self.weight_block_size == [32, 32]
