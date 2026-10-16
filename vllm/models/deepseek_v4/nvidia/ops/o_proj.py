@@ -105,6 +105,18 @@ def deep_gemm_fp8_o_proj(
                 z,
                 recipe=einsum_recipe,
             )
+    elif envs.VLLM_BATCH_INVARIANT:
+        # BF16 wo_a (the reference inference contract): each group's GEMM
+        # accumulates in FP32 with one fixed reduction, then rounds once.
+        from vllm.model_executor.kernels.linear.cute_dsl.batch_invariant import (
+            bf16_fixed_mm,
+        )
+
+        grouped_weight = wo_a.weight.view(n_groups, o_lora_rank, -1)
+        for group in range(n_groups):
+            z[:, group] = bf16_fixed_mm(
+                o_proj_input[:, group].contiguous(), grouped_weight[group]
+            ).to(z.dtype)
     else:
         grouped_weight = wo_a.weight.view(n_groups, o_lora_rank, -1)
         torch.bmm(
