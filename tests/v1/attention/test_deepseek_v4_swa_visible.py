@@ -887,7 +887,12 @@ def test_dspark_noncausal_draft_decode_update_matches_build():
 def _ds41_swa_bi_config(lengths):
     from types import SimpleNamespace
 
-    from vllm.config import CacheConfig, set_current_vllm_config
+    from vllm.config import (
+        CacheConfig,
+        CompilationConfig,
+        ParallelConfig,
+        set_current_vllm_config,
+    )
     from vllm.models.deepseek_v41.nvidia.flashmla import DeepseekV4FlashMLAAttention
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 
@@ -901,9 +906,9 @@ def _ds41_swa_bi_config(lengths):
         scheduler_config=SimpleNamespace(
             max_num_batched_tokens=max_tokens, max_num_seqs=3
         ),
-        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        parallel_config=ParallelConfig(decode_context_parallel_size=1),
         speculative_config=None,
-        compilation_config=SimpleNamespace(static_forward_context={}),
+        compilation_config=CompilationConfig(),
     )
     cache_config = CacheConfig(cache_dtype="nvfp4_ds_mla")
     with set_current_vllm_config(config):
@@ -919,6 +924,32 @@ def _ds41_swa_bi_config(lengths):
             packed_page_alignment=512,
         )
     return config, swa
+
+
+@pytest.mark.parametrize("mode_name", ["FULL", "PIECEWISE"])
+def test_ds41_graph_forward_context_contract(monkeypatch, mode_name):
+    """Enter the GPU fixture's real forward context before capture on CPU."""
+    from vllm.config import CompilationConfig, CUDAGraphMode, ParallelConfig
+    from vllm.forward_context import get_forward_context, set_forward_context
+
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    config, _ = _ds41_swa_bi_config([5])
+    assert isinstance(config.parallel_config, ParallelConfig)
+    assert isinstance(config.compilation_config, CompilationConfig)
+    metadata = {"swa": object()}
+    mode = CUDAGraphMode[mode_name]
+    with set_forward_context(
+        metadata, config, num_tokens=5, cudagraph_runtime_mode=mode
+    ):
+        context = get_forward_context()
+        assert context.attn_metadata is metadata
+        assert context.cudagraph_runtime_mode == mode
+        assert context.batch_descriptor.num_tokens == 5
+        assert context.dp_metadata is None
+        assert (
+            context.no_compile_layers
+            is config.compilation_config.static_forward_context
+        )
 
 
 def _ds41_cr2_bi_builder(config, device):
