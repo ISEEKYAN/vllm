@@ -98,6 +98,10 @@ from vllm.models.deepseek_v41.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferSM120Attention,
 )
 from vllm.models.deepseek_v41.nvidia.flashmla import DeepseekV4FlashMLAAttention
+from vllm.models.deepseek_v41.quant_config import (
+    deepseek_v4_wo_a_dtype,
+    dequantize_wo_a,
+)
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
@@ -775,6 +779,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 "Enable it with --enable-expert-parallel, or pick a different "
                 "moe backend."
             )
+        self.wo_a_bf16 = (
+            deepseek_v4_wo_a_dtype(getattr(config, "text_config", config)) == "bf16"
+        )
         self.vocab_size = config.vocab_size
         self.hc_eps = config.hc_eps
         self.hc_mult = config.hc_mult
@@ -1471,6 +1478,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         ]
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        pending_wo_a: dict[str, dict[str, torch.Tensor]] = {}
 
         # Pre-compute expert mapping ONCE.
         expert_mapping = self.get_expert_mapping()
@@ -1488,6 +1496,22 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 # Vision weights are loaded by the outer multimodal wrapper.
                 logger.warning_once("Skipping non-text weight: %s", name)
                 continue
+            if (
+                self.wo_a_bf16
+                and ".attn.wo_a." in name
+                and loaded_weight.dtype != torch.bfloat16
+            ):
+                # A BF16 wo_a from an FP8 checkpoint: hold the codes and the
+                # scale until both arrived, then load their exact BF16 value.
+                head, _, leaf = name.rpartition(".")
+                parts = pending_wo_a.setdefault(head, {})
+                parts[leaf] = loaded_weight
+                if "weight" not in parts or len(parts) < 2:
+                    continue
+                del pending_wo_a[head]
+                weight = parts.pop("weight")
+                (scale,) = parts.values()
+                name, loaded_weight = f"{head}.weight", dequantize_wo_a(weight, scale)
             if ".shared_experts." in name:
                 if is_pp_missing_parameter(name, self):
                     continue
@@ -1577,6 +1601,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     loaded_params.add(name)
                     continue
 
+        if pending_wo_a:
+            raise ValueError(f"FP8 wo_a without its pair: {sorted(pending_wo_a)}")
         return loaded_params
 
     @staticmethod
