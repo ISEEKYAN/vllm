@@ -5,7 +5,7 @@
 import math
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from functools import cached_property
+from functools import cached_property, partial
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import regex as re
@@ -802,7 +802,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         )
         return qr, None, kv
 
-    @eager_break_during_capture
+    @partial(eager_break_during_capture, bi_full_break=True)
     def _prepare_and_attn_eager(
         self,
         hidden_states: torch.Tensor,
@@ -994,7 +994,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
 
         return qr_kv, kv_score, indexer_weights
 
-    @eager_break_during_capture
+    @partial(eager_break_during_capture, bi_full_break=True)
     def _sparse_indexer_and_attn(
         self,
         hidden_states: torch.Tensor,
@@ -1512,7 +1512,9 @@ class DeepseekV4Indexer(nn.Module):
         if isinstance(attn_metadata, dict):
             indexer_metadata = cast(Any, attn_metadata[self.k_cache.prefix])
             if (
-                indexer_metadata.max_seq_len // self.compress_ratio <= self.topk_tokens
+                not envs.VLLM_BATCH_INVARIANT
+                and indexer_metadata.max_seq_len // self.compress_ratio
+                <= self.topk_tokens
                 and not torch.cuda.is_current_stream_capturing()
             ):
                 # candidates num smaller than topk, every candidate is selected

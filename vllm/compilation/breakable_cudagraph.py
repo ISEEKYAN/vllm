@@ -55,6 +55,16 @@ def is_breakable_cudagraph_enabled() -> bool:
     return bool(envs.VLLM_USE_BREAKABLE_CUDAGRAPH)
 
 
+def requires_ds41_bi_full_breaks(vllm_config: VllmConfig) -> bool:
+    """DS41 BI attention reads live metadata inside eager graph segments."""
+    model = vllm_config.model_config
+    return bool(
+        envs.VLLM_BATCH_INVARIANT
+        and model is not None
+        and getattr(model.hf_config, "model_type", None) == "deepseek_v41"
+    )
+
+
 F = TypeVar("F", bound=Callable[..., Any])
 
 
@@ -64,7 +74,7 @@ def _weak_ref_capture_arg(arg: Any) -> Any:
     return weak_ref_tensor(arg)
 
 
-def eager_break_during_capture(fn: F) -> F:
+def eager_break_during_capture(fn: F, *, bi_full_break: bool = False) -> F:
     """Decorator that turns a custom-op Python kernel into a "break point"
     for the breakable cudagraph capture.
 
@@ -74,6 +84,9 @@ def eager_break_during_capture(fn: F) -> F:
     When invoked inside a capture context, it ends the current cudagraph
     segment, runs the function eagerly on the capture stream, records the
     callable for replay, and starts a fresh segment.
+
+    ``bi_full_break`` also breaks FULL capture in BI mode, for callers that
+    require live metadata. Other FULL captures keep their existing behavior.
 
     **In-place output buffer required.** Decorated ops must write into a
     caller-provided output tensor; a fresh tensor returned by ``fn`` would
@@ -107,7 +120,9 @@ def eager_break_during_capture(fn: F) -> F:
             return fn(*args, **kwargs)
         if is_forward_context_available():
             mode = get_forward_context().cudagraph_runtime_mode
-            if mode == CUDAGraphMode.FULL:
+            if mode == CUDAGraphMode.FULL and not (
+                bi_full_break and envs.VLLM_BATCH_INVARIANT
+            ):
                 return fn(*args, **kwargs)
 
         # Weak-ref args: strong refs in the replay lambda pin cudagraph-pool

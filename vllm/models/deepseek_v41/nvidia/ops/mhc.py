@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, cast
 
 import torch
 
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.distributed import get_tp_group
 from vllm.logger import init_logger
@@ -47,7 +48,8 @@ def supports_mhc_overlap(vllm_config: VllmConfig) -> bool:
     # DeepGEMM's prenorm kernel requires K % 64 == 0, N % 8 == 0, and N <= 32.
     mix_size = config.hc_mult * (config.hc_mult + 2)
     return (
-        current_platform.is_device_capability_family(100)
+        not envs.VLLM_BATCH_INVARIANT
+        and current_platform.is_device_capability_family(100)
         and is_deep_gemm_supported()
         and config.hidden_size % 64 == 0
         and 0 < mix_size <= 32

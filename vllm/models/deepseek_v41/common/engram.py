@@ -40,6 +40,7 @@ import os
 import tempfile
 import weakref
 from contextlib import ExitStack
+from functools import partial
 
 import numpy as np
 import torch
@@ -1452,6 +1453,7 @@ class EngramBatch(nn.Module):
             return None
         return cls(layers, max_tokens)
 
+    @partial(eager_break_during_capture, bi_full_break=True)
     def prepare_embeddings(self, hashes: torch.Tensor) -> None:
         """Stage every layer's WKV input before the decoder layers.
 
@@ -1461,7 +1463,7 @@ class EngramBatch(nn.Module):
         peer = self.peer_exchange is not None and slot < ENGRAM_A2A_MIN_SLOT
         self._stage(hashes if peer else gather_engram_hashes(hashes), slot, peer)
 
-    @eager_break_during_capture
+    @partial(eager_break_during_capture, bi_full_break=True)
     def _stage(self, hashes: torch.Tensor, slot: int, peer: bool) -> None:
         if slot == 0:
             return
@@ -1603,6 +1605,7 @@ class Engram(nn.Module):
             self._prefetch_stream = torch.cuda.Stream(device=self.staged_rows.device)
         self._prefetch_done = torch.cuda.Event()
 
+    @partial(eager_break_during_capture, bi_full_break=True)
     def prepare_embeddings(self, hash_ids: torch.Tensor) -> None:
         """Look up, or prefetch from host memory, rows before the decoder layers
         consume them; DP-sharded tables take the group's gathered hash IDs."""
@@ -1613,7 +1616,7 @@ class Engram(nn.Module):
         else:
             self._start_prefetch(hash_ids, rows)
 
-    @eager_break_during_capture
+    @partial(eager_break_during_capture, bi_full_break=True)
     def _start_prefetch(self, hash_ids: torch.Tensor, rows: torch.Tensor) -> None:
         # Eager boundaries let the lookup span piecewise graph segments, and
         # decide per replay (on the replay stream) whether it runs inline.
@@ -1637,7 +1640,7 @@ class Engram(nn.Module):
         assert self._prefetch_done is not None
         self._prefetch_done.record(stream)
 
-    @eager_break_during_capture
+    @partial(eager_break_during_capture, bi_full_break=True)
     def _finish_prefetch(self, event: torch.cuda.Event) -> None:
         # Wait for this layer's lookup only, not for later layers on the stream.
         torch.cuda.current_stream().wait_event(event)

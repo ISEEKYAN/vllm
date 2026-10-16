@@ -30,6 +30,7 @@ import torch
 import torch.nn as nn
 
 import vllm.envs as envs
+from vllm.compilation.breakable_cudagraph import requires_ds41_bi_full_breaks
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.compilation.wrapper import compile_model_with_stock_torch
@@ -741,6 +742,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             max_num_reqs=self.max_num_reqs,
             is_profiling=is_profiling,
             piecewise_capture_available=piecewise_capture_available,
+            allow_mode_fallback=not requires_ds41_bi_full_breaks(self.vllm_config),
         )
         self.cudagraph_manager = ModelCudaGraphManager(
             self.vllm_config,
@@ -2005,7 +2007,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kv_connector.pre_forward(
                 scheduler_output, input_batch, attn_metadata=attn_metadata
             )
-            model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
+            with self.cudagraph_manager.fullgraph_forward_context(
+                attn_metadata=attn_metadata,
+                vllm_config=self.vllm_config,
+                num_tokens=input_batch.num_tokens_after_padding,
+                cudagraph_runtime_mode=CUDAGraphMode.FULL,
+                num_tokens_across_dp=dp_sync_state
+                and dp_sync_state.num_tokens_across_dp,
+                batch_descriptor=BatchDescriptor(
+                    num_tokens=input_batch.num_tokens_after_padding,
+                    has_lora=self.lora_config is not None,
+                    num_active_loras=batch_desc.num_active_loras,
+                ),
+                slot_mapping=slot_mappings_by_layer,
+                skip_compiled=skip_compiled,
+                is_padding=input_batch.is_padding,
+            ):
+                model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
+
         else:
             # For piecewise and eager mode, just call model().
             batch_descriptor = BatchDescriptor(

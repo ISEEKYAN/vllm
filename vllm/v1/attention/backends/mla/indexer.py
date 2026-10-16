@@ -1994,7 +1994,13 @@ class DeepseekV41BIIndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder):
 
     @classmethod
     def get_cudagraph_support(cls, vllm_config, kv_cache_spec):
-        return AttentionCGSupport.NEVER
+        from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
+
+        return (
+            AttentionCGSupport.ALWAYS
+            if is_breakable_cudagraph_enabled()
+            else AttentionCGSupport.NEVER
+        )
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

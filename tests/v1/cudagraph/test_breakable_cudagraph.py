@@ -149,6 +149,50 @@ def test_decorator_passthrough_outside_capture():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("bi", [False, True])
+@pytest.mark.parametrize("full_break", [False, True])
+def test_full_eager_boundary_replays_live_metadata(monkeypatch, bi, full_break):
+    """Opted-in BI FULL breaks refresh metadata while preserving output storage."""
+    from types import SimpleNamespace
+
+    import vllm.compilation.breakable_cudagraph as graphs
+    from vllm.config import CUDAGraphMode
+
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", str(int(bi)))
+    context = SimpleNamespace(
+        cudagraph_runtime_mode=CUDAGraphMode.FULL, attn_metadata={"delta": 2}
+    )
+    recorded = []
+
+    def add_eager(fn):
+        recorded.append(fn)
+        return fn()
+
+    capture = SimpleNamespace(_capturing=True, add_eager=add_eager)
+    monkeypatch.setattr(graphs.BreakableCUDAGraphCapture, "current", lambda: capture)
+    monkeypatch.setattr(graphs, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(graphs, "get_forward_context", lambda: context)
+    monkeypatch.setattr(graphs, "_weak_ref_capture_arg", lambda arg: arg)
+
+    def operation(source, output):
+        from typing import cast
+
+        metadata = cast(dict[str, int], graphs.get_forward_context().attn_metadata)
+        output.copy_(source + metadata["delta"])
+
+    wrapped = graphs.eager_break_during_capture(operation, bi_full_break=full_break)
+    source, output = torch.ones(3), torch.empty(3)
+    pointer = output.data_ptr()
+    wrapped(source, output)
+    assert torch.equal(output, torch.full((3,), 3.0))
+    assert len(recorded) == int(bi and full_break)
+    if recorded:
+        context.attn_metadata = {"delta": 7}
+        recorded[0]()
+        assert torch.equal(output, torch.full((3,), 8.0))
+        assert output.data_ptr() == pointer
+
+
 def test_current_is_none_when_inactive():
     from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
 
@@ -677,3 +721,46 @@ def test_unwrap_recurses_through_nested_wrappers():
 
     assert inner.unwrap() is model
     assert outer.unwrap() is model
+
+
+@pytest.mark.parametrize("allow_fallback", [False, True])
+def test_requested_full_mode_can_reject_backend_downgrade(allow_fallback):
+    """Strict callers must never receive eager mode for a FULL request."""
+    from vllm.config import CompilationConfig, CompilationMode, CUDAGraphMode
+    from vllm.v1.attention.backend import AttentionCGSupport
+
+    config = CompilationConfig(
+        mode=CompilationMode.NONE, cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE
+    )
+    if allow_fallback:
+        result = config.resolve_cudagraph_mode_and_sizes(
+            AttentionCGSupport.NEVER, "unsupported", allow_mode_fallback=True
+        )
+        assert result == CUDAGraphMode.NONE
+    else:
+        with pytest.raises(ValueError, match="forbids fallback"):
+            config.resolve_cudagraph_mode_and_sizes(
+                AttentionCGSupport.NEVER, "unsupported", allow_mode_fallback=False
+            )
+        assert config.cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE
+
+
+@pytest.mark.parametrize(
+    "model_type,bi,expected",
+    [
+        ("deepseek_v41", True, True),
+        ("deepseek_v41", False, False),
+        ("deepseek_v4", True, False),
+        ("nemotron", True, False),
+    ],
+)
+def test_bi_full_breaks_are_scoped_to_ds41(monkeypatch, model_type, bi, expected):
+    from types import SimpleNamespace
+
+    from vllm.compilation.breakable_cudagraph import requires_ds41_bi_full_breaks
+
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", str(int(bi)))
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type=model_type))
+    )
+    assert requires_ds41_bi_full_breaks(config) is expected

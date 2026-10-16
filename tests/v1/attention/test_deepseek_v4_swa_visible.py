@@ -952,21 +952,24 @@ def test_ds41_flashmla_cr2_bi_builder_constructs_on_cpu(monkeypatch):
     assert builder.compressed_slot_mapping_buffer.device.type == "cpu"
 
 
-def test_ds41_flashmla_swa_bi_builder_policy(monkeypatch):
-    """CPU construction must retain BI decode routing and disable engine graphs."""
+@pytest.mark.parametrize("breakable", [False, True])
+def test_ds41_flashmla_swa_bi_builder_policy(monkeypatch, breakable):
+    """BI graph support requires the live-metadata breakable capture route."""
     from vllm.models.deepseek_v41.nvidia.flashmla import (
         DeepseekSparseSWAFlashMLAMetadataBuilder,
     )
     from vllm.v1.attention.backend import AttentionCGSupport
 
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", str(int(breakable)))
     config, swa = _ds41_swa_bi_config([12290, 65, 129])
     spec = swa.get_kv_cache_spec(config)
     builder = DeepseekSparseSWAFlashMLAMetadataBuilder(
         spec, [swa.prefix], config, torch.device("cpu")
     )
     assert builder.decode_threshold == 0
-    assert builder.get_cudagraph_support(config, spec) == AttentionCGSupport.NEVER
+    expected = AttentionCGSupport.ALWAYS if breakable else AttentionCGSupport.NEVER
+    assert builder.get_cudagraph_support(config, spec) == expected
 
 
 @pytest.mark.parametrize("major,supported", [(9, False), (10, True), (12, False)])
@@ -1047,7 +1050,6 @@ def _assert_ds41_flashmla_bi_schedule(monkeypatch, length, compress_ratio):
         DeepseekSparseSWAFlashMLAMetadataBuilder,
         DeepseekV4FlashMLAAttention,
     )
-    from vllm.v1.attention.backend import AttentionCGSupport
     from vllm.v1.worker.workspace import (
         init_workspace_manager,
         reset_workspace_manager,
@@ -1072,7 +1074,6 @@ def _assert_ds41_flashmla_bi_schedule(monkeypatch, length, compress_ratio):
         spec, [swa.prefix], config, device
     )
     assert builder.decode_threshold == 0
-    assert builder.get_cudagraph_support(config, spec) == AttentionCGSupport.NEVER
 
     pages = (max(lengths) + block_size - 1) // block_size
     tables = torch.arange(3 * pages, dtype=torch.int32, device=device).view(3, pages)
@@ -1369,3 +1370,86 @@ def test_ds41_bi_nvfp4_gather_matches_paged_record_and_graph(monkeypatch, bounde
     actual.fill_(-7.25)
     graph.replay()
     assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+
+
+@pytest.mark.parametrize("mode", ["FULL", "PIECEWISE"])
+def test_ds41_bi_flashmla_breakable_graph_replays_live_kv(monkeypatch, tmp_path, mode):
+    """FULL and PIECEWISE replay use new KV metadata with identical BF16 output."""
+    if not torch.cuda.is_available():
+        pytest.skip("SM100 FlashMLA graph arithmetic")
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("DS41 BI declaration is limited to SM100")
+    from functools import partial
+
+    from vllm.compilation.breakable_cudagraph import (
+        BreakableCUDAGraphCapture,
+        eager_break_during_capture,
+    )
+    from vllm.config import CUDAGraphMode
+    from vllm.forward_context import get_forward_context, set_forward_context
+    from vllm.v1.attention.ops.flashmla import flash_mla_sparse_fwd
+
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "1")
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    config, _ = _ds41_swa_bi_config([5])
+    graph_mode = CUDAGraphMode[mode]
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+
+    @partial(eager_break_during_capture, bi_full_break=True)
+    def attention(query, output):
+        metadata = get_forward_context().attn_metadata
+        flash_mla_sparse_fwd(
+            q=query,
+            kv=metadata["kv"],
+            indices=metadata["indices"],
+            sm_scale=512**-0.5,
+            topk_length=metadata["lengths"],
+            out=output,
+        )
+
+    with torch.cuda.stream(stream):
+        torch.manual_seed(1961)
+        source = torch.randn(5, 64, 512, device="cuda", dtype=torch.bfloat16)
+        output = torch.empty_like(source)
+        reference = torch.empty_like(source)
+        metadata_cases = [
+            {
+                "kv": torch.randn(rows, 1, 512, device="cuda", dtype=torch.bfloat16),
+                "indices": torch.arange(128, device="cuda", dtype=torch.int32)
+                .reshape(1, 1, 128)
+                .repeat(5, 1, 1),
+                "lengths": torch.full((5,), 128, device="cuda", dtype=torch.int32),
+            }
+            for rows in (128, 256, 384)
+        ]
+        with set_forward_context(
+            metadata_cases[0], config, cudagraph_runtime_mode=graph_mode
+        ):
+            attention(source, output)
+            capture = BreakableCUDAGraphCapture()
+            with capture:
+                query = source * 1
+                attention(query, output)
+                result = output * 1
+        assert capture.num_graphs >= 2 and capture.num_eager_breaks == 1
+        for metadata in metadata_cases[1:]:
+            with set_forward_context(
+                metadata, config, cudagraph_runtime_mode=graph_mode
+            ):
+                attention(source, reference)
+                capture.replay()
+                stream.synchronize()
+                assert torch.equal(result, reference)
+                torch.save(
+                    {
+                        "actual": result.detach().cpu(),
+                        "expected": reference.detach().cpu(),
+                        "mode": mode,
+                        "kv_rows": metadata["kv"].shape[0],
+                        "graph_segments": capture.num_graphs,
+                        "eager_breaks": capture.num_eager_breaks,
+                    },
+                    tmp_path / f"{mode}-kv{metadata['kv'].shape[0]}.pt",
+                )
+    torch.cuda.current_stream().wait_stream(stream)

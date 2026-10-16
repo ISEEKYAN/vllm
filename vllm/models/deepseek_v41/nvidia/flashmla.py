@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, ClassVar, cast
 import torch
 
 from vllm import envs
+from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
 from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4.nvidia.ops.o_proj import compute_fp8_einsum_recipe
 from vllm.models.deepseek_v41.attention import DeepseekV4Attention
@@ -51,7 +52,11 @@ class DeepseekSparseSWAFlashMLAMetadataBuilder(DeepseekV41SparseSWAMetadataBuild
     @classmethod
     def get_cudagraph_support(cls, vllm_config, kv_cache_spec):
         if envs.VLLM_BATCH_INVARIANT:
-            return AttentionCGSupport.NEVER
+            return (
+                AttentionCGSupport.ALWAYS
+                if is_breakable_cudagraph_enabled()
+                else AttentionCGSupport.NEVER
+            )
         return super().get_cudagraph_support(vllm_config, kv_cache_spec)
 
 
@@ -311,6 +316,17 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         combined_topk = round_up(top_k + self.window_size, 128)
         for chunk_start, chunk_end, chunk_N, chunk_M in chunk_plan:
             chunk_size = chunk_end - chunk_start
+            if envs.VLLM_BATCH_INVARIANT:
+                chunk_M = (
+                    (
+                        0
+                        if swa_only
+                        else (self.max_model_len + self.compress_ratio - 1)
+                        // self.compress_ratio
+                    )
+                    + self.window_size
+                    + self.max_num_batched_tokens
+                )
             workspace = workspace_manager.get_simultaneous(
                 ((chunk_size, chunk_M, q.shape[-1]), torch.bfloat16),
                 ((self.max_num_batched_tokens, combined_topk), torch.int32),

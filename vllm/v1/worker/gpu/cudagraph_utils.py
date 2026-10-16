@@ -4,7 +4,7 @@ import gc
 import itertools
 from collections import defaultdict
 from collections.abc import Callable, Iterable
-from contextlib import ExitStack
+from contextlib import AbstractContextManager, ExitStack, nullcontext
 from dataclasses import dataclass, replace
 from itertools import groupby, product
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
@@ -14,8 +14,10 @@ import torch.nn as nn
 from tqdm import tqdm
 
 from vllm.compilation.breakable_cudagraph import (
+    BreakableCUDAGraphCapture,
     BreakableCUDAGraphWrapper,
     is_breakable_cudagraph_enabled,
+    requires_ds41_bi_full_breaks,
 )
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphStat, CUDAGraphWrapper
@@ -172,7 +174,12 @@ class CudaGraphManager:
         # dispatch() is a plain dict lookup instead of a per-call bisect.
         self._lora_dispatch_map, self._max_lora_case = self._build_lora_dispatch_map()
 
-        self.graphs: dict[BatchExecutionDescriptor, torch.cuda.CUDAGraph] = {}
+        self.bi_full_breaks = requires_ds41_bi_full_breaks(vllm_config)
+        if self.bi_full_breaks and ubatch_runner is not None:
+            raise ValueError("DS41 BI breakable full graphs do not support ubatching")
+        self.graphs: dict[
+            BatchExecutionDescriptor, torch.cuda.CUDAGraph | BreakableCUDAGraphCapture
+        ] = {}
         self.pool = current_platform.get_global_graph_pool() if cudagraph_mode else None
 
         self._graphs_captured = False
@@ -481,25 +488,28 @@ class CudaGraphManager:
                         assert desc not in self.graphs, (
                             f"Graph already captured for {desc}"
                         )
-                        graph = torch.cuda.CUDAGraph()
                         # Sync offloader's copy stream before capture.
                         # Ensure any pre-capture prefetches from offloader are complete.
                         get_offloader().sync_prev_onload()
                         if self._capture_mem_samples is not None:
                             torch.accelerator.synchronize()
                             free_before = torch.accelerator.get_memory_info()[0]
-                        with (
-                            capture_pool(self.pool, self.vllm_config) as pool,
-                            torch.cuda.graph(
-                                graph, pool, stream=self._capture_stream(desc)
-                            ),
-                        ):
-                            forward_fn(CUDAGraphMode.NONE)
-                            # Join offloader's copy stream after forward to avoid
-                            # unjoined stream error. The last layer's start_prefetch
-                            # forks copy_stream, but wait_prefetch only happens in
-                            # the next forward pass.
-                            get_offloader().join_after_forward()
+                        with capture_pool(self.pool, self.vllm_config) as pool:
+                            if self.bi_full_breaks:
+                                graph = BreakableCUDAGraphCapture(pool=pool)
+                                with (
+                                    torch.cuda.stream(self._capture_stream(desc)),
+                                    graph,
+                                ):
+                                    forward_fn(CUDAGraphMode.FULL)
+                                    get_offloader().join_after_forward()
+                            else:
+                                graph = torch.cuda.CUDAGraph()
+                                with torch.cuda.graph(
+                                    graph, pool, stream=self._capture_stream(desc)
+                                ):
+                                    forward_fn(CUDAGraphMode.NONE)
+                                    get_offloader().join_after_forward()
                         if self._capture_mem_samples is not None:
                             torch.accelerator.synchronize()
                             free_after = torch.accelerator.get_memory_info()[0]
@@ -546,6 +556,10 @@ class CudaGraphManager:
             num_active_loras=effective_loras,
             num_ubatches=num_ubatches,
         )
+
+    def fullgraph_forward_context(self, **kwargs: Any) -> AbstractContextManager:
+        """Expose current metadata to eager segments in a breakable FULL replay."""
+        return set_forward_context(**kwargs) if self.bi_full_breaks else nullcontext()
 
     def run_fullgraph(self, desc: BatchExecutionDescriptor):
         """Replay a captured FULL cudagraph."""

@@ -24,6 +24,7 @@ import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import (
     BreakableCUDAGraphWrapper,
     is_breakable_cudagraph_enabled,
+    requires_ds41_bi_full_breaks,
 )
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphStat, CUDAGraphWrapper
@@ -5186,8 +5187,20 @@ class GPUModelRunner(
         # CudagraphWrapper and CudagraphDispatcher of vllm.
 
         # wrap the model with full cudagraph wrapper if needed.
+        bi_full_breaks = requires_ds41_bi_full_breaks(self.vllm_config)
         cudagraph_mode = self.compilation_config.cudagraph_mode
         assert cudagraph_mode is not None
+        if (
+            bi_full_breaks
+            and cudagraph_mode.has_full_cudagraphs()
+            and (
+                self.parallel_config.use_ubatching
+                or not is_breakable_cudagraph_enabled()
+            )
+        ):
+            raise ValueError(
+                "DS41 BI full graphs require breakable CUDA graphs without ubatching"
+            )
         if (
             is_breakable_cudagraph_enabled()
             and cudagraph_mode != CUDAGraphMode.NONE
@@ -5198,19 +5211,22 @@ class GPUModelRunner(
             # (drafters under a FULL target mode, or a later FULL ->
             # FULL_AND_PIECEWISE upgrade in _check_and_update_cudagraph_mode).
             self.model = BreakableCUDAGraphWrapper(
-                self.model, self.vllm_config, runtime_mode=CUDAGraphMode.PIECEWISE
+                self.model,
+                self.vllm_config,
+                runtime_mode=None if bi_full_breaks else CUDAGraphMode.PIECEWISE,
             )
             drafter = getattr(self, "drafter", None)
             if drafter is not None and hasattr(drafter, "model"):
                 drafter.model = BreakableCUDAGraphWrapper(
                     drafter.model,
                     self.vllm_config,
-                    runtime_mode=CUDAGraphMode.PIECEWISE,
+                    runtime_mode=None if bi_full_breaks else CUDAGraphMode.PIECEWISE,
                 )
 
         if (
             cudagraph_mode.has_full_cudagraphs()
             and not self.parallel_config.use_ubatching
+            and not bi_full_breaks
         ):
             self.model = CUDAGraphWrapper(
                 self.model, self.vllm_config, runtime_mode=CUDAGraphMode.FULL
@@ -6856,6 +6872,7 @@ class GPUModelRunner(
             kv_cache_config=self.kv_cache_config,
             max_num_reqs=self.max_num_reqs,
             is_profiling=is_profiling,
+            allow_mode_fallback=not requires_ds41_bi_full_breaks(self.vllm_config),
         )
         # Trigger cudagraph dispatching keys initialization after
         # resolved cudagraph mode.

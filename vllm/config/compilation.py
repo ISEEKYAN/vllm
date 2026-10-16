@@ -1383,6 +1383,7 @@ class CompilationConfig:
         max_num_reqs: int | None = None,
         is_profiling: bool = False,
         piecewise_capture_available: bool = True,
+        allow_mode_fallback: bool = True,
     ) -> CUDAGraphMode:
         from vllm.v1.attention.backend import AttentionCGSupport
 
@@ -1531,6 +1532,11 @@ class CompilationConfig:
                 "gpu_memory_utilization."
             )
 
+        if not allow_mode_fallback and cudagraph_mode != self.cudagraph_mode:
+            raise ValueError(
+                f"Requested {self.cudagraph_mode} would be downgraded to "
+                f"{cudagraph_mode}; strict CUDA graph mode forbids fallback."
+            )
         self.cudagraph_mode = cudagraph_mode
         return cudagraph_mode
 
