@@ -492,7 +492,37 @@ class DeepseekV4DecoderLayer(nn.Module):
         # for the first layer), the FFN uses this layer's attention pre-mix.
         if residual is None:
             assert isinstance(x, torch.Tensor)
-            if x.dim() == 2:
+            if self.engram is not None and engram_hashes is not None:
+                # An Engram layer that opens the local stack (model entry or a
+                # later PP stage) still injects before its pre, as the
+                # reference does for every Engram layer. The injected copies
+                # differ, so the summed broadcast projection does not apply;
+                # pre_mix=None selects copy 0 at model entry.
+                residual = (
+                    x
+                    if x.dim() == 3
+                    else x.unsqueeze(1).expand(-1, self.hc_mult, -1).contiguous()
+                )
+                residual = self.engram(
+                    residual,
+                    engram_hashes[:, self.engram.layer_hash_index],
+                    engram_mask,
+                )
+                post_mix, res_mix, x, attn_pre = mhc_pre(
+                    residual,
+                    self.hc_attn_fn,
+                    self.hc_attn_scale,
+                    self.hc_attn_base,
+                    self.rms_norm_eps,
+                    self.hc_eps,
+                    self.hc_eps,
+                    self.hc_post_alpha,
+                    self.hc_sinkhorn_iters,
+                    pre_mix=pre_mix,
+                    norm_weight=self.attn_norm.weight,
+                    norm_eps=self.attn_norm.variance_epsilon,
+                )
+            elif x.dim() == 2:
                 # First layer: the stream is the embedding broadcast to hc
                 # copies and the identity pre-mix selects copy 0.
                 assert self.hc_attn_fn_broadcast is not None
