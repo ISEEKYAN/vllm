@@ -717,8 +717,46 @@ def test_mxfp4_bi_backend_selection_limits(monkeypatch, overrides, expected):
         assert "parallel config" in reason
 
 
+def _mxfp4_ep_quant(sf1, sf2, clamp, act_group):
+    from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
+        Mxfp4MoeBackend,
+        make_mxfp4_moe_quant_config,
+    )
+    from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
+
+    if act_group == 32:
+        return make_mxfp4_moe_quant_config(
+            Mxfp4MoeBackend.DEEPGEMM_MXFP4,
+            w1_scale=sf1,
+            w2_scale=sf2,
+            swiglu_limit=clamp,
+            act_group_size=32,
+        )
+    activation = FusedMoEQuantDesc(torch.float8_e4m3fn, GroupShape(128, 128))
+    return FusedMoEQuantConfig(
+        _a1=activation,
+        _a2=activation,
+        _w1=FusedMoEQuantDesc("mxfp4", scale=sf1),
+        _w2=FusedMoEQuantDesc("mxfp4", scale=sf2),
+        gemm1_clamp_limit=clamp,
+    )
+
+
+def _mxfp4_ep_cases(device, experts, hidden, topk):
+    """Uneven, empty and idle-expert batches shared by the EP dispatch tests."""
+    for sizes, active in (([17, 5, 0, 3], experts), ([1, 0, 9, 4], 6)):
+        total = sum(sizes)
+        values = torch.randn(total, hidden, device=device, dtype=torch.bfloat16)
+        values[::3] *= 32
+        ids = torch.stack(
+            [torch.randperm(active, device=device)[:topk] for _ in range(total)]
+        ).int()
+        scores = torch.rand(total, topk, device=device)
+        yield sizes, values, ids, scores
+
+
 @torch.inference_mode()
-def _mxfp4_bi_ep_worker(group, vllm_config, cpu_group, clamp):
+def _mxfp4_bi_ep_worker(group, vllm_config, cpu_group, clamp, act_group=128):
     from dataclasses import replace
 
     from vllm.forward_context import get_forward_context, set_forward_context
@@ -732,7 +770,6 @@ def _mxfp4_bi_ep_worker(group, vllm_config, cpu_group, clamp):
     from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
         _pack_deepgemm_mxfp4_scales,
     )
-    from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
     from vllm.v1.worker.workspace import init_workspace_manager
 
     init_workspace_manager(group.device)
@@ -757,6 +794,7 @@ def _mxfp4_bi_ep_worker(group, vllm_config, cpu_group, clamp):
     )
     sharded = replace(base, num_local_experts=per_rank, moe_parallel_config=parallel)
     from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        kFp8Dynamic32Sym,
         kFp8Dynamic128Sym,
         kMxfp4Static,
     )
@@ -765,20 +803,13 @@ def _mxfp4_bi_ep_worker(group, vllm_config, cpu_group, clamp):
         DeepGemmFP4Experts,
         sharded,
         kMxfp4Static,
-        kFp8Dynamic128Sym,
+        kFp8Dynamic32Sym if act_group == 32 else kFp8Dynamic128Sym,
         mk.FusedMoEActivationFormat.Standard,
     )
     assert supported, reason
 
     def kernel(config, sf1, sf2):
-        activation = FusedMoEQuantDesc(torch.float8_e4m3fn, GroupShape(128, 128))
-        quant = FusedMoEQuantConfig(
-            _a1=activation,
-            _a2=activation,
-            _w1=FusedMoEQuantDesc("mxfp4", scale=sf1),
-            _w2=FusedMoEQuantDesc("mxfp4", scale=sf2),
-            gemm1_clamp_limit=clamp,
-        )
+        quant = _mxfp4_ep_quant(sf1, sf2, clamp, act_group)
         return mk.FusedMoEKernel(
             prepare_finalize=maybe_make_prepare_finalize(
                 config, quant, allow_new_interface=True
@@ -790,14 +821,9 @@ def _mxfp4_bi_ep_worker(group, vllm_config, cpu_group, clamp):
     distributed = kernel(sharded, *(s[owned] for s in scales))
     # Empty input ranks and an entirely idle expert rank exercise collective
     # participation independently of expert ownership and token counts.
-    for sizes, active in (([17, 5, 0, 3], experts), ([1, 0, 9, 4], 6)):
-        total = sum(sizes)
-        values = torch.randn(total, hidden, device=group.device, dtype=torch.bfloat16)
-        values[::3] *= 32
-        ids = torch.stack(
-            [torch.randperm(active, device=group.device)[:topk] for _ in range(total)]
-        ).int()
-        scores = torch.rand(total, topk, device=group.device)
+    for sizes, values, ids, scores in _mxfp4_ep_cases(
+        group.device, experts, hidden, topk
+    ):
         begin = sum(sizes[: group.rank])
         rows = slice(begin, begin + sizes[group.rank])
         kwargs = dict(
@@ -836,8 +862,9 @@ def _mxfp4_bi_ep_worker(group, vllm_config, cpu_group, clamp):
         assert torch.equal(actual, expected), (group.rank, sizes, clamp)
 
 
+@pytest.mark.parametrize("act_group", [128, 32])
 @pytest.mark.parametrize("clamp", [None, 10.0])
-def test_mxfp4_bi_ep_ag_rs_matches_unsharded(clamp):
+def test_mxfp4_bi_ep_ag_rs_matches_unsharded(clamp, act_group):
     """Real EP4 dispatch/expert/combine preserves the single-rank BF16 result."""
     from tests.kernels.moe.modular_kernel_tools.parallel_utils import (
         parallel_launch_with_config,
@@ -854,7 +881,7 @@ def test_mxfp4_bi_ep_ag_rs_matches_unsharded(clamp):
         )
     )
     parallel_launch_with_config(
-        4, _mxfp4_bi_ep_worker, config, {"VLLM_BATCH_INVARIANT": "1"}, clamp
+        4, _mxfp4_bi_ep_worker, config, {"VLLM_BATCH_INVARIANT": "1"}, clamp, act_group
     )
 
 

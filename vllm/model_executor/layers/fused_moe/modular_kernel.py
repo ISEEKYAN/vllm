@@ -106,6 +106,9 @@ class ExpertTokensMetadata:
     # local->global expert-id offset, set when globalization is deferred to the
     # experts' fused align kernel.
     rank_expert_offset: int | None = None
+    # FP32 routing weight of each received batched row [local_experts, rows],
+    # set by prepare/finalize when the experts weight rows before FC2.
+    expert_row_weights: torch.Tensor | None = None
 
     @staticmethod
     def make_from_list(
@@ -762,6 +765,12 @@ class FusedMoEExperts(ABC):
     def supports_packed_ue8m0_act_scales(self) -> bool:
         """A flag indicating whether or not this class can process packed ue8m0
         activation scales.
+        """
+        return False
+
+    def weights_rows_before_combine(self) -> bool:
+        """Whether the experts multiply each route's weight into their output
+        rows (before FC2 quantization), so the combine must add them unweighted.
         """
         return False
 

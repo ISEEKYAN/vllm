@@ -205,11 +205,14 @@ def backend_to_kernel_cls(
         return [B12xExperts]
 
     elif backend == Mxfp4MoeBackend.DEEPGEMM_MXFP4:
+        from vllm.model_executor.layers.fused_moe.experts.batched_deep_gemm_moe import (  # noqa: E501
+            BatchedDeepGemmFP4Experts,
+        )
         from vllm.model_executor.layers.fused_moe.experts.deep_gemm_moe import (
             DeepGemmFP4Experts,
         )
 
-        return [DeepGemmFP4Experts]
+        return [DeepGemmFP4Experts, BatchedDeepGemmFP4Experts]
 
     elif backend in (
         Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_BF16,

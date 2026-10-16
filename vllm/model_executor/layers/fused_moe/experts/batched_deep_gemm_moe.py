@@ -5,6 +5,7 @@
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm import envs
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -12,6 +13,10 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
     FusedMoEParallelConfig,
     FusedMoEQuantConfig,
+)
+from vllm.model_executor.layers.fused_moe.experts.deep_gemm_moe import (
+    DeepGemmFP4Experts,
+    _fp4_bi_parallel_supported,
 )
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceDelegate,
@@ -474,4 +479,137 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
             output,
             expert_num_tokens,
             expected_m,
+        )
+
+
+class BatchedDeepGemmFP4Experts(DeepGemmFP4Experts):
+    """DeepGemmFP4Experts over DeepEP low-latency batches.
+
+    Each received row ``[local_expert, slot]`` is one route, so the batch is
+    flattened into ``local_experts * capacity`` single-route tokens (padding
+    slots routed to -1) and run through the unchanged FP4 expert path: same
+    permutation, grouped GEMMs and FC2 quantization as AG/RS. Only the
+    group-32 contract is supported: each row carries its routing weight into
+    FC2 and the DeepEP combine adds the rows unweighted, in ascending slot
+    order, as the AG/RS ordered combine does.
+    """
+
+    _LOW_LATENCY_ROWS = True
+
+    def __init__(
+        self,
+        moe_config: FusedMoEConfig,
+        quant_config: FusedMoEQuantConfig,
+        max_num_tokens: int,
+        num_dispatchers: int,
+    ):
+        super().__init__(
+            moe_config=moe_config,
+            quant_config=quant_config,
+            max_num_tokens=max_num_tokens,
+            num_dispatchers=num_dispatchers,
+        )
+        if not self._official_contract:
+            raise RuntimeError("Batched MXFP4 experts require the group-32 contract")
+
+    @staticmethod
+    def activation_format() -> mk.FusedMoEActivationFormat:
+        return mk.FusedMoEActivationFormat.BatchedExperts
+
+    @staticmethod
+    def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
+        return envs.VLLM_BATCH_INVARIANT and _fp4_bi_parallel_supported(
+            moe_parallel_config, low_latency=True
+        )
+
+    def supports_packed_ue8m0_act_scales(self) -> bool:
+        # BF16 dispatch; the FC1 input is quantized after the dispatch.
+        return False
+
+    def weights_rows_before_combine(self) -> bool:
+        return True
+
+    def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
+        # The DeepEP low-latency combine applies the weights and reduces.
+        return TopKWeightAndReduceDelegate()
+
+    def _capacity(self) -> int:
+        assert self.max_num_tokens is not None and self.num_dispatchers is not None
+        return self.max_num_tokens * self.num_dispatchers
+
+    def workspace_shapes(
+        self,
+        M: int,
+        N: int,
+        K: int,
+        topk: int,
+        global_num_experts: int,
+        local_num_experts: int,
+        expert_tokens_meta: mk.ExpertTokensMetadata | None,
+        activation: MoEActivation,
+    ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+        capacity = self._capacity()
+        workspace13, workspace2, _ = super().workspace_shapes(
+            local_num_experts * capacity,
+            N,
+            K,
+            1,
+            local_num_experts,
+            local_num_experts,
+            None,
+            activation,
+        )
+        return workspace13, workspace2, (local_num_experts, capacity, K)
+
+    def apply(
+        self,
+        output: torch.Tensor,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+        expert_map: torch.Tensor | None,
+        a1q_scale: torch.Tensor | None,
+        a2_scale: torch.Tensor | None,
+        workspace13: torch.Tensor,
+        workspace2: torch.Tensor,
+        expert_tokens_meta: mk.ExpertTokensMetadata | None,
+        apply_router_weight_on_input: bool,
+    ):
+        assert expert_tokens_meta is not None
+        assert expert_tokens_meta.expert_num_tokens is not None
+        assert a1q_scale is not None
+        if apply_router_weight_on_input:
+            raise RuntimeError("Batched MXFP4 experts weight rows after FC1")
+        E, capacity, K = hidden_states.shape
+        assert w1.size(0) == E and output.shape == hidden_states.shape
+
+        # One route per received row: its local expert, or -1 past the count.
+        slots = torch.arange(capacity, device=hidden_states.device)
+        valid = slots < expert_tokens_meta.expert_num_tokens[:, None]
+        experts = torch.arange(E, device=hidden_states.device, dtype=torch.int32)
+        routes = torch.where(valid, experts[:, None], -1).view(-1, 1)
+        weights = expert_tokens_meta.expert_row_weights
+        if weights is None:
+            raise RuntimeError("The group-32 contract needs per-row weights")
+
+        super().apply(
+            output=output.view(E * capacity, K),
+            hidden_states=hidden_states.view(E * capacity, K),
+            w1=w1,
+            w2=w2,
+            topk_weights=weights.reshape(-1, 1),
+            topk_ids=routes,
+            activation=activation,
+            global_num_experts=E,
+            expert_map=None,
+            a1q_scale=a1q_scale.reshape(E * capacity, -1),
+            a2_scale=a2_scale,
+            workspace13=workspace13,
+            workspace2=workspace2,
+            expert_tokens_meta=None,
+            apply_router_weight_on_input=False,
         )

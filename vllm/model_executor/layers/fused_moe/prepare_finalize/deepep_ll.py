@@ -47,6 +47,38 @@ def dequant_fp8(
     return (expert_x_fp32 * expert_x_scales).view(expert_x_fp8.size())
 
 
+def received_row_weights(
+    handle: tuple,
+    routes: torch.Tensor,
+    weights: torch.Tensor,
+    expert_num_tokens: torch.Tensor,
+    rank: int,
+) -> torch.Tensor:
+    """FP32 routing weight of each row a low-latency dispatch delivered.
+
+    ``routes``/``weights`` are every rank's dispatched top-k ids and weights,
+    ``[num_ranks, max_tokens_per_rank, topk]``. The dispatch handle records,
+    per local expert, the source token of each received row and the row range
+    each source rank occupies (count in the low and begin in the high 32 bits).
+    Rows past ``expert_num_tokens`` get 0.
+    """
+    src_info, layout_range = handle[0], handle[1]
+    num_local_experts, capacity = src_info.shape
+    device = src_info.device
+    rows = torch.arange(capacity, device=device)
+    begin = (layout_range >> 32)[:, :, None]
+    count = (layout_range & 0xFFFFFFFF)[:, :, None]
+    owner = (rows >= begin) & (rows < begin + count)
+    src_rank = owner.to(torch.int32).argmax(dim=1)
+    src_token = src_info.long().clamp(0, routes.size(1) - 1)
+    expert = rank * num_local_experts + torch.arange(num_local_experts, device=device)
+    # Top-k ids are distinct, so exactly one slot matches each valid row.
+    hit = routes[src_rank, src_token] == expert[:, None, None]
+    row_weights = torch.where(hit, weights[src_rank, src_token], 0.0).sum(dim=-1)
+    valid = rows < expert_num_tokens[:, None]
+    return torch.where(valid, row_weights, 0.0)
+
+
 class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
     """Prepare/Finalize using DeepEP low-latency kernels."""
 
@@ -114,8 +146,19 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         # activation scales in a packed ue8m0 format during object construction
         # time. This setting is handled by post_init_setup.
         self.use_ue8m0_dispatch = False
+        # Set by post_init_setup when the experts weight rows before FC2.
+        self.weights_rows_before_combine = False
+        self.route_tables: list[tuple[torch.Tensor, torch.Tensor] | None] = [
+            None,
+            None,
+        ]
 
     def post_init_setup(self, fused_experts: mk.FusedMoEExperts):
+        self.weights_rows_before_combine = fused_experts.weights_rows_before_combine()
+        if self.weights_rows_before_combine and self.use_fp8_dispatch:
+            raise RuntimeError(
+                "Weighting rows before FC2 requires BF16 low-latency dispatch"
+            )
         if not fused_experts.supports_packed_ue8m0_act_scales():
             # Early exit.
             return
@@ -210,6 +253,7 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                 q_dtype,
                 quant_config.per_act_token_quant,
                 quant_config.block_shape,
+                eps=quant_config.a1_eps,
             )
             x = x.view((num_experts, -1, hidden_dim))
 
@@ -309,6 +353,10 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             return_recv_hook=True,
         )
         self.handles[a2a_idx] = handle
+        if self.weights_rows_before_combine:
+            self.route_tables[a2a_idx] = self._gather_routes(
+                dispatch_topk_ids, topk_weights
+            )
 
         return (
             hook,
@@ -318,7 +366,30 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                 quant_config.a1_scale,
                 a1.dtype,
                 quant_config,
+                a2a_idx,
             ),
+        )
+
+    def _gather_routes(
+        self, topk_ids: torch.Tensor, topk_weights: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Every rank's dispatched top-k ids and FP32 weights, padded to the
+        dispatch capacity so the collective has a static shape."""
+        from vllm.distributed import get_ep_group
+
+        if topk_weights.dtype != torch.float32:
+            raise RuntimeError("Row weighting requires FP32 routing weights")
+        num_tokens, topk = topk_ids.shape
+        routes = topk_ids.new_full((self.max_tokens_per_rank, topk), -1)
+        weights = topk_weights.new_zeros((self.max_tokens_per_rank, topk))
+        routes[:num_tokens] = topk_ids
+        weights[:num_tokens] = topk_weights
+        group = get_ep_group()
+        routes = group.all_gather(routes, dim=0)
+        weights = group.all_gather(weights, dim=0)
+        return (
+            routes.view(group.world_size, -1, topk),
+            weights.view(group.world_size, -1, topk),
         )
 
     def _receiver(
@@ -328,11 +399,29 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         a1_scale: torch.Tensor | None,
         a1_dtype: torch.dtype,
         quant_config: FusedMoEQuantConfig,
+        a2a_idx: int,
     ) -> mk.PrepareResultType:
         expert_x, expert_x_scale = self._do_quant(expert_x, a1_dtype, quant_config)
 
+        row_weights = None
+        if self.weights_rows_before_combine:
+            from vllm.distributed import get_ep_group
+
+            route_tables = self.route_tables[a2a_idx]
+            handle = self.handles[a2a_idx]
+            assert route_tables is not None and handle is not None
+            row_weights = received_row_weights(
+                handle,
+                *route_tables,
+                expert_num_tokens,
+                get_ep_group().rank_in_group,
+            )
+            self.route_tables[a2a_idx] = None
+
         expert_tokens_meta = mk.ExpertTokensMetadata(
-            expert_num_tokens=expert_num_tokens, expert_num_tokens_cpu=None
+            expert_num_tokens=expert_num_tokens,
+            expert_num_tokens_cpu=None,
+            expert_row_weights=row_weights,
         )
 
         return expert_x, expert_x_scale, expert_tokens_meta, None, None
@@ -385,7 +474,7 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         assert handle is not None
 
         combine_topk_weights = topk_weights
-        if apply_router_weight_on_input:
+        if apply_router_weight_on_input or self.weights_rows_before_combine:
             # weights have already been applied.
             combine_topk_weights = torch.ones_like(topk_weights)
 

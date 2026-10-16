@@ -450,17 +450,20 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
         )
 
 
-def _fp4_bi_parallel_supported(parallel: FusedMoEParallelConfig) -> bool:
+def _fp4_bi_parallel_supported(
+    parallel: FusedMoEParallelConfig, low_latency: bool = False
+) -> bool:
+    """Standard experts run unsharded or behind AG/RS; the batched experts
+    consume DeepEP low-latency dispatch, whose rows each come from one route."""
+    if low_latency:
+        dispatch_supported = parallel.use_deepep_ll_kernels
+    else:
+        dispatch_supported = parallel.ep_size == 1 or parallel.use_ag_rs_all2all_kernels
     return (
         parallel.tp_size == parallel.pcp_size == parallel.sp_size == 1
         and not parallel.enable_eplb
-        and (
-            parallel.ep_size == parallel.dp_size == 1
-            or (
-                parallel.dp_size == parallel.ep_size
-                and parallel.use_ag_rs_all2all_kernels
-            )
-        )
+        and parallel.dp_size == parallel.ep_size
+        and dispatch_supported
     )
 
 
@@ -489,9 +492,22 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
 
     # FP4 weight block size
     _WEIGHT_BLOCK_K = 32
+    # Rows already belong to local experts (DeepEP low-latency batches).
+    _LOW_LATENCY_ROWS = False
 
-    def __init__(self, moe_config: FusedMoEConfig, quant_config: FusedMoEQuantConfig):
-        super().__init__(moe_config=moe_config, quant_config=quant_config)
+    def __init__(
+        self,
+        moe_config: FusedMoEConfig,
+        quant_config: FusedMoEQuantConfig,
+        max_num_tokens: int | None = None,
+        num_dispatchers: int | None = None,
+    ):
+        super().__init__(
+            moe_config=moe_config,
+            quant_config=quant_config,
+            max_num_tokens=max_num_tokens,
+            num_dispatchers=num_dispatchers,
+        )
         assert quant_config.weight_quant_dtype == "mxfp4"
         assert not quant_config.per_act_token_quant
         assert not quant_config.per_out_ch_quant
@@ -515,9 +531,11 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
             parallel = moe_config.moe_parallel_config
             if not current_platform.is_device_capability_family(100):
                 raise RuntimeError("MXFP4 BI execution requires SM100-family GPUs")
-            if not _fp4_bi_parallel_supported(parallel):
+            if not _fp4_bi_parallel_supported(parallel, self._LOW_LATENCY_ROWS):
+                dispatch = "DeepEP low-latency" if self._LOW_LATENCY_ROWS else "AG/RS"
                 raise RuntimeError(
-                    "MXFP4 BI requires TP=PCP=SP=1 and DP=EP with AG/RS, without EPLB"
+                    f"MXFP4 BI requires TP=PCP=SP=1 and DP=EP with {dispatch}, "
+                    "without EPLB"
                 )
             if (
                 moe_config.activation != MoEActivation.SILU
@@ -800,7 +818,7 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
             topk_weights = torch.ones_like(topk_weights)
 
         if envs.VLLM_BATCH_INVARIANT:
-            if self.moe_config.ep_size > 1:
+            if self.moe_config.ep_size > 1 and not self._LOW_LATENCY_ROWS:
                 if expert_map is None:
                     raise RuntimeError("MXFP4 BI EP requires an ownership map")
                 deepgemm_ep_ordered_unpermute_and_reduce(
