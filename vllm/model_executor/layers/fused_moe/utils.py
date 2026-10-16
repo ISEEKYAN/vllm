@@ -325,6 +325,7 @@ def _fp8_quantize(
     A_scale: torch.Tensor | None,
     per_act_token: bool,
     block_shape: list[int] | None = None,
+    eps: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Perform fp8 quantization on the inputs.  If a block_shape
     is provided, the output will be blocked.
@@ -339,7 +340,9 @@ def _fp8_quantize(
         assert not per_act_token
         assert len(block_shape) == 2
         _, block_k = block_shape[0], block_shape[1]
-        A, A_scale = per_token_group_quant_fp8(A, block_k)
+        A, A_scale = per_token_group_quant_fp8(
+            A, block_k, eps=1e-10 if eps is None else eps
+        )
         assert cdiv(A.size(-1), block_k) == A_scale.size(-1)
 
     return A, A_scale
@@ -464,12 +467,19 @@ def moe_kernel_quantize_input(
     is_scale_swizzled: bool = True,
     quantization_emulation: bool = False,
     mx_alignment: int = 0,
+    eps: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    if eps is not None and (
+        quant_dtype != current_platform.fp8_dtype()
+        or block_shape is None
+        or quantization_emulation
+    ):
+        raise NotImplementedError("eps is only supported for blocked FP8 input")
     if quant_dtype == current_platform.fp8_dtype():
         if quantization_emulation:
             return _fp8_quantize_dequantize(A, A_scale)
         else:
-            return _fp8_quantize(A, A_scale, per_act_token_quant, block_shape)
+            return _fp8_quantize(A, A_scale, per_act_token_quant, block_shape, eps)
     elif quant_dtype == torch.int8:
         if quantization_emulation:
             raise NotImplementedError(

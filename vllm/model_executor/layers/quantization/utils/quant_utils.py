@@ -225,6 +225,11 @@ kNvfp4Static = QuantKey(
 kDynamic128Scale = ScaleDesc(torch.float32, False, GroupShape(1, 128))
 kFp8Dynamic128Sym = QuantKey(FP8_DTYPE, kDynamic128Scale, symmetric=True)
 
+# Per-token group-32 FP8 with FP32 (power-of-two) scales: the DeepSeek-V4.1
+# official expert activation contract on the batch-invariant DeepGEMM path.
+kDynamic32Scale = ScaleDesc(torch.float32, False, GroupShape(1, 32))
+kFp8Dynamic32Sym = QuantKey(FP8_DTYPE, kDynamic32Scale, symmetric=True)
+
 kStatic128BlockScale = ScaleDesc(torch.float32, True, GroupShape(128, 128))
 kFp8Static128BlockSym = QuantKey(FP8_DTYPE, kStatic128BlockScale, symmetric=True)
 kFp8Static128BlockE8M0Sym = QuantKey(

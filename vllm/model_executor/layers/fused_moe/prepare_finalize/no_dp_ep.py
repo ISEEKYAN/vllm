@@ -32,6 +32,7 @@ def _quantize_input(
         block_shape=quant_config.block_shape,
         is_scale_swizzled=quant_config.is_scale_swizzled,
         mx_alignment=quant_config.mx_alignment,
+        eps=quant_config.a1_eps,
     )
 
     return a1q, a1q_scale

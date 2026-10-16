@@ -47,6 +47,7 @@ from vllm.model_executor.layers.quantization.utils.ocp_mx_utils import (
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
+    kFp8Dynamic32Sym,
     kFp8Dynamic128Sym,
     kFp8StaticTensorSym,
     kMxfp4Dynamic,
@@ -449,10 +450,23 @@ def _get_priority_backends() -> list[Mxfp4MoeBackend]:
     return prioritize_humming(_AVAILABLE_BACKENDS)
 
 
-def _backend_activation_key(backend: Mxfp4MoeBackend) -> QuantKey | None:
+# DeepSeek-V4.1 official expert contract (activation group 32): FP32
+# power-of-two scales, routing weight applied before FC2 quantization, and the
+# reference 1e-4 floor on each group's absolute maximum.
+OFFICIAL_EXPERT_ACT_GROUP = 32
+OFFICIAL_EXPERT_ACT_EPS = 1e-4
+
+
+def _backend_activation_key(
+    backend: Mxfp4MoeBackend, act_group_size: int = 128
+) -> QuantKey | None:
     """Map backend to its activation key (FP8, MXFP8, or None for BF16)."""
     if backend == Mxfp4MoeBackend.DEEPGEMM_MXFP4:
-        return kFp8Dynamic128Sym
+        return (
+            kFp8Dynamic32Sym
+            if act_group_size == OFFICIAL_EXPERT_ACT_GROUP
+            else kFp8Dynamic128Sym
+        )
     if backend == Mxfp4MoeBackend.B12X_MXFP4_MXFP8:
         return kMxfp8Dynamic
     if backend in (
@@ -741,10 +755,22 @@ def select_mxfp4_moe_backend(
 
 def select_deepseek_v4_mxfp4_moe_backend(
     config: FusedMoEConfig,
+    act_group_size: int = 128,
 ) -> tuple[Mxfp4MoeBackend, type[mk.FusedMoEExperts] | None]:
     """Select the MXFP4 MoE backend with MXFP8 activation as top priority.
     Falls back through BF16 and other backends.
+
+    ``act_group_size=32`` selects the official DeepSeek-V4.1 expert contract,
+    which only the DeepGEMM MXFP4 backend implements.
     """
+    if act_group_size not in (128, OFFICIAL_EXPERT_ACT_GROUP):
+        raise ValueError(f"Unsupported expert activation group {act_group_size}")
+    if act_group_size == OFFICIAL_EXPERT_ACT_GROUP and config.moe_backend not in (
+        "deep_gemm",
+    ):
+        raise ValueError(
+            "The group-32 expert activation contract requires moe_backend=deep_gemm"
+        )
     activation_format = (
         mk.FusedMoEActivationFormat.BatchedExperts
         if config.moe_parallel_config.use_batched_activation_format
@@ -774,7 +800,7 @@ def select_deepseek_v4_mxfp4_moe_backend(
                     requested_backend,
                     config,
                     kMxfp4Static,
-                    _backend_activation_key(requested_backend),
+                    _backend_activation_key(requested_backend, act_group_size),
                     activation_format,
                 )
             except ValueError as e:
@@ -797,7 +823,7 @@ def select_deepseek_v4_mxfp4_moe_backend(
 
     # Iterate priority backends: TRTLLM MXFP8, then Triton.
     for backend in priority_backends:
-        activation_key = _backend_activation_key(backend)
+        activation_key = _backend_activation_key(backend, act_group_size)
         for k_cls in backend_to_kernel_cls(backend):
             supported, reason = k_cls.is_supported_config(
                 k_cls, config, kMxfp4Static, activation_key, activation_format
@@ -2003,8 +2029,13 @@ def make_mxfp4_moe_quant_config(
     a1_scale: torch.Tensor | None = None,
     a2_scale: torch.Tensor | None = None,
     layer: "RoutedExperts | None" = None,
+    act_group_size: int = 128,
 ) -> FusedMoEQuantConfig | None:
     """Create a FusedMoEQuantConfig for the given MXFP4 backend."""
+    if act_group_size != 128 and mxfp4_backend != Mxfp4MoeBackend.DEEPGEMM_MXFP4:
+        raise ValueError(
+            "Only the DeepGEMM MXFP4 backend supports a non-128 activation group"
+        )
     if mxfp4_backend in FLASHINFER_MOE_EP_MXFP4_BACKENDS:
         # The megakernel quantizes activations itself and owns its scales.
         return FusedMoEQuantConfig.make("nvfp4", weight_dtype="mxfp4")
@@ -2023,13 +2054,23 @@ def make_mxfp4_moe_quant_config(
             GroupShape,
         )
 
-        # DeepGEMM FP4 uses FP8 per-token-group activation quantization
-        # with block 128, matching the FP8 DeepGEMM path.
+        # DeepGEMM FP4 uses FP8 per-token-group activation quantization with
+        # FP32 power-of-two scales: group 128 by default, or group 32 under the
+        # official contract (which also floors each group's amax at 1e-4).
         _fp8_dtype = current_platform.fp8_dtype()
-        _block_shape = GroupShape(128, 128)
+        _block_shape = GroupShape(128, act_group_size)
+        _eps = (
+            OFFICIAL_EXPERT_ACT_EPS
+            if act_group_size == OFFICIAL_EXPERT_ACT_GROUP
+            else None
+        )
         return FusedMoEQuantConfig(
-            _a1=FusedMoEQuantDesc(_fp8_dtype, _block_shape, None, None, None, None),
-            _a2=FusedMoEQuantDesc(_fp8_dtype, _block_shape, None, None, None, None),
+            _a1=FusedMoEQuantDesc(
+                _fp8_dtype, _block_shape, None, None, None, None, eps=_eps
+            ),
+            _a2=FusedMoEQuantDesc(
+                _fp8_dtype, _block_shape, None, None, None, None, eps=_eps
+            ),
             _w1=FusedMoEQuantDesc("mxfp4", None, w1_scale, None, None, w1_bias),
             _w2=FusedMoEQuantDesc("mxfp4", None, w2_scale, None, None, w2_bias),
             gemm1_alpha=gemm1_alpha,
@@ -2137,6 +2178,7 @@ _MXFP4_SCHEME_CANDIDATES: list[tuple[QuantKey, QuantKey | None]] = [
     (kMxfp4Static, kMxfp4Dynamic),
     (kMxfp4Static, kMxfp8Dynamic),
     (kMxfp4Static, kFp8Dynamic128Sym),
+    (kMxfp4Static, kFp8Dynamic32Sym),
     (kMxfp4Static, kFp8StaticTensorSym),
     (kMxfp4Static, None),
 ]

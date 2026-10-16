@@ -195,8 +195,15 @@ def fused_silu_mul_per_token_group_quant_fp8(
     output_q: torch.Tensor | None = None,
     group_size: int = 128,
     fuse_silu_and_mul: bool = True,
+    eps: float = 1e-10,
+    row_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run the batch-invariant fused SiLU*up and per-token FP8 quant kernel."""
+    """Run the batch-invariant fused SiLU*up and per-token FP8 quant kernel.
+
+    ``eps`` floors each group's absolute maximum. ``row_scale`` (FP32, one per
+    input row, fused SiLU*up only) multiplies the FP32 product before its single
+    BF16 rounding, e.g. the MoE routing weight applied ahead of FC2 quantization.
+    """
     require_batch_invariant_kernel()
     if round_scale is None:
         round_scale = use_ue8m0
@@ -210,6 +217,15 @@ def fused_silu_mul_per_token_group_quant_fp8(
         )
     if not input.is_contiguous() or input.dtype != torch.bfloat16:
         raise ValueError("batch-invariant activation input must be contiguous BF16")
+    if row_scale is not None:
+        if not fuse_silu_and_mul:
+            raise ValueError("row_scale requires fuse_silu_and_mul")
+        if (
+            row_scale.dtype != torch.float32
+            or not row_scale.is_contiguous()
+            or row_scale.numel() != input.numel() // input.shape[-1]
+        ):
+            raise ValueError("row_scale must be contiguous FP32 with one value per row")
 
     hidden = input.shape[-1] // input_factor
     groups = hidden // group_size
@@ -253,7 +269,7 @@ def fused_silu_mul_per_token_group_quant_fp8(
         output_q,
         output_s,
         group_size,
-        1e-10,
+        eps,
         -448.0,
         448.0,
         0.0 if clamp_limit is None else float(clamp_limit),
@@ -261,6 +277,8 @@ def fused_silu_mul_per_token_group_quant_fp8(
         use_ue8m0,
         fuse_silu_and_mul,
         masked_m,
+        # Unweighted calls keep the pre-row_scale 12-argument schema.
+        *(() if row_scale is None else (row_scale,)),
     )
     return output_q, output_s
 

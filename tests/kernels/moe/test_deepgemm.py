@@ -998,3 +998,136 @@ def test_deepgemm_fp4_vs_triton(
             f"DeepGEMM FP4 path was not executed during the test. "
             f"Call counter: {call_counter['cnt']}"
         )
+
+
+def test_permuted_route_weights_skips_padding_and_remote_routes():
+    from vllm.model_executor.layers.fused_moe.experts.deep_gemm_moe import (
+        permuted_route_weights,
+    )
+
+    inv_perm = torch.tensor([[3, -1], [0, 5]], dtype=torch.int32)
+    scores = torch.tensor([[0.25, 0.5], [0.125, 2.0]])
+    weights = permuted_route_weights(inv_perm, scores, 8)
+    assert weights.dtype == torch.float32
+    assert weights.tolist() == [0.125, 0, 0, 0.25, 0, 2.0, 0, 0]
+
+
+def test_mxfp4_official_contract_quant_config_and_selection():
+    from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
+        Mxfp4MoeBackend,
+        make_mxfp4_moe_quant_config,
+        select_deepseek_v4_mxfp4_moe_backend,
+    )
+
+    quant = make_mxfp4_moe_quant_config(
+        Mxfp4MoeBackend.DEEPGEMM_MXFP4,
+        w1_scale=torch.empty(0),
+        w2_scale=torch.empty(0),
+        act_group_size=32,
+    )
+    assert quant.block_shape == [128, 32]
+    assert quant.a1_eps == 1e-4 and quant._a2.eps == 1e-4
+    legacy = make_mxfp4_moe_quant_config(
+        Mxfp4MoeBackend.DEEPGEMM_MXFP4, w1_scale=torch.empty(0), w2_scale=torch.empty(0)
+    )
+    assert legacy.block_shape == [128, 128] and legacy.a1_eps is None
+    with pytest.raises(ValueError, match="DeepGEMM"):
+        make_mxfp4_moe_quant_config(
+            Mxfp4MoeBackend.TRITON,
+            w1_scale=torch.empty(0),
+            w2_scale=torch.empty(0),
+            act_group_size=32,
+        )
+    config = make_dummy_moe_config(hidden_dim=256, intermediate_size=256)
+    with pytest.raises(ValueError, match="moe_backend=deep_gemm"):
+        select_deepseek_v4_mxfp4_moe_backend(config, act_group_size=32)
+    with pytest.raises(ValueError, match="activation group"):
+        select_deepseek_v4_mxfp4_moe_backend(config, act_group_size=64)
+
+
+def _official_fp4_kernel(config, w1_s, w2_s, group, clamp):
+    from vllm.model_executor.layers.fused_moe.experts.deep_gemm_moe import (
+        DeepGemmFP4Experts,
+    )
+    from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
+        Mxfp4MoeBackend,
+        make_mxfp4_moe_quant_config,
+    )
+
+    quant = make_mxfp4_moe_quant_config(
+        Mxfp4MoeBackend.DEEPGEMM_MXFP4,
+        w1_scale=w1_s,
+        w2_scale=w2_s,
+        swiglu_limit=clamp,
+        act_group_size=group,
+    )
+    return mk.FusedMoEKernel(
+        prepare_finalize=maybe_make_prepare_finalize(
+            config, quant, allow_new_interface=True
+        ),
+        fused_experts=DeepGemmFP4Experts(config, quant),
+    )
+
+
+@pytest.mark.skipif(not is_deep_gemm_supported(), reason="Requires deep_gemm kernels")
+@torch.inference_mode()
+def test_mxfp4_official_contract_weights_before_fc2_quant(monkeypatch):
+    """Group-32 contract: routing weight scales the FC2 input, combine adds."""
+    from vllm.model_executor.determinism.batch_invariant import (
+        enable_batch_invariant_mode,
+    )
+    from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
+        _pack_deepgemm_mxfp4_scales,
+    )
+    from vllm.v1.worker.workspace import init_workspace_manager
+
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    init_workspace_manager(torch.device("cuda"))
+    enable_batch_invariant_mode()
+    torch.manual_seed(2031)
+    experts, intermediate, hidden, topk, tokens = 8, 2304, 5120, 6, 67
+    w1, w2, s1, s2, w1_bf16, w2_bf16 = make_mxfp4_weights(experts, intermediate, hidden)
+    config = make_dummy_moe_config(
+        num_experts=experts,
+        experts_per_token=topk,
+        hidden_dim=hidden,
+        intermediate_size=intermediate,
+    )
+    sf1, sf2 = _pack_deepgemm_mxfp4_scales(w1, w2, s1, s2)
+    kernel = _official_fp4_kernel(config, sf1, sf2, 32, 10.0)
+    x = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16)
+    ids = torch.stack(
+        [torch.randperm(experts, device="cuda")[:topk] for _ in range(tokens)]
+    ).int()
+    scores = torch.rand(tokens, topk, device="cuda") + 0.05
+
+    def run(values, weights, routes):
+        return kernel.apply(
+            hidden_states=values,
+            w1=w1,
+            w2=w2,
+            topk_weights=weights,
+            topk_ids=routes,
+            global_num_experts=experts,
+            activation=MoEActivation.SILU,
+            apply_router_weight_on_input=False,
+            expert_map=None,
+        ).clone()
+
+    out = run(x, scores, ids)
+    # A power-of-two weight only moves each FC2 group's UE8M0 scale, so the
+    # FC2 codes, the FP32 GEMM and the BF16 rounding all scale exactly.
+    assert torch.equal(run(x, scores * 2, ids), out * 2)
+    # Batch invariance: a prefix of the batch reproduces its rows bit for bit.
+    assert torch.equal(run(x[:5], scores[:5], ids[:5]), out[:5])
+
+    # Reference inference semantics on the unquantized weights.
+    ref = torch.zeros(tokens, hidden, device="cuda")
+    for t in range(tokens):
+        for k in range(topk):
+            e = ids[t, k].item()
+            gate, up = (x[t].float() @ w1_bf16[e].float().T).chunk(2)
+            gate, up = gate.clamp(max=10.0), up.clamp(-10.0, 10.0)
+            act = (scores[t, k] * torch.nn.functional.silu(gate) * up).bfloat16()
+            ref[t] += act.float() @ w2_bf16[e].float().T
+    assert calc_diff(out, ref.bfloat16()) < 0.05

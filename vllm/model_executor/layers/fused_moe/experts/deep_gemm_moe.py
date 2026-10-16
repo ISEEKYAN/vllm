@@ -34,6 +34,7 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
+    kFp8Dynamic32Sym,
     kFp8Dynamic128Sym,
     kFp8Static128BlockSym,
     kMxfp4Static,
@@ -463,6 +464,21 @@ def _fp4_bi_parallel_supported(parallel: FusedMoEParallelConfig) -> bool:
     )
 
 
+def permuted_route_weights(
+    inv_perm: torch.Tensor, topk_weights: torch.Tensor, num_rows: int
+) -> torch.Tensor:
+    """FP32 routing weight of each permuted row; padding and remote routes get 0.
+
+    ``inv_perm[t, k]`` is the permuted row of token ``t``'s ``k``-th route, or
+    -1 when another rank owns the expert.
+    """
+    rows = inv_perm.flatten().long()
+    rows = torch.where(rows >= 0, rows, num_rows)
+    weights = torch.zeros(num_rows + 1, dtype=torch.float32, device=rows.device)
+    weights.scatter_(0, rows, topk_weights.flatten().float())
+    return weights[:num_rows]
+
+
 class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
     """DeepGemm-based fused MoE expert implementation for FP4 weights.
 
@@ -471,9 +487,6 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
     GPUs (SM100 datacenter or SM120 consumer).
     """
 
-    # FP8 activation block size (hardcoded since mxfp4_w4a8 quant config
-    # does not set a block_shape on the activation descriptor).
-    _ACT_BLOCK_K = 128
     # FP4 weight block size
     _WEIGHT_BLOCK_K = 32
 
@@ -484,6 +497,19 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
         assert not quant_config.per_out_ch_quant
 
         self.gemm1_clamp_limit = quant_config.gemm1_clamp_limit
+        # FP8 activation group: 128 by default; 32 is the official DeepSeek-V4.1
+        # expert contract, which also applies the routing weight to SwiGLU
+        # before FC2 quantization and floors each group's amax.
+        block_shape = quant_config.block_shape
+        self._act_block_k = 128 if block_shape is None else block_shape[1]
+        if self._act_block_k not in (32, 128):
+            raise ValueError(f"Unsupported FP4 activation group {self._act_block_k}")
+        self._official_contract = self._act_block_k == 32
+        self._act_eps = quant_config.a1_eps
+        if self._official_contract and not envs.VLLM_BATCH_INVARIANT:
+            raise RuntimeError(
+                "The group-32 expert contract requires VLLM_BATCH_INVARIANT=1"
+            )
 
         if envs.VLLM_BATCH_INVARIANT:
             parallel = moe_config.moe_parallel_config
@@ -508,7 +534,7 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
             if DeepGemmQuantScaleFMT.from_oracle() != DeepGemmQuantScaleFMT.UE8M0:
                 raise RuntimeError("MXFP4 BI execution requires UE8M0 scales")
             if any(
-                dim % self._ACT_BLOCK_K
+                dim % 128
                 for dim in (moe_config.hidden_dim, moe_config.intermediate_size)
             ):
                 raise RuntimeError("MXFP4 BI K dimensions must be divisible by 128")
@@ -545,6 +571,7 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
     ) -> bool:
         SUPPORTED_W_A = [
             (kMxfp4Static, kFp8Dynamic128Sym),
+            (kMxfp4Static, kFp8Dynamic32Sym),
         ]
         return (weight_key, activation_key) in SUPPORTED_W_A
 
@@ -604,10 +631,18 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
         return (workspace1, workspace2, output)
 
     def _act_mul_quant(
-        self, input: torch.Tensor, output: torch.Tensor, activation: MoEActivation
+        self,
+        input: torch.Tensor,
+        output: torch.Tensor,
+        activation: MoEActivation,
+        row_scale: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        block_k = self._ACT_BLOCK_K
+        block_k = self._act_block_k
         scale_fmt = DeepGemmQuantScaleFMT.from_oracle()
+        if row_scale is not None and (
+            activation != MoEActivation.SILU or scale_fmt != DeepGemmQuantScaleFMT.UE8M0
+        ):
+            raise RuntimeError("Routing-weighted FC2 quantization requires UE8M0 SiLU")
 
         M_sum, N = input.size()
         activation_out_dim = self.adjust_N_for_activation(N, activation)
@@ -620,6 +655,8 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
                     output_q=output,
                     group_size=block_k,
                     clamp_limit=self.gemm1_clamp_limit,
+                    row_scale=row_scale,
+                    eps=self._act_eps,
                 )
             use_ue8m0 = scale_fmt == DeepGemmQuantScaleFMT.FLOAT32_CEIL_UE8M0
             return silu_mul_per_token_group_quant_fp8_colmajor(
@@ -627,6 +664,7 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
                 output=output,
                 use_ue8m0=use_ue8m0,
                 clamp_limit=self.gemm1_clamp_limit,
+                group_size=block_k,
             )
 
         # General gated activations (SWIGLUSTEP, SITU): apply the activation
@@ -707,8 +745,16 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
             expert_map=expert_map,
             expert_tokens_meta=expert_tokens_meta,
             aq_out=a1q_perm,
+            block_size=self._act_block_k,
         )
         assert a1q.size(0) == M_sum
+
+        # Official contract: weight each permuted row's SwiGLU by its routing
+        # weight before FC2 quantization; the combine then adds unweighted.
+        row_scale = None
+        if self._official_contract:
+            row_scale = permuted_route_weights(inv_perm, topk_weights, M_sum)
+            topk_weights = torch.ones_like(topk_weights)
 
         # Cap DG's BLOCK_M heuristic at the workspace's per-expert alignment;
         # see DeepGemmExperts.apply for rationale.
@@ -723,7 +769,7 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
                 (w1.view(torch.int8), self.w1_scale),
                 mm1_out,
                 expert_ids,
-                recipe_a=(1, self._ACT_BLOCK_K),
+                recipe_a=(1, self._act_block_k),
                 recipe_b=(1, self._WEIGHT_BLOCK_K),
             )
 
@@ -733,7 +779,10 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
                 workspace13.view(dtype=torch.float8_e4m3fn), (M_sum, activation_out_dim)
             )
             a2q, a2q_scale = self._act_mul_quant(
-                input=mm1_out.view(-1, N), output=quant_out, activation=activation
+                input=mm1_out.view(-1, N),
+                output=quant_out,
+                activation=activation,
+                row_scale=row_scale,
             )
 
             # FC2: FP8 activations x FP4 weights
@@ -743,7 +792,7 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
                 (w2.view(torch.int8), self.w2_scale),
                 mm2_out,
                 expert_ids,
-                recipe_a=(1, self._ACT_BLOCK_K),
+                recipe_a=(1, self._act_block_k),
                 recipe_b=(1, self._WEIGHT_BLOCK_K),
             )
 
