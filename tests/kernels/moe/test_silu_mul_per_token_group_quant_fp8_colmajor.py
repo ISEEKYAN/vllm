@@ -278,3 +278,104 @@ def test_bi_quant_large_numel_matches_row_chunks(rows, packed, monkeypatch):
             output[start : start + 4096].view(torch.uint8), expected.view(torch.uint8)
         )
         assert torch.equal(scales[start : start + 4096], expected_scales)
+
+
+def _ceil_pow2(x: torch.Tensor) -> torch.Tensor:
+    return torch.exp2(torch.ceil(torch.log2(x)))
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA native quantization")
+@pytest.mark.parametrize("group_size", [32, 128])
+def test_bi_quant_row_scale_and_eps_follow_reference(group_size, monkeypatch):
+    """Routing weight before the BF16 rounding, then a floored UE8M0 group scale."""
+    from vllm.model_executor.kernels.batch_invariant import (
+        fused_silu_mul_per_token_group_quant_fp8,
+    )
+
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    set_random_seed(7)
+    rows, hidden, limit, eps = 96, 512, 10.0, 1e-4
+    x = torch.randn(rows, 2 * hidden, dtype=torch.bfloat16, device="cuda") * 4
+    x[3] = 0  # every group of this row is below the floor
+    x[4, :hidden] = 1e-3
+    x[4, hidden:] = 1e-3
+    weights = torch.rand(rows, device="cuda") + 0.01
+
+    def quant(row_scale, eps=eps):
+        return fused_silu_mul_per_token_group_quant_fp8(
+            x,
+            use_ue8m0=False,
+            round_scale=True,
+            clamp_limit=limit,
+            masked_m=None,
+            group_size=group_size,
+            eps=eps,
+            row_scale=row_scale,
+        )
+
+    codes, scales = quant(weights)
+    gate, up = x.float().chunk(2, dim=-1)
+    gate, up = gate.clamp(max=limit), up.clamp(-limit, limit)
+    hidden_bf16 = (weights[:, None] * torch.nn.functional.silu(gate) * up).bfloat16()
+    groups = hidden_bf16.float().unflatten(-1, (-1, group_size))
+    amax = groups.abs().amax(-1).clamp(min=eps)
+    ref_scales = _ceil_pow2(amax / 448.0)
+    # silu differs from torch by at most one BF16 ulp on rare elements, which
+    # can flip a group's power-of-two scale or a code; require near equality.
+    assert (scales == ref_scales).float().mean() > 0.995
+    assert torch.equal(
+        scales[3],
+        torch.full_like(scales[3], _ceil_pow2(torch.tensor(eps / 448.0)).item()),
+    )
+    ref_codes = (groups / ref_scales[..., None]).flatten(-2).to(FLOAT8_DTYPE)
+    same = codes.view(torch.uint8) == ref_codes.view(torch.uint8)
+    assert same.float().mean() > 0.995
+
+    # Power-of-two weights only shift the group exponents: identical codes.
+    pow2 = torch.exp2(torch.randint(-3, 4, (rows,), device="cuda").float())
+    unweighted_codes, unweighted_scales = quant(torch.ones_like(weights))
+    pow2_codes, pow2_scales = quant(pow2)
+    live = torch.ones(rows, dtype=torch.bool, device="cuda")
+    live[3] = live[4] = False  # floored groups do not scale with the weight
+    assert torch.equal(
+        pow2_codes[live].view(torch.uint8), unweighted_codes[live].view(torch.uint8)
+    )
+    assert torch.equal(pow2_scales[live], unweighted_scales[live] * pow2[live, None])
+
+    # Unit row_scale is the unweighted kernel; the default floor is the legacy one.
+    plain_codes, plain_scales = quant(None, eps=1e-10)
+    legacy_codes, legacy_scales = fused_silu_mul_per_token_group_quant_fp8(
+        x,
+        use_ue8m0=False,
+        round_scale=True,
+        clamp_limit=limit,
+        masked_m=None,
+        group_size=group_size,
+    )
+    assert torch.equal(plain_codes.view(torch.uint8), legacy_codes.view(torch.uint8))
+    assert torch.equal(plain_scales, legacy_scales)
+    assert torch.equal(
+        unweighted_codes[live].view(torch.uint8), plain_codes[live].view(torch.uint8)
+    )
+    assert not torch.equal(unweighted_scales[3], plain_scales[3])
+
+
+def test_bi_quant_row_scale_requires_fp32_rows(monkeypatch):
+    from vllm.model_executor.kernels import batch_invariant
+
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    monkeypatch.setattr(batch_invariant, "require_batch_invariant_kernel", lambda: None)
+    x = torch.zeros(4, 256, dtype=torch.bfloat16)
+    for bad in (torch.ones(3), torch.ones(4, dtype=torch.bfloat16)):
+        with pytest.raises(ValueError, match="row_scale"):
+            batch_invariant.fused_silu_mul_per_token_group_quant_fp8(
+                x, use_ue8m0=True, masked_m=None, row_scale=bad
+            )
+    with pytest.raises(ValueError, match="row_scale requires"):
+        batch_invariant.fused_silu_mul_per_token_group_quant_fp8(
+            x,
+            use_ue8m0=True,
+            masked_m=None,
+            fuse_silu_and_mul=False,
+            row_scale=torch.ones(4),
+        )

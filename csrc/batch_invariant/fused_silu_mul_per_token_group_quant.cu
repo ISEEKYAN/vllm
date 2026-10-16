@@ -223,7 +223,6 @@ __device__ __forceinline__ int64_t compute_input_group_start_offset(
          static_cast<int64_t>(hidden_dim_group_idx) * group_size;
 }
 
-constexpr float LOCAL_ABSMAX_ABS = 1e-10;
 constexpr uint32_t INPUT_PRIMARY_VEC_NUM_BYTES = 32;
 
 struct NaiveScheduler {
@@ -349,7 +348,8 @@ __global__ void per_token_group_quant_8bit_kernel(
     // TODO can this be removed?
     const int64_t scale_expert_stride, const int64_t scale_hidden_stride,
     const int num_tokens_per_expert, const float max_8bit,
-    const float clamp_limit) {
+    const float clamp_limit, const float absmax_floor,
+    const float* __restrict__ row_scale) {
   using dst_dtype_info = DtypeInfo<DST_DTYPE>;
   using scale_element_t = std::conditional_t<SCALE_UE8M0, uint8_t, float>;
   static_assert(sizeof(scale_packed_t) % sizeof(scale_element_t) == 0);
@@ -434,7 +434,17 @@ __global__ void per_token_group_quant_8bit_kernel(
           }
         }
 
-        float local_absmax = LOCAL_ABSMAX_ABS;
+        float local_absmax = absmax_floor;
+        // Optional per-row FP32 multiplier applied to silu(gate)*up before the
+        // single low-precision rounding (e.g. the MoE routing weight).
+        float row_multiplier = 1.0f;
+        if constexpr (FUSE_SILU_AND_MUL) {
+          if (row_scale != nullptr) {
+            row_multiplier =
+                row_scale[int64_t(expert_idx) * num_tokens_per_expert +
+                          token_idx];
+          }
+        }
 
 #pragma unroll
         for (uint32_t j = 0; j < INPUT_PRIMARY_VEC_SIZE; ++j) {
@@ -452,7 +462,11 @@ __global__ void per_token_group_quant_8bit_kernel(
             // Keep the same single visible low-precision boundary as the
             // contiguous activation path.  Rounding SiLU before multiplying
             // changes the second MoE GEMM's FP8 inputs.
-            T val_lowprec = static_cast<T>(silu(gate) * up);
+            float product = silu(gate) * up;
+            if (row_scale != nullptr) {
+              product = product * row_multiplier;
+            }
+            T val_lowprec = static_cast<T>(product);
             val = static_cast<float>(val_lowprec);
             input_primary_vec[j] = val_lowprec;
           } else {
@@ -555,12 +569,26 @@ void fused_silu_mul_per_token_group_quant(
     torch::Tensor input, torch::Tensor output_q, torch::Tensor output_s,
     int64_t group_size, double eps, double min_8bit, double max_8bit,
     double clamp_limit, bool round_scale, bool scale_ue8m0,
-    bool fuse_silu_and_mul, const std::optional<torch::Tensor>& masked_m) {
+    bool fuse_silu_and_mul, const std::optional<torch::Tensor>& masked_m,
+    const std::optional<torch::Tensor>& row_scale) {
   CHECK_INPUT(input);
   CHECK_INPUT(output_q);
   TORCH_CHECK(input.numel() > 0);
 
-  TORCH_CHECK(std::abs(LOCAL_ABSMAX_ABS - eps) < 1e-13);
+  // eps is the floor of each group's absolute maximum.
+  TORCH_CHECK(std::isfinite(eps) && eps > 0.0,
+              "eps must be finite and positive");
+  if (row_scale.has_value()) {
+    TORCH_CHECK(fuse_silu_and_mul, "row_scale requires fuse_silu_and_mul");
+    const torch::Tensor& weights = row_scale.value();
+    CHECK_INPUT(weights);
+    TORCH_CHECK(weights.device() == input.device(),
+                "row_scale must be on the input device");
+    TORCH_CHECK(row_scale->scalar_type() == at::ScalarType::Float,
+                "row_scale must be float32");
+    TORCH_CHECK(row_scale->numel() == input.numel() / input.size(-1),
+                "row_scale must hold one value per input row");
+  }
 
   CHECK_EQ(input.numel() % group_size, 0);
   const int64_t num_groups =
@@ -624,7 +652,9 @@ void fused_silu_mul_per_token_group_quant(
                                                    : 0),                     \
         subwarps_per_block, hidden_dim_num_groups, scale_expert_stride,      \
         scale_hidden_stride, num_tokens_per_expert,                          \
-        static_cast<float>(max_8bit), static_cast<float>(clamp_limit)));     \
+        static_cast<float>(max_8bit), static_cast<float>(clamp_limit),       \
+        static_cast<float>(eps),                                             \
+        row_scale.has_value() ? row_scale->data_ptr<float>() : nullptr));    \
   } while (0)
 
 #define LAUNCH_KERNEL(GROUP_SIZE, T, DST_DTYPE)                                \

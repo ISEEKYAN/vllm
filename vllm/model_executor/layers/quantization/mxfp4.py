@@ -522,6 +522,21 @@ def _use_k3_situ_int4_gfx942(moe: FusedMoEConfig) -> bool:
     )
 
 
+def _expert_activation_group_size() -> int:
+    """Routed-expert activation group from ``expert_activation_group_size``.
+
+    DeepSeek-V4.1 checkpoints default to 128; 32 selects the official expert
+    contract (see ``select_deepseek_v4_mxfp4_moe_backend``).
+    """
+    from vllm.config import get_current_vllm_config
+
+    vllm_config = get_current_vllm_config()
+    if vllm_config is None or vllm_config.model_config is None:
+        return 128
+    hf_config = vllm_config.model_config.hf_text_config
+    return int(getattr(hf_config, "expert_activation_group_size", 128))
+
+
 def _moe_weight_override_is_int4() -> bool:
     """True when --quantization-config.moe.weight int4_per_group_32 was set."""
     from vllm.config import get_current_vllm_config
@@ -555,6 +570,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.is_k3_situ_aiter = _use_k3_situ_aiter(moe)
         self.is_k3_situ_int4_gfx942 = _use_k3_situ_int4_gfx942(moe)
         self.experts_cls: type[mk.FusedMoEExperts] | None
+        self.expert_act_group_size = 128
         if self.is_k3_situ_aiter or self.is_k3_situ_int4_gfx942:
             self.mxfp4_backend = Mxfp4MoeBackend.AITER_MXFP4_BF16
             self.experts_cls = backend_to_kernel_cls(self.mxfp4_backend)[0]
@@ -575,8 +591,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 # TODO: Remove once AITER takes this as a kernel argument.
                 os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"
         else:
+            self.expert_act_group_size = _expert_activation_group_size()
             self.mxfp4_backend, self.experts_cls = select_deepseek_v4_mxfp4_moe_backend(
-                moe
+                moe, self.expert_act_group_size
             )
 
         self.max_capture_size = moe.max_capture_size
@@ -1084,6 +1101,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w2_bias=w2_bias,
             swiglu_limit=swiglu_limit,
             layer=layer,
+            act_group_size=self.expert_act_group_size,
         )
 
     def apply(

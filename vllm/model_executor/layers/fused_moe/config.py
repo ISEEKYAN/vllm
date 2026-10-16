@@ -206,6 +206,10 @@ class FusedMoEQuantDesc:
     # Biases for GPT triton MoE
     bias: torch.Tensor | None = None
 
+    # Floor of each dynamic quantization group's absolute maximum; None keeps
+    # the kernel default.
+    eps: float | None = None
+
 
 # TODO(bnell): have subclasses for specific moe methods?
 # e.g. for specific arguments bias, precision, etc.
@@ -312,6 +316,10 @@ class FusedMoEQuantConfig:
     @property
     def is_block_quantized(self) -> bool:
         return self.block_shape is not None
+
+    @property
+    def a1_eps(self) -> float | None:
+        return self._a1.eps
 
     @property
     def a1_scale(self) -> torch.Tensor | None:

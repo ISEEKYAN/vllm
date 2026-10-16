@@ -269,8 +269,14 @@ def silu_mul_quant_fp8_packed_triton(
     *,
     expert_ends: torch.Tensor | None = None,
     expert_alignment: int = 0,
+    row_scale: torch.Tensor | None = None,
+    eps: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fuse activation and FP8 quantization, optionally skipping expert padding.
+
+    ``row_scale`` (one FP32 value per row) multiplies SiLU*up before the single
+    BF16 rounding and ``eps`` floors each group's absolute maximum; both are
+    batch-invariant-kernel features only.
 
     ``expert_ends`` uses DeepGEMM's prefix-sum layout: each entry is the
     exclusive end of an expert's live rows, including earlier alignment gaps.
@@ -293,6 +299,12 @@ def silu_mul_quant_fp8_packed_triton(
             use_ue8m0=True,
             clamp_limit=clamp_limit,
             masked_m=None,
+            row_scale=row_scale,
+            eps=1e-10 if eps is None else eps,
+        )
+    if row_scale is not None or eps is not None:
+        raise NotImplementedError(
+            "row_scale and eps require the batch-invariant quantization kernel"
         )
 
     assert input.dim() == 2
