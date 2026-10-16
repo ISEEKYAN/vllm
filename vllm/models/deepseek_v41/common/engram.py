@@ -224,6 +224,12 @@ class EngramLayout:
         self.compressed_vocab_size: int = config.engram_compressed_vocab_size
         self.pad_token_id: int = config.engram_pad_token_id
         assert len(self.layer_ids) == len(self.num_embeddings)
+        # Layer ids that seed each table's hash multipliers. A model built from
+        # a subset of release layers renumbers them but keeps the release hash.
+        self.hash_layer_ids: tuple[int, ...] = tuple(
+            getattr(config, "engram_hash_layer_ids", None) or self.layer_ids
+        )
+        assert len(self.hash_layer_ids) == len(self.layer_ids)
 
         primes = []
         seen: set[int] = set()
@@ -462,7 +468,7 @@ class NgramHashState(nn.Module):
             )
         self.pad_id = token_map[layout.pad_token_id]
         multipliers = compute_hash_multipliers(
-            layout.layer_ids, layout.max_ngram_size, vocab_size
+            layout.hash_layer_ids, layout.max_ngram_size, vocab_size
         )
         self.register_buffer(
             "token_map", torch.tensor(token_map, dtype=torch.int32), persistent=False
