@@ -13,6 +13,7 @@ import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.kernel import MEGA_MOE_BACKENDS, NATIVE_MEGA_MOE_BACKENDS
 from vllm.distributed import (
+    get_dp_group,
     get_engram_dp_size,
     get_pcp_group,
     get_pp_group,
@@ -978,6 +979,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         self.engram_dp_shared_memory = bool(
             vllm_config.engram_config and vllm_config.engram_config.dp_shared_memory
         )
+        # Per-rank row tables gather the DP group's hashes inside the lookup.
+        self.engram_per_rank = bool(
+            vllm_config.engram_config
+            and vllm_config.engram_config.host_table_layout == "per_rank"
+        )
         self.engram_swa_prefix: str | None = None
         if self.engram_layout is not None:
             local_engram = any(
@@ -1106,7 +1112,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     swa_metadata.slot_mapping,
                     swa_metadata.block_table,
                 )
-            elif not self.engram_dp_shared_memory and get_engram_dp_size() > 1:
+            elif (
+                not self.engram_per_rank
+                and not self.engram_dp_shared_memory
+                and get_engram_dp_size() > 1
+            ) or (self.engram_per_rank and get_dp_group().world_size > 1):
                 # DP-sharded lookups are collective, so a replica skipping the
                 # hash still has to reach them.
                 engram_hashes, engram_mask = self.engram_hash.dummy_hashes(input_ids)
@@ -1117,7 +1127,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     self.engram_batch.prepare_embeddings(engram_hashes)
                 else:
                     gathered_hashes = gather_engram_hashes(
-                        engram_hashes, dp_shared_memory=self.engram_dp_shared_memory
+                        engram_hashes,
+                        dp_shared_memory=self.engram_dp_shared_memory
+                        or self.engram_per_rank,
                     )
                     for layer in islice(self.layers, self.start_layer, self.end_layer):
                         engram = getattr(layer, "engram", None)
