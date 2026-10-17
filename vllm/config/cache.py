@@ -245,12 +245,14 @@ class CacheConfig:
     necessary for implementing this optimization in some models (e.g. Gemma3n)
     """
 
-    swa_bounded_replay: bool = True
+    swa_bounded_replay: bool | None = None
     """Keep the sliding-window KV of models that support it (DeepSeek-V4.1)
     out of prefix caching and rebuild it after a prefix hit by recomputing the
     hit's last window. The layers past the last KV-source layer then also run
-    eager prefill steps on each request's trailing window only. Requires model
-    runner V2."""
+    eager prefill steps on each request's trailing rows only. Requires model
+    runner V2. None (default) turns it on where the replay equals a full
+    prefill: DeepSeek-V4.1 turns it off with a warning under prefix caching or
+    chunked prefill. True requires it and fails where it would not be exact."""
 
     kv_cache_memory_bytes: int | None = None
     """Size of KV Cache per GPU in bytes. By default, this is set to None

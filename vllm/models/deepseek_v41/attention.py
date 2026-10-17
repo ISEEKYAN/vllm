@@ -84,6 +84,34 @@ from vllm.v1.kv_cache_interface import (
 logger = init_logger(__name__)
 
 
+def resolve_swa_bounded_replay(vllm_config: VllmConfig) -> bool:
+    """``CacheConfig.swa_bounded_replay`` for DeepSeek-V4.1: on only where the
+    replay equals a full prefill. Prefix hits would replay one window of every
+    layer, and a later prefill chunk would read an earlier chunk's trimmed
+    replay rows. An explicit request fails there; the default turns it off."""
+    requested = vllm_config.cache_config.swa_bounded_replay
+    if requested is False:
+        return False
+    conflicts = []
+    if vllm_config.cache_config.enable_prefix_caching:
+        conflicts.append("prefix caching")
+    if (
+        vllm_config.scheduler_config.max_num_batched_tokens
+        < vllm_config.model_config.max_model_len
+    ):
+        conflicts.append("chunked prefill (max_num_batched_tokens < max_model_len)")
+    if not conflicts:
+        return True
+    reason = (
+        "DeepSeek V4.1 SWA bounded replay does not equal a full prefill with "
+        + " and ".join(conflicts)
+    )
+    if requested:
+        raise ValueError(f"{reason}: disable them or pass --no-swa-bounded-replay.")
+    logger.warning_once("%s; it is off, so prefill computes every row.", reason)
+    return False
+
+
 def _replace_layer_index(prefix: str, layer_id: int) -> str:
     """Swap the layer index inside a ``...layers.<idx>...`` prefix."""
     new_prefix, n = re.subn(r"\.layers\.\d+\.", f".layers.{layer_id}.", prefix)
@@ -525,7 +553,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 "decodes only on SM100."
             )
 
-        swa_bounded_replay = cache_config.swa_bounded_replay
+        swa_bounded_replay = resolve_swa_bounded_replay(vllm_config)
         if swa_bounded_replay and not vllm_config.use_v2_model_runner:
             logger.warning_once(
                 "SWA bounded replay needs model runner V2 (only it skips the "

@@ -82,7 +82,11 @@ from vllm.models.deepseek_v4.nvidia.model import (
     prepare_mega_gate_routing_metadata,
 )
 from vllm.models.deepseek_v41.attention import DeepseekV4Attention
-from vllm.models.deepseek_v41.decoder_replay_layers import DecoderReplayLayers
+from vllm.models.deepseek_v41.decoder_replay_layers import (
+    DecoderReplayLayers,
+    check_decoder_replay_exact,
+    decoder_replay_rows,
+)
 from vllm.models.deepseek_v41.nvidia.flash_mla_mega_attn import (
     DeepseekV4MegaAttnAttention,
 )
@@ -846,6 +850,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             and self.layers[cut].attn.swa_cache_layer.bounded_replay
         ):
             assert self.layers[cut].attn.compress_ratio <= 1
+            check_decoder_replay_exact(self.config, self.layers, cut, self.end_layer)
             # The last KV source writes every row's KV, then replays.
             self.decoder_replay_start = cut
             # The attention metadata keys the replay layers read.
@@ -857,8 +862,15 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     metadata_prefixes.add(attn.compressed_cache_prefix)
                 if attn.indexer is not None:
                     metadata_prefixes.add(attn.indexer.k_cache.prefix)
+            # Every SWA layer past the cut widens, by its window W less one, the
+            # rows its input must hold exactly: the last row's logits and every
+            # layer's decode-window KV equal a full prefill only if the cut
+            # layer's output covers N * (W - 1) + 1 rows for N layers past it.
+            replay_rows = decoder_replay_rows(
+                self.end_layer - 1 - cut, config.sliding_window
+            )
             self.decoder_replay_layers = DecoderReplayLayers(
-                config.sliding_window,
+                replay_rows,
                 self._run_replay_layers,
                 self.layers[cut].write_kv,
                 metadata_prefixes,
@@ -871,7 +883,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 cut,
                 cut + 1,
                 self.end_layer - 1,
-                config.sliding_window,
+                replay_rows,
             )
 
         # The n-gram hash needs a slot-keyed rolling store of compressed ids

@@ -187,7 +187,8 @@ def _model(monkeypatch):
     layers = [
         _Layer(0, "layers.0.compressed", "layers.0.indexer"),
         _Layer(1, "layers.1.compressed", "layers.1.indexer"),
-        _Layer(2, "layers.1.compressed", "layers.2.indexer"),
+        # A non-owning index source shares the last KV source's index K cache.
+        _Layer(2, "layers.1.compressed", "layers.1.indexer"),
         _Layer(3),
     ]
     # Layer 1 is the KV source, so the replay callback is this layer's write.
@@ -210,9 +211,13 @@ def _model(monkeypatch):
         candidate_topk_blocks=0,
     )
     vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(hf_config=config, dtype=torch.bfloat16),
+        model_config=SimpleNamespace(
+            hf_config=config, dtype=torch.bfloat16, max_model_len=FULL
+        ),
         quant_config=None,
-        cache_config=SimpleNamespace(swa_bounded_replay=True),
+        cache_config=SimpleNamespace(
+            swa_bounded_replay=True, enable_prefix_caching=False
+        ),
         use_v2_model_runner=True,
         parallel_config=SimpleNamespace(
             prefill_context_parallel_size=1,
@@ -288,7 +293,6 @@ def test_amd_replay_forward_trims_to_the_window(monkeypatch):
         "layers.1.compressed",
         "layers.1.indexer",
         "layers.2.swa",
-        "layers.2.indexer",
         "layers.3.swa",
     }
     assert replay_layers.replay_batch is None

@@ -97,6 +97,14 @@ def _pad_replayed_slots_kernel(
             )
 
 
+def replay_kept_lens(
+    query_lens: np.ndarray, keeps_rows: np.ndarray, replay_rows: int
+) -> np.ndarray:
+    """Rows of each request the replay layers run on: its last ``replay_rows``
+    query rows, or all of them when it keeps its rows (prompt logprobs)."""
+    return np.where(keeps_rows, query_lens, np.minimum(query_lens, replay_rows))
+
+
 @triton.jit
 def _gather_replay_batch_kernel(
     query_start_loc_ptr,  # [num_reqs + 1]
@@ -112,7 +120,7 @@ def _gather_replay_batch_kernel(
     kept_slot_mappings_ptr,  # out: [num_groups, num_kept]
     kept_slot_mappings_stride,
     kept_kv_start_ptr,  # out: [num_reqs]
-    window,
+    replay_rows,
     NUM_GROUPS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -130,7 +138,7 @@ def _gather_replay_batch_kernel(
     # A trimmed request holds no replay-layer window KV below its kept rows.
     kv_start = tl.load(replay_start_ptr + req)
     if kept_end - kept_begin < end - begin:
-        kv_start = tl.maximum(kv_start, tl.load(seq_lens_ptr + req) - window)
+        kv_start = tl.maximum(kv_start, tl.load(seq_lens_ptr + req) - replay_rows)
     tl.store(kept_kv_start_ptr + req, kv_start)
 
     first_row = end - (kept_end - kept_begin)
@@ -256,10 +264,11 @@ class DeepseekV41ModelState(DefaultModelState):
             and not vllm_config.model_config.enable_prompt_embeds
         ):
             threshold = compilation_config.decoder_replay_trim_threshold
-            if threshold <= layers.window:
+            if threshold <= layers.replay_rows:
                 raise ValueError(
-                    "decoder_replay_trim_threshold must exceed the replay window "
-                    f"of {layers.window} tokens: smaller graphs have nothing to trim"
+                    "decoder_replay_trim_threshold must exceed the replay rows "
+                    f"({layers.replay_rows} tokens): smaller graphs have nothing "
+                    "to trim"
                 )
             self.replay_cudagraphs = DecoderReplayCudaGraphManager(
                 vllm_config, device, layers
@@ -429,7 +438,7 @@ class DeepseekV41ModelState(DefaultModelState):
             self._kept_slot_mappings,
             self._kept_slot_mappings.stride(0),
             self._kept_kv_start,
-            self.decoder_replay_layers.window,
+            self.decoder_replay_layers.replay_rows,
             NUM_GROUPS=slot_mappings.shape[0],
             BLOCK=1024,
             grid=(1,),
@@ -462,10 +471,10 @@ class DeepseekV41ModelState(DefaultModelState):
 
         num_reqs = input_batch.num_reqs
         query_lens = np.diff(input_batch.query_start_loc_np[: num_reqs + 1])
-        kept_lens = np.where(
-            self._keeps_rows_np[input_batch.idx_mapping_np[:num_reqs]],
+        kept_lens = replay_kept_lens(
             query_lens,
-            np.minimum(query_lens, layers.window),
+            self._keeps_rows_np[input_batch.idx_mapping_np[:num_reqs]],
+            layers.replay_rows,
         )
         # A batch of context-free non-prefill rows is a dummy (an idle DP rank's):
         # nothing reads it and its idx_mapping hits stale slots, so keep one row.
@@ -620,7 +629,7 @@ class DeepseekV41ModelState(DefaultModelState):
             kept_slot_mappings,
             kept_slot_mappings.stride(0),
             self._kept_kv_start,
-            self.decoder_replay_layers.window,  # type: ignore[union-attr]
+            self.decoder_replay_layers.replay_rows,  # type: ignore[union-attr]
             NUM_GROUPS=slot_mappings.shape[0],
             BLOCK=1024,
         )

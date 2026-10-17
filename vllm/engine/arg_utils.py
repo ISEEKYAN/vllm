@@ -838,7 +838,7 @@ class EngineArgs:
     stream_interval: int = SchedulerConfig.stream_interval
 
     kv_sharing_fast_prefill: bool = CacheConfig.kv_sharing_fast_prefill
-    swa_bounded_replay: bool = CacheConfig.swa_bounded_replay
+    swa_bounded_replay: bool | None = CacheConfig.swa_bounded_replay
     optimization_level: OptimizationLevel = VllmConfig.optimization_level
     performance_mode: PerformanceMode = VllmConfig.performance_mode
 

@@ -60,8 +60,15 @@ from vllm.models.deepseek_v4.amd.model import (
 )
 from vllm.models.deepseek_v41.amd.mono_decode import MonoDecodeLayer
 from vllm.models.deepseek_v41.amd.rocm import DeepseekV41ROCMAiterMLAAttention
-from vllm.models.deepseek_v41.attention import DeepseekV4Attention
-from vllm.models.deepseek_v41.decoder_replay_layers import DecoderReplayLayers
+from vllm.models.deepseek_v41.attention import (
+    DeepseekV4Attention,
+    resolve_swa_bounded_replay,
+)
+from vllm.models.deepseek_v41.decoder_replay_layers import (
+    DecoderReplayLayers,
+    check_decoder_replay_exact,
+    decoder_replay_rows,
+)
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -539,12 +546,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         self.decoder_replay_start = self.end_layer
         cut = max(config.kv_source_layer_ids)
         if (
-            vllm_config.cache_config.swa_bounded_replay
+            resolve_swa_bounded_replay(vllm_config)
             and vllm_config.use_v2_model_runner
             and cut < self.end_layer - 1
             and self._decoder_replay_supported(vllm_config, cut)
         ):
             assert self.layers[cut].attn.compress_ratio <= 1
+            check_decoder_replay_exact(config, self.layers, cut, self.end_layer)
             # The last KV source writes every row's KV, then replays.
             self.decoder_replay_start = cut
             # The attention metadata keys the replay layers read.
@@ -556,8 +564,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     metadata_prefixes.add(attn.compressed_cache_prefix)
                 if attn.indexer is not None:
                     metadata_prefixes.add(attn.indexer.k_cache.prefix)
+            # N layers past the cut need N * (W - 1) + 1 exact rows
+            # (decoder_replay_rows).
+            replay_rows = decoder_replay_rows(
+                self.end_layer - 1 - cut, config.sliding_window
+            )
             self.decoder_replay_layers = DecoderReplayLayers(
-                config.sliding_window,
+                replay_rows,
                 self._run_replay_layers,
                 self.layers[cut].write_kv,
                 metadata_prefixes,
@@ -570,7 +583,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 cut,
                 cut + 1,
                 self.end_layer - 1,
-                config.sliding_window,
+                replay_rows,
             )
 
         # The n-gram hash needs a slot-keyed rolling store of compressed ids

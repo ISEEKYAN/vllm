@@ -3,7 +3,10 @@
 """Decoder-side SWA bounded replay: running the replay layers on their batch.
 
 Once the last KV-source layer has written every row's KV, it and the layers past
-it (which own only SWA KV) run on each request's last ``window`` rows only.
+it (which own only SWA KV) run on each request's last ``replay_rows`` rows only.
+Each replay layer's sliding window W widens the rows its input must hold exactly
+by W - 1, so N layers past the cut need N * (W - 1) + 1 rows for the last row and
+every layer's decode-window KV to equal a full prefill.
 ``DeepseekV41ModelState`` prepares those rows as a sub-batch with attention
 metadata and a forward context of its own, like a microbatch;
 ``DecoderReplayLayers`` gathers the layer inputs by its rows, runs the layers
@@ -16,6 +19,7 @@ break out to the replay batch, which may run in a graph of its own
 from collections.abc import Callable
 from dataclasses import dataclass
 
+import regex as re
 import torch
 
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
@@ -26,6 +30,46 @@ from vllm.forward_context import (
     override_forward_context,
 )
 from vllm.model_executor.layers.fused_moe.moe_output import MoEOutput
+
+
+def decoder_replay_rows(layers_after_cut: int, window: int) -> int:
+    """Rows the replay layers run on so that the last row and every replay
+    layer's last ``window - 1`` rows of SWA KV equal a full prefill: the last
+    layer needs ``window`` exact input rows, and each layer before it widens
+    that by ``window - 1``."""
+    if layers_after_cut < 1 or window < 1:
+        raise ValueError(
+            f"decoder replay needs layers after the cut ({layers_after_cut}) "
+            f"and a sliding window ({window})"
+        )
+    return layers_after_cut * (window - 1) + 1
+
+
+def _layer_index(prefix: str) -> int:
+    """The decoder layer index in a module prefix (``...layers.<i>....``)."""
+    match = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", prefix)
+    assert match is not None, prefix
+    return int(match.group(1))
+
+
+def check_decoder_replay_exact(config, layers, cut: int, end_layer: int) -> None:
+    """The replay layers may read only the cut layer's all-row caches besides
+    their own kept rows: the candidate source and every index K owner sit at or
+    before the cut. (Prefix caching and chunked prefill are resolved with the
+    flag, ``resolve_swa_bounded_replay``.)"""
+    candidate = getattr(config, "candidate_source_layer_id", -1)
+    late_index_k = [
+        i
+        for i in range(cut + 1, end_layer)
+        if layers[i].attn.indexer is not None
+        and _layer_index(layers[i].attn.indexer.k_cache.prefix) > cut
+    ]
+    if candidate > cut or late_index_k:
+        raise ValueError(
+            "DeepSeek V4.1 SWA bounded replay needs the candidate source "
+            f"({candidate}) and every index K owner at or before the last KV "
+            f"source ({cut}); layers {late_index_k} own their index K."
+        )
 
 
 @dataclass
@@ -49,13 +93,13 @@ class DecoderReplayLayers:
 
     def __init__(
         self,
-        window: int,
+        replay_rows: int,
         run_layers: Callable[..., tuple[torch.Tensor, ...]],
         write_batch_kv: Callable[..., None],
         metadata_prefixes: set[str],
         first_swa_prefix: str,
     ) -> None:
-        self.window = window
+        self.replay_rows = replay_rows
         self.run_layers = run_layers
         self.write_batch_kv = write_batch_kv
         self.metadata_prefixes = metadata_prefixes
@@ -111,7 +155,8 @@ class DecoderReplayLayers:
         replay_batch = self.replay_batch
         if replay_batch is None:
             return self.run_layers(hidden_states, *states)
-        # Replay batch steps hold more than `window` tokens: no deferred MoE finalize.
+        # Replay batch steps hold more than `replay_rows` tokens: no deferred MoE
+        # finalize.
         assert isinstance(hidden_states, torch.Tensor)
         rows = replay_batch.rows
         inputs = (hidden_states, *states)

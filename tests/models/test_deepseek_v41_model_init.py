@@ -52,7 +52,8 @@ def test_prefix_replay_requires_an_uncompressed_kv_source(
         sliding_window=128,
     )
     vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(hf_config=config),
+        model_config=SimpleNamespace(hf_config=config, max_model_len=16),
+        cache_config=SimpleNamespace(enable_prefix_caching=False),
         quant_config=None,
         kernel_config=SimpleNamespace(moe_backend="deep_gemm"),
         parallel_config=SimpleNamespace(
