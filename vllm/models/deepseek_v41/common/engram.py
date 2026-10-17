@@ -32,6 +32,12 @@ chunk-by-chunk while an n-gram at position ``p`` needs the token ids at
   runner's CPU token table holds placeholders for generated tokens under
   async scheduling, so it passes prompt positions only and keeps the slot
   cache for the rest.
+
+The ``per_rank`` host-table layout (``EngramConfig.host_table_layout``) follows
+sgl-project/sglang@86cc2e02ecb2 ``python/sglang/srt/layers/engram.py``: every
+DP rank keeps one contiguous row range of the table in host memory, looks up
+only those rows (others read as zeros) for the tokens gathered from the whole
+DP group, and a reduce-scatter returns each rank its own tokens.
 """
 
 import ctypes
@@ -754,6 +760,25 @@ def engram_gathered_num_tokens() -> int:
     )
 
 
+def engram_row_range(num_rows: int, rank: int, size: int) -> tuple[int, int]:
+    """Contiguous row range of one rank (sglang@86cc2e02 engram.py:759-762)."""
+    return num_rows * rank // size, num_rows * (rank + 1) // size
+
+
+def reduce_scatter_owned_rows(
+    values: torch.Tensor, group: GroupCoordinator
+) -> torch.Tensor:
+    """Sum rows owned by exactly one rank and scatter them along dim 0.
+
+    Every other rank contributes zeros, so adding the BF16 bit patterns as
+    integers reassembles each row bit for bit; a floating-point sum would turn
+    a -0.0 into +0.0.
+    """
+    rows = values.reshape(values.shape[0], -1)
+    out = group.reduce_scatter(rows.view(torch.int32), dim=0)
+    return out.view(values.dtype).view(-1, *values.shape[1:])
+
+
 def gather_engram_hashes(
     hash_ids: torch.Tensor, *, dp_shared_memory: bool = False
 ) -> torch.Tensor:
@@ -966,6 +991,7 @@ class ParallelEngramEmbedding(nn.Module):
         cpu_offload: bool = False,
         dp_shared_memory: bool = False,
         use_thp: bool = False,
+        row_sharded: bool = False,
     ) -> None:
         super().__init__()
         assert head_sizes and all(size > 0 for size in head_sizes)
@@ -973,7 +999,18 @@ class ParallelEngramEmbedding(nn.Module):
         self.cpu_offload = cpu_offload
         self.dp_shared_memory = dp_shared_memory
         self.use_thp = use_thp
+        self.row_sharded = row_sharded
         self.dp_size = get_engram_dp_size()
+        if row_sharded:
+            if not cpu_offload or dp_shared_memory:
+                raise ValueError(
+                    "The per_rank Engram layout requires cpu_offload=True and "
+                    "dp_shared_memory=False"
+                )
+            if get_tensor_model_parallel_world_size() > 1:
+                raise ValueError("The per_rank Engram layout requires TP=1")
+            # Rows are split over the whole DP group, not heads over a node.
+            self.dp_size = 1
         if dp_shared_memory:
             if not cpu_offload:
                 raise ValueError("dp_shared_memory requires cpu_offload=True")
@@ -994,17 +1031,27 @@ class ParallelEngramEmbedding(nn.Module):
         self.block_size = block_size
         self.n_hash_cols = len(head_sizes)
         self.tp_size = get_tensor_model_parallel_world_size()
-        num_shards, head_rank = self._get_shard_info()
-        self.part_n_hash_cols = triton.cdiv(self.n_hash_cols, num_shards)
-        # TODO: Support row-wise sharding when there are too few hash heads.
-        assert (num_shards - 1) * self.part_n_hash_cols < self.n_hash_cols, (
-            f"Engram sharding leaves ranks without hash heads: "
-            f"{self.n_hash_cols} heads over {num_shards} shards"
-        )
-        self.head_start = head_rank * self.part_n_hash_cols
-        head_end = self.head_start + self.part_n_hash_cols
-        self.vocab_start_idx = sum(head_sizes[: self.head_start])
-        self.vocab_end_idx = sum(head_sizes[:head_end])
+        if row_sharded:
+            # Every head, but only this DP rank's rows; the lookup kernel reads
+            # rows inside [vocab_start, vocab_end) and zeros the rest.
+            dp_group = get_dp_group()
+            self.part_n_hash_cols = self.n_hash_cols
+            self.head_start = 0
+            self.vocab_start_idx, self.vocab_end_idx = engram_row_range(
+                num_embeddings, dp_group.rank_in_group, dp_group.world_size
+            )
+        else:
+            num_shards, head_rank = self._get_shard_info()
+            self.part_n_hash_cols = triton.cdiv(self.n_hash_cols, num_shards)
+            # TODO: Support row-wise sharding when there are too few hash heads.
+            assert (num_shards - 1) * self.part_n_hash_cols < self.n_hash_cols, (
+                f"Engram sharding leaves ranks without hash heads: "
+                f"{self.n_hash_cols} heads over {num_shards} shards"
+            )
+            self.head_start = head_rank * self.part_n_hash_cols
+            head_end = self.head_start + self.part_n_hash_cols
+            self.vocab_start_idx = sum(head_sizes[: self.head_start])
+            self.vocab_end_idx = sum(head_sizes[:head_end])
         self.part_num_embeddings = self.vocab_end_idx - self.vocab_start_idx
         self._num_sms = torch.cuda.get_device_properties(
             torch.accelerator.current_device_index()
@@ -1031,7 +1078,12 @@ class ParallelEngramEmbedding(nn.Module):
                 self.part_num_embeddings,
                 dim,
                 self.part_num_embeddings * (dim + dim // block_size) / 1024**3,
-                "shared across DP replicas" if dp_shared_memory else "per rank",
+                "shared across DP replicas"
+                if dp_shared_memory
+                else f"rows [{self.vocab_start_idx}, {self.vocab_end_idx}) of "
+                f"{num_embeddings} on this rank"
+                if row_sharded
+                else "per rank",
             )
 
     def _get_shard_info(self) -> tuple[int, int]:
@@ -1170,9 +1222,40 @@ class ParallelEngramEmbedding(nn.Module):
             OUT_STRIDE=out.stride(0),
         )
 
+    def row_sharded_lookup(self, indices: torch.Tensor) -> torch.Tensor:
+        """Per-rank rows: gather every DP rank's ids, look up the rows this rank
+        owns (zeros elsewhere), and reduce-scatter each rank its own tokens.
+
+        Collective over the DP group (sglang@86cc2e02 engram.py:904-940).
+        """
+        num_tokens = indices.shape[0]
+        group = get_dp_group()
+        if group.world_size > 1:
+            dp_metadata = get_forward_context().dp_metadata
+            if dp_metadata is None:
+                raise RuntimeError("the per_rank Engram lookup needs DP token metadata")
+            slot = int(dp_metadata.num_tokens_across_dp_cpu.max())
+            if num_tokens > slot:
+                raise ValueError("Engram token count exceeds the DP token slot")
+            if num_tokens < slot:
+                pad = indices.new_full((slot - num_tokens, *indices.shape[1:]), DEAD_ID)
+                indices = torch.cat((indices, pad))
+            indices = group.all_gather(indices.contiguous(), dim=0)
+        out = torch.zeros(
+            (indices.shape[0], self.n_hash_cols, self.dim),
+            dtype=torch.bfloat16,
+            device=indices.device,
+        )
+        self.lookup(indices, out)
+        if group.world_size > 1:
+            out = reduce_scatter_owned_rows(out, group)
+        return out[:num_tokens]
+
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
         """indices: [num_tokens, n_hash_cols] -> [num_tokens, n_hash_cols, dim]
         bf16, gathered from all shards for this replica's tokens."""
+        if self.row_sharded:
+            return self.row_sharded_lookup(indices)
         num_tokens = indices.shape[0]
         if self.dp_size > 1:
             indices = gather_engram_hashes(indices)
@@ -1594,6 +1677,7 @@ class Engram(nn.Module):
             cpu_offload=engram_config.cpu_offload,
             dp_shared_memory=bool(engram_config.dp_shared_memory),
             use_thp=engram_config.use_thp,
+            row_sharded=engram_config.host_table_layout == "per_rank",
         )
 
     def _init_staging(self, max_tokens: int, head_dim: int) -> None:
@@ -1604,7 +1688,8 @@ class Engram(nn.Module):
             head_dim,
             dtype=torch.bfloat16,
         )
-        if not self.embed_tokens.cpu_offload:
+        # A per_rank lookup is a DP collective: keep it on the main stream.
+        if not self.embed_tokens.cpu_offload or self.embed_tokens.row_sharded:
             self._prefetch_stream = None
             return
         if self._prefetch_stream is None:
@@ -1617,7 +1702,9 @@ class Engram(nn.Module):
         consume them; DP-sharded tables take the group's gathered hash IDs."""
         rows = self.staged_rows[: hash_ids.shape[0]]
         assert rows.shape[0] == hash_ids.shape[0], "engram staging buffer too small"
-        if self._prefetch_stream is None:
+        if self.embed_tokens.row_sharded:
+            rows.copy_(self.embed_tokens.row_sharded_lookup(hash_ids))
+        elif self._prefetch_stream is None:
             self.embed_tokens.lookup(hash_ids, rows)
         else:
             self._start_prefetch(hash_ids, rows)
