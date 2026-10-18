@@ -43,13 +43,17 @@ _all_reduce_mhc: "AllReduceMHC | None" = None
 
 
 def supports_mhc_overlap(vllm_config: VllmConfig) -> bool:
-    """Check kernel requirements and safety of sharing the coefficient stream."""
+    """Check kernel requirements and safety of sharing the coefficient stream.
+
+    In BI mode every boundary already runs the overlap path's kernels on the
+    caller stream (see ``mhc_shifted_post_pre``), so the side stream only moves
+    the coefficient work and keeps results bitwise.
+    """
     config = vllm_config.model_config.hf_config
     # DeepGEMM's prenorm kernel requires K % 64 == 0, N % 8 == 0, and N <= 32.
     mix_size = config.hc_mult * (config.hc_mult + 2)
     return (
-        not envs.VLLM_BATCH_INVARIANT
-        and current_platform.is_device_capability_family(100)
+        current_platform.is_device_capability_family(100)
         and is_deep_gemm_supported()
         and config.hidden_size % 64 == 0
         and 0 < mix_size <= 32

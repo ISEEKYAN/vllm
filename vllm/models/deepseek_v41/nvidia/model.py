@@ -633,13 +633,18 @@ class DeepseekV4DecoderLayer(nn.Module):
         if self.use_sequence_parallel:
             x = sp_all_gather(x)[: positions.shape[0]]
 
+        # BI attention breaks FULL capture into eager segments, and a segment
+        # cannot end with the coefficient stream still forked: join before it.
+        join_before_attn = mhc_stream is not None and envs.VLLM_BATCH_INVARIANT
+        if join_before_attn:
+            torch.cuda.current_stream().wait_stream(mhc_stream)
         x = self.attn(positions, x, None)
         # With GEMM-RS bound, the attention output is already this rank's
         # sequence-parallel shard (see DeepseekV4Attention._wo_b_proj).
         if self.use_sequence_parallel and self.attn.gemm_rs is None:
             x = sp_reduce_scatter(x)
 
-        if mhc_stream is not None:
+        if mhc_stream is not None and not join_before_attn:
             torch.cuda.current_stream().wait_stream(mhc_stream)
         residual, post_mix, res_mix, x, ffn_pre, _ = mhc_shifted_post_pre(
             x,
