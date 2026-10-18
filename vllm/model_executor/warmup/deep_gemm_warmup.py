@@ -25,7 +25,10 @@ from vllm.model_executor.layers.fused_moe import MoERunner
 from vllm.model_executor.layers.fused_moe.deep_gemm_utils import (
     compute_aligned_M_and_alignment,
 )
-from vllm.model_executor.layers.fused_moe.experts.deep_gemm_moe import DeepGemmExperts
+from vllm.model_executor.layers.fused_moe.experts.deep_gemm_moe import (
+    DeepGemmExperts,
+    DeepGemmFP4Experts,
+)
 from vllm.model_executor.layers.fused_moe.experts.triton_deep_gemm_moe import (
     TritonOrDeepGemmExperts,
 )
@@ -34,6 +37,7 @@ from vllm.utils.deep_gemm import (
     _import_deep_gemm,
     fp8_gemm_nt,
     get_mk_alignment_for_contiguous_layout,
+    m_grouped_fp8_fp4_gemm_nt_contiguous,
     m_grouped_fp8_gemm_nt_contiguous,
     mk_alignment_scope,
 )
@@ -158,6 +162,17 @@ def _fused_moe_grouped_gemm_may_use_deep_gemm(module: torch.nn.Module) -> bool:
 
 
 # Model construction already imports the model modules. Avoid importing them here.
+def _fp4_experts(module: torch.nn.Module) -> DeepGemmFP4Experts | None:
+    """The DeepGEMM MXFP4 experts a MoE runner dispatches to, if any."""
+    if not isinstance(module, MoERunner):
+        return None
+    moe_kernel = getattr(module._quant_method, "moe_kernel", None)
+    if moe_kernel is None:
+        return None
+    experts = moe_kernel.impl.fused_experts
+    return experts if isinstance(experts, DeepGemmFP4Experts) else None
+
+
 def _mega_moe_uses_mega_gate(module: torch.nn.Module) -> "TypeGuard[DeepseekV4MoE]":
     # DeepSeek-V4 routes with bf16_mega_gate, Kimi K3 with its GateLinear.
     dsv4 = sys.modules.get("vllm.models.deepseek_v4.nvidia.model")
@@ -334,6 +349,66 @@ def _deepgemm_grouped_fp8_gemm_nt_contiguous_warmup(
             GROUPED_FP8_GEMM_NT_CONTIGUOUS_WARMUP_CACHE.add(w.size())
 
 
+GROUPED_FP8_FP4_GEMM_NT_CONTIGUOUS_WARMUP_CACHE: set[tuple] = set()
+
+
+def _grouped_fp8_fp4_warmup_keys(
+    module: MoERunner, experts: DeepGemmFP4Experts
+) -> list[tuple]:
+    act_block_k = experts._act_block_k
+    return [
+        (w.size(), act_block_k)
+        for w in (module.routed_experts.w13_weight, module.routed_experts.w2_weight)
+    ]
+
+
+def _deepgemm_grouped_fp8_fp4_gemm_nt_contiguous_warmup(
+    module: MoERunner,
+    experts: DeepGemmFP4Experts,
+    max_tokens: int,
+    pbar: tqdm | None = None,
+):
+    """Compile the MXFP4 expert GEMMs for every M bucket the grouped GEMM path
+    can see, with the activation and weight recipes the experts pass."""
+    w13 = module.routed_experts.w13_weight
+    w2 = module.routed_experts.w2_weight
+    MAX_M, _, warmup_cases = _get_grouped_gemm_params(
+        w13, w2, module.routed_experts.top_k, max_tokens
+    )
+    if not warmup_cases:
+        return
+    act_block_k = experts._act_block_k
+    keys = _grouped_fp8_fp4_warmup_keys(module, experts)
+    for key, w, w_scale in zip(
+        keys, (w13, w2), (experts.w1_scale, experts.w2_scale), strict=True
+    ):
+        if key in GROUPED_FP8_FP4_GEMM_NT_CONTIGUOUS_WARMUP_CACHE:
+            continue
+        assert w_scale is not None
+        # FP4 weights pack two values per byte along K.
+        _, n, k = w.size()
+        k *= 2
+        a1q, a1q_scales, out = current_workspace_manager().get_simultaneous(
+            ((MAX_M, k), torch.float8_e4m3fn),
+            ((MAX_M, k // act_block_k), torch.float32),
+            ((MAX_M, n), torch.bfloat16),
+        )
+        a1q_scales.zero_()
+        for num_tokens, align_used, expert_ids in warmup_cases:
+            with mk_alignment_scope(align_used):
+                m_grouped_fp8_fp4_gemm_nt_contiguous(
+                    (a1q[:num_tokens], a1q_scales[:num_tokens]),
+                    (w.view(torch.int8), w_scale),
+                    out[:num_tokens],
+                    expert_ids,
+                    recipe_a=(1, act_block_k),
+                    recipe_b=(1, experts._WEIGHT_BLOCK_K),
+                )
+            if pbar is not None:
+                pbar.update(1)
+        GROUPED_FP8_FP4_GEMM_NT_CONTIGUOUS_WARMUP_CACHE.add(key)
+
+
 FP8_FP4_MEGA_MOE_WARMUP_CACHE: set[tuple] = set()
 
 
@@ -463,6 +538,17 @@ def deepgemm_grouped_fp8_gemm_nt_contiguous_warmup(
         )
 
 
+def deepgemm_grouped_fp8_fp4_gemm_nt_contiguous_warmup(
+    model: torch.nn.Module, max_tokens: int, pbar: tqdm | None = None
+):
+    for m in model.modules():
+        if (experts := _fp4_experts(m)) is not None:
+            assert isinstance(m, MoERunner)
+            _deepgemm_grouped_fp8_fp4_gemm_nt_contiguous_warmup(
+                m, experts, max_tokens, pbar=pbar
+            )
+
+
 @torch.inference_mode()
 def deepgemm_fp8_fp4_mega_moe_warmup(
     model: torch.nn.Module, max_tokens: int, pbar: tqdm | None = None
@@ -478,6 +564,7 @@ def _count_warmup_iterations(model: torch.nn.Module, max_tokens: int) -> int:
         GROUPED_FP8_GEMM_NT_CONTIGUOUS_WARMUP_CACHE
     )
     seen_mega_moe_keys: set[tuple] = set(FP8_FP4_MEGA_MOE_WARMUP_CACHE)
+    seen_fp4_keys: set[tuple] = set(GROUPED_FP8_FP4_GEMM_NT_CONTIGUOUS_WARMUP_CACHE)
 
     total = 0
     for m in model.modules():
@@ -498,6 +585,16 @@ def _count_warmup_iterations(model: torch.nn.Module, max_tokens: int) -> int:
             if w2.size() not in seen_grouped_sizes:
                 total += n_values
                 seen_grouped_sizes.add(w2.size())
+        elif (experts := _fp4_experts(m)) is not None:
+            assert isinstance(m, MoERunner)
+            w13, w2 = m.routed_experts.w13_weight, m.routed_experts.w2_weight
+            _, _, warmup_cases = _get_grouped_gemm_params(
+                w13, w2, m.routed_experts.top_k, max_tokens
+            )
+            for key in _grouped_fp8_fp4_warmup_keys(m, experts):
+                if key not in seen_fp4_keys:
+                    total += len(warmup_cases)
+                    seen_fp4_keys.add(key)
         elif _mega_moe_may_use_deep_gemm(m):
             key = _get_fp8_fp4_mega_moe_warmup_key(m)
             if key not in seen_mega_moe_keys:
@@ -517,8 +614,10 @@ def deep_gemm_warmup(model: torch.nn.Module, max_tokens: int):
         with tqdm(total=total, desc="DeepGEMM warmup") as pbar:
             deepgemm_fp8_gemm_nt_warmup(model, max_tokens, pbar)
             deepgemm_grouped_fp8_gemm_nt_contiguous_warmup(model, max_tokens, pbar)
+            deepgemm_grouped_fp8_fp4_gemm_nt_contiguous_warmup(model, max_tokens, pbar)
             deepgemm_fp8_fp4_mega_moe_warmup(model, max_tokens, pbar)
     else:
         deepgemm_fp8_gemm_nt_warmup(model, max_tokens, None)
         deepgemm_grouped_fp8_gemm_nt_contiguous_warmup(model, max_tokens, None)
+        deepgemm_grouped_fp8_fp4_gemm_nt_contiguous_warmup(model, max_tokens, None)
         deepgemm_fp8_fp4_mega_moe_warmup(model, max_tokens, None)

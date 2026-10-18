@@ -178,3 +178,65 @@ def test_mega_moe_m_values_reach_mega_gate(monkeypatch) -> None:
         use_sequence_parallel=False,
     )
     assert deep_gemm_warmup._get_fp8_fp4_mega_moe_m_values(module, 40) == [16, 32, 40]
+
+
+@pytest.mark.cpu_test
+def test_mxfp4_experts_are_warmed_with_their_gemm_recipes(monkeypatch) -> None:
+    """MXFP4 experts compile at startup, per M bucket, with the activation and
+    weight recipes their grouped GEMMs pass at runtime."""
+    from vllm.model_executor.layers.fused_moe import MoERunner
+    from vllm.model_executor.layers.fused_moe.experts.deep_gemm_moe import (
+        DeepGemmFP4Experts,
+    )
+
+    num_experts, n, k = 4, 512, 256
+    w13 = torch.empty((num_experts, n, k // 2), dtype=torch.uint8)
+    w2 = torch.empty((num_experts, k, n // 4), dtype=torch.uint8)
+    experts = object.__new__(DeepGemmFP4Experts)
+    experts._act_block_k = 32
+    experts.quant_config = SimpleNamespace(
+        w1_scale=torch.empty(1), w2_scale=torch.empty(1)
+    )
+    runner = object.__new__(MoERunner)
+    runner.__dict__["routed_experts"] = SimpleNamespace(
+        w13_weight=w13,
+        w2_weight=w2,
+        top_k=6,
+        quant_method=SimpleNamespace(
+            get_fused_moe_quant_config=lambda layer: None,
+            moe_kernel=SimpleNamespace(impl=SimpleNamespace(fused_experts=experts)),
+        ),
+    )
+    cases = [(128, 128, torch.zeros(128)), (256, 128, torch.zeros(256))]
+    monkeypatch.setattr(
+        deep_gemm_warmup, "_get_grouped_gemm_params", lambda *_: (256, 128, cases)
+    )
+    monkeypatch.setattr(
+        deep_gemm_warmup,
+        "current_workspace_manager",
+        lambda: SimpleNamespace(
+            get_simultaneous=lambda *specs: [torch.empty(s, dtype=d) for s, d in specs]
+        ),
+    )
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        deep_gemm_warmup,
+        "m_grouped_fp8_fp4_gemm_nt_contiguous",
+        lambda a, b, out, ids, **kw: calls.append((a[0].shape, a[1].shape, b[0], kw)),
+    )
+    deep_gemm_warmup.GROUPED_FP8_FP4_GEMM_NT_CONTIGUOUS_WARMUP_CACHE.clear()
+    model = SimpleNamespace(modules=lambda: iter([runner, SimpleNamespace()]))
+
+    assert deep_gemm_warmup._count_warmup_iterations(model, 256) == 4
+    deep_gemm_warmup.deepgemm_grouped_fp8_fp4_gemm_nt_contiguous_warmup(model, 256)
+    deep_gemm_warmup.deepgemm_grouped_fp8_fp4_gemm_nt_contiguous_warmup(model, 256)
+
+    recipes = {"recipe_a": (1, 32), "recipe_b": (1, 32)}
+    assert [(a, s, kw) for a, s, _, kw in calls] == [
+        ((128, k), (128, k // 32), recipes),
+        ((256, k), (256, k // 32), recipes),
+        ((128, n // 2), (128, n // 2 // 32), recipes),
+        ((256, n // 2), (256, n // 2 // 32), recipes),
+    ]
+    assert [w.shape for *_, w, _ in calls] == [w13.shape] * 2 + [w2.shape] * 2
+    assert deep_gemm_warmup._count_warmup_iterations(model, 256) == 0
