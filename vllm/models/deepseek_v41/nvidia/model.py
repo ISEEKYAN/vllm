@@ -392,8 +392,13 @@ class DeepseekV4DecoderLayer(nn.Module):
                 )
             # Shifted mHC splits the epilogue in two: the input collapse on the
             # caller stream and coefficient generation on a side stream.
+            # BI mode runs the split epilogue at every token count.
             split_modes = (
-                ("fused", "stats", "input") if mhc_stream is not None else ("fused",)
+                ("stats", "input")
+                if envs.VLLM_BATCH_INVARIANT
+                else ("fused", "stats", "input")
+                if mhc_stream is not None
+                else ("fused",)
             )
             for variant in variants:
                 for split_mode in split_modes:
@@ -401,7 +406,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                         split_mode=split_mode,
                         max_tokens=(
                             max_tokens
-                            if split_mode == "fused"
+                            if split_mode == "fused" or envs.VLLM_BATCH_INVARIANT
                             else min(max_tokens, MHC_OVERLAP_MAX_TOKENS)
                         ),
                         hidden_size=self.hidden_size,
@@ -494,6 +499,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         mhc_pre = (
             partial(mhc_pre_delayed_overlap, stream=mhc_stream)
             if mhc_stream is not None
+            else partial(mhc_pre_delayed_overlap, stream=torch.cuda.current_stream())
+            if envs.VLLM_BATCH_INVARIANT
             else mhc_pre_delayed_tilelang
         )
         # The reference collapses each sublayer's input with the *previous*

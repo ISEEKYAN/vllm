@@ -74,6 +74,10 @@ def test_entry_split_order_for_decode_prefill_and_teacher_forcing(
             for rows in (1, 8, 239, 384, 4206)
         ]
         assert actual == ([16] * 5 if batch_invariant else [16, 16, 16, 16, 4])
+        # Narrow projections bucket to 4 splits unless BI fixes the reduction.
+        assert warmup.compute_mhc_pre_num_splits(1024, 1) == (
+            16 if batch_invariant else 4
+        )
     finally:
         warmup.compute_num_split.cache_clear()
 
@@ -130,7 +134,11 @@ def test_deepseek_v41_all_reduce_fusion_requires_kernel_support(
         )
     )
     monkeypatch.setattr(mhc, "get_tp_group", lambda: group)
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", False)
     assert mhc.supports_mhc_all_reduce(config) is expected
+    # The fused reduction serves only small batches, so BI keeps it off.
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    assert mhc.supports_mhc_all_reduce(config) is False
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
@@ -464,6 +472,68 @@ def test_deepseek_v41_mhc_overlap_preserves_outputs_on_replay(
             pre_mix.uniform_()
         graph.replay()
         check(captured)
+
+
+@pytest.mark.skipif(
+    not HAS_TILELANG_MHC or not current_platform.is_device_capability_family(100),
+    reason="SM100 TileLang mHC required",
+)
+@pytest.mark.parametrize("carried", [False, True])
+def test_deepseek_v41_bi_shifted_mhc_overlap_is_scheduling_only(monkeypatch, carried):
+    """BI boundaries match on the caller and a side stream, at any batch size."""
+    from vllm.models.deepseek_v41.nvidia.ops.mhc import mhc_shifted_post_pre
+    from vllm.utils.deep_gemm import is_deep_gemm_supported
+
+    if not is_deep_gemm_supported():
+        pytest.skip("DeepGEMM required")
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    set_random_seed(7)
+    num_tokens, hc_mult, hidden_size = 16, 4, 5120
+    mix_size = hc_mult * (hc_mult + 2)
+    x = torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=DEVICE)
+    residual = torch.randn(
+        num_tokens, hc_mult, hidden_size, dtype=torch.bfloat16, device=DEVICE
+    )
+    post_mix = torch.rand(num_tokens, hc_mult, 1, device=DEVICE)
+    res_mix = torch.rand(num_tokens, hc_mult, hc_mult, device=DEVICE)
+    fn = torch.randn(mix_size, hc_mult * hidden_size, device=DEVICE) * 0.02
+    scale = torch.tensor([0.5, 0.25, 1.0], device=DEVICE)
+    base = torch.randn(mix_size, device=DEVICE)
+    pre_mix = torch.rand(num_tokens, hc_mult, device=DEVICE) if carried else None
+    weight = torch.empty(hidden_size, dtype=torch.bfloat16, device=DEVICE)
+    weight.uniform_(0.5, 1.5)
+    side = torch.cuda.Stream()
+
+    def run(rows, stream):
+        outputs = mhc_shifted_post_pre(
+            x[rows],
+            residual[rows],
+            post_mix[rows],
+            res_mix[rows],
+            fn,
+            scale,
+            base,
+            1e-20,
+            1e-6,
+            1e-6,
+            2.0,
+            20,
+            pre_mix=None if pre_mix is None else pre_mix[rows],
+            norm_weight=weight,
+            norm_eps=1e-20,
+            stream=stream,
+        )
+        if stream is not None:
+            torch.cuda.current_stream().wait_stream(stream)
+        return outputs[:5]
+
+    full = slice(0, num_tokens)
+    caller = run(full, None)
+    for a, b in zip(run(full, side), caller, strict=True):
+        assert torch.equal(a, b)
+    for row in (0, 5, num_tokens - 1):
+        for a, b in zip(run(slice(row, row + 1), None), caller, strict=True):
+            assert torch.equal(a, b[row : row + 1])
 
 
 def mhc_fused_post_pre_delayed_ref(

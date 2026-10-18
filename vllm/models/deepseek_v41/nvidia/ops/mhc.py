@@ -62,7 +62,9 @@ def supports_mhc_all_reduce(vllm_config: VllmConfig) -> bool:
     parallel = vllm_config.parallel_config
     config = vllm_config.model_config.hf_config
     if (
-        parallel.tensor_parallel_size != 4
+        # The Lamport reduction only serves batches up to the overlap limit.
+        envs.VLLM_BATCH_INVARIANT
+        or parallel.tensor_parallel_size != 4
         or parallel.enable_expert_parallel
         or config.hidden_size != 5120
         or config.hc_mult != 4
@@ -217,7 +219,11 @@ def mhc_shifted_post_pre(
 
     A MoE output left unfinalized is finalized inside the fused all-reduce.
     When stream is supplied, join it before consuming the returned coefficients.
+    BI mode takes the overlap kernels at every token count, on the caller
+    stream when no stream is supplied.
     """
+    if stream is None and envs.VLLM_BATCH_INVARIANT:
+        stream = torch.cuda.current_stream()
     layer_input = None
     if isinstance(x, MoEOutput):
         assert _all_reduce_mhc is not None, "init_mhc_all_reduce was not called"

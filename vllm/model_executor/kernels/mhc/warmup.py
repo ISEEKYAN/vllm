@@ -5,6 +5,7 @@ from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from vllm import envs
 from vllm.model_executor.kernels.mhc.tilelang_kernels import (
     compute_num_split,
     mhc_pre_big_fuse_with_norm_tilelang,
@@ -14,8 +15,13 @@ from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import is_deep_gemm_supported
 from vllm.utils.math_utils import cdiv
 
+# BI fixes the split-K so every token count reduces the projection identically.
+MHC_PRE_BI_NUM_SPLITS = 16
+
 
 def compute_mhc_pre_num_splits(input_size: int, num_tokens: int) -> int:
+    if envs.VLLM_BATCH_INVARIANT:
+        return MHC_PRE_BI_NUM_SPLITS
     splits = compute_num_split(64, input_size, cdiv(num_tokens, 64))
     # Bound both GEMM and fused-normalization specializations during startup.
     return 1 if splits == 1 else 4 if splits <= 4 else 16
