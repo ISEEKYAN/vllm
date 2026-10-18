@@ -23,6 +23,7 @@ import torch
 import torch.multiprocessing as mp
 
 from vllm.config import (
+    CUDAGraphMode,
     EngramConfig,
     VllmConfig,
     get_current_vllm_config_or_none,
@@ -263,7 +264,10 @@ def _check_fp8_batch(vllm_config):
         ):
             batch.prepare_embeddings(ids)
             check(ids)
-            for capture in ("full", "breakable") if len(set(counts)) == 1 else ():
+            # breakable_full is a breakable capture under the FULL runtime mode,
+            # which BI FULL graphs use.
+            captures = ("full", "breakable", "breakable_full")
+            for capture in captures if len(set(counts)) == 1 else ():
                 warmup = torch.cuda.Stream()
                 warmup.wait_stream(torch.cuda.current_stream())
                 if capture == "full":
@@ -272,7 +276,24 @@ def _check_fp8_batch(vllm_config):
                         batch.prepare_embeddings(ids)
                 else:
                     graph = BreakableCUDAGraphCapture()
-                    with torch.cuda.stream(warmup), graph:
+                    mode = (
+                        CUDAGraphMode.FULL
+                        if capture == "breakable_full"
+                        else CUDAGraphMode.NONE
+                    )
+                    with (
+                        set_forward_context(
+                            None,
+                            vllm_config,
+                            num_tokens=tokens,
+                            num_tokens_across_dp=torch.tensor(
+                                counts, dtype=torch.int32
+                            ),
+                            cudagraph_runtime_mode=mode,
+                        ),
+                        torch.cuda.stream(warmup),
+                        graph,
+                    ):
                         batch.prepare_embeddings(ids)
                 torch.cuda.current_stream().wait_stream(warmup)
                 for step in (2, 3):
@@ -589,6 +610,7 @@ def _check_dummy_hash_model_forward(
     model.use_sequence_parallel = False
     model.fuse_mhc_all_reduce = False
     model.engram_batch = None
+    model.engram_per_rank = False
     model.engram_hash = state
     model.engram_swa_prefix = "swa"
     model.engram_dp_shared_memory = dp_shared_memory
