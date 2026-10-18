@@ -423,6 +423,28 @@ def test_combine_topk_swa_with_image_spans(cfg):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_v41_combine_topk_swa_workspace_tail_is_reset():
+    """A reused workspace ends each row in -1, like a freshly allocated one."""
+    from vllm.models.deepseek_v41.common.ops.cache_utils import (
+        combine_topk_swa_indices as combine_v41,
+    )
+
+    device = torch.device("cuda")
+    topk, window, cr = 64, 128, 2
+    seq_lens = torch.tensor([40, 300], dtype=torch.int32, device=device)
+    query_start_loc = torch.tensor([0, 3, 7], dtype=torch.int32, device=device)
+    topk_indices = torch.randint(-1, 20, (7, topk), dtype=torch.int32, device=device)
+    args = (topk_indices, query_start_loc, seq_lens, seq_lens, window, cr, topk)
+    fresh, fresh_lens = combine_v41(*args, 512, 150)
+    workspace = torch.full_like(fresh, 12345)
+    lens = torch.empty_like(fresh_lens)
+    reused, reused_lens = combine_v41(*args, 512, 150, out=(workspace, lens))
+    assert torch.equal(reused_lens, fresh_lens)
+    assert torch.equal(reused, fresh)
+    assert int(fresh_lens.max()) < fresh.shape[1]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("cfg", COMBINE_CASES)
 @pytest.mark.parametrize("query_len", [24, 20])
 def test_v41_combine_topk_swa_stops_at_replay_start(cfg, query_len):

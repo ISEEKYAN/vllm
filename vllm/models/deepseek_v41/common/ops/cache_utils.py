@@ -968,6 +968,9 @@ def combine_topk_swa_indices(
         )
     else:
         combined_indices, combined_lens = out
+        # The kernel writes only each token's valid prefix; a reused workspace
+        # must not keep stale indices past it.
+        combined_indices.fill_(-1)
 
     _COMBINE_TOPK_SWA_INDICES_KERNEL(
         combined_indices,
