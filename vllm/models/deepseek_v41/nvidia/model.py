@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 
 import vllm.envs as envs
+from vllm.compilation.breakable_cudagraph import bi_full_capture_breaks
 from vllm.config import VllmConfig
 from vllm.config.kernel import MEGA_MOE_BACKENDS, NATIVE_MEGA_MOE_BACKENDS
 from vllm.distributed import (
@@ -633,9 +634,10 @@ class DeepseekV4DecoderLayer(nn.Module):
         if self.use_sequence_parallel:
             x = sp_all_gather(x)[: positions.shape[0]]
 
-        # BI attention breaks FULL capture into eager segments, and a segment
-        # cannot end with the coefficient stream still forked: join before it.
-        join_before_attn = mhc_stream is not None and envs.VLLM_BATCH_INVARIANT
+        # BI attention breaks FULL capture of batches with prefills into eager
+        # segments, and a segment cannot end with the coefficient stream still
+        # forked: join before it.
+        join_before_attn = mhc_stream is not None and bi_full_capture_breaks()
         if join_before_attn:
             torch.cuda.current_stream().wait_stream(mhc_stream)
         x = self.attn(positions, x, None)

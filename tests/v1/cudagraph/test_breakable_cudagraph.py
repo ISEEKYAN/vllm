@@ -151,8 +151,12 @@ def test_decorator_passthrough_outside_capture():
 
 @pytest.mark.parametrize("bi", [False, True])
 @pytest.mark.parametrize("full_break", [False, True])
-def test_full_eager_boundary_replays_live_metadata(monkeypatch, bi, full_break):
-    """Opted-in BI FULL breaks refresh metadata while preserving output storage."""
+@pytest.mark.parametrize("prefills", [0, 1])
+def test_full_eager_boundary_replays_live_metadata(
+    monkeypatch, bi, full_break, prefills
+):
+    """Opted-in BI FULL breaks of batches with prefills refresh metadata while
+    preserving output storage; decode-only FULL graphs stay whole."""
     from types import SimpleNamespace
 
     import vllm.compilation.breakable_cudagraph as graphs
@@ -160,7 +164,8 @@ def test_full_eager_boundary_replays_live_metadata(monkeypatch, bi, full_break):
 
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", str(int(bi)))
     context = SimpleNamespace(
-        cudagraph_runtime_mode=CUDAGraphMode.FULL, attn_metadata={"delta": 2}
+        cudagraph_runtime_mode=CUDAGraphMode.FULL,
+        attn_metadata={"delta": 2, "attn": SimpleNamespace(num_prefills=prefills)},
     )
     recorded = []
 
@@ -185,7 +190,7 @@ def test_full_eager_boundary_replays_live_metadata(monkeypatch, bi, full_break):
     pointer = output.data_ptr()
     wrapped(source, output)
     assert torch.equal(output, torch.full((3,), 3.0))
-    assert len(recorded) == int(bi and full_break)
+    assert len(recorded) == int(bi and full_break and prefills > 0)
     if recorded:
         context.attn_metadata = {"delta": 7}
         recorded[0]()

@@ -65,6 +65,27 @@ def requires_ds41_bi_full_breaks(vllm_config: VllmConfig) -> bool:
     )
 
 
+def _batch_has_prefills() -> bool:
+    """Whether the current forward schedules any prefill (non-decode) request."""
+    metadata = get_forward_context().attn_metadata
+    if not isinstance(metadata, dict):
+        return False
+    return any(getattr(m, "num_prefills", 0) > 0 for m in metadata.values())
+
+
+def bi_full_capture_breaks() -> bool:
+    """Whether BI FULL capture of this batch breaks at ``bi_full_break`` ops.
+
+    DS41 BI decode reads only device metadata, so uniform-decode FULL graphs
+    stay whole; the prefill path still reads live host metadata.
+    """
+    return bool(
+        envs.VLLM_BATCH_INVARIANT
+        and is_forward_context_available()
+        and _batch_has_prefills()
+    )
+
+
 F = TypeVar("F", bound=Callable[..., Any])
 
 
@@ -85,8 +106,9 @@ def eager_break_during_capture(fn: F, *, bi_full_break: bool = False) -> F:
     segment, runs the function eagerly on the capture stream, records the
     callable for replay, and starts a fresh segment.
 
-    ``bi_full_break`` also breaks FULL capture in BI mode, for callers that
-    require live metadata. Other FULL captures keep their existing behavior.
+    ``bi_full_break`` also breaks FULL capture in BI mode when the batch has
+    prefills, for callers whose prefill path reads live host metadata. Other
+    FULL captures keep their existing behavior.
 
     **In-place output buffer required.** Decorated ops must write into a
     caller-provided output tensor; a fresh tensor returned by ``fn`` would
@@ -121,7 +143,7 @@ def eager_break_during_capture(fn: F, *, bi_full_break: bool = False) -> F:
         if is_forward_context_available():
             mode = get_forward_context().cudagraph_runtime_mode
             if mode == CUDAGraphMode.FULL and not (
-                bi_full_break and envs.VLLM_BATCH_INVARIANT
+                bi_full_break and bi_full_capture_breaks()
             ):
                 return fn(*args, **kwargs)
 

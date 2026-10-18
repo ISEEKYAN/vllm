@@ -1007,7 +1007,7 @@ def test_ds41_flashmla_cr2_bi_builder_constructs_on_cpu(monkeypatch):
 
 @pytest.mark.parametrize("breakable", [False, True])
 def test_ds41_flashmla_swa_bi_builder_policy(monkeypatch, breakable):
-    """BI graph support requires the live-metadata breakable capture route."""
+    """BI graph support requires the breakable capture route; decode stays BI."""
     from vllm.models.deepseek_v41.nvidia.flashmla import (
         DeepseekSparseSWAFlashMLAMetadataBuilder,
     )
@@ -1020,7 +1020,7 @@ def test_ds41_flashmla_swa_bi_builder_policy(monkeypatch, breakable):
     builder = DeepseekSparseSWAFlashMLAMetadataBuilder(
         spec, [swa.prefix], config, torch.device("cpu")
     )
-    assert builder.decode_threshold == 0
+    assert builder.decode_threshold == 1
     expected = AttentionCGSupport.ALWAYS if breakable else AttentionCGSupport.NEVER
     assert builder.get_cudagraph_support(config, spec) == expected
 
@@ -1126,7 +1126,7 @@ def _assert_ds41_flashmla_bi_schedule(monkeypatch, length, compress_ratio):
     builder = DeepseekSparseSWAFlashMLAMetadataBuilder(
         spec, [swa.prefix], config, device
     )
-    assert builder.decode_threshold == 0
+    assert builder.decode_threshold == 1
 
     pages = (max(lengths) + block_size - 1) // block_size
     tables = torch.arange(3 * pages, dtype=torch.int32, device=device).view(3, pages)
@@ -1153,6 +1153,7 @@ def _assert_ds41_flashmla_bi_schedule(monkeypatch, length, compress_ratio):
     attention.swa_cache_layer = swa
     attention.window_size = window
     attention.max_num_batched_tokens = max_tokens
+    attention.max_model_len = max(lengths)
     attention.topk_indices_buffer = torch.full(
         (max_tokens, 512), -1, device=device, dtype=torch.int32
     )
@@ -1224,8 +1225,9 @@ def _assert_ds41_flashmla_bi_schedule(monkeypatch, length, compress_ratio):
             causal=True,
         )
         metadata = builder.build(0, common)
-        assert metadata.num_decodes == 0 and metadata.num_prefills == len(schedule)
-        assert metadata.num_prefill_tokens == sum(sizes)
+        # Single-token requests take the graph-safe BI decode path.
+        assert metadata.num_decodes + metadata.num_prefills == len(schedule)
+        assert metadata.num_decode_tokens + metadata.num_prefill_tokens == sum(sizes)
         all_metadata = {swa.prefix: metadata}
         if compressed_builder is not None:
             from dataclasses import replace
@@ -1433,6 +1435,7 @@ def test_ds41_bi_flashmla_breakable_graph_replays_live_kv(monkeypatch, tmp_path,
     if torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("DS41 BI declaration is limited to SM100")
     from functools import partial
+    from types import SimpleNamespace
 
     from vllm.compilation.breakable_cudagraph import (
         BreakableCUDAGraphCapture,
@@ -1473,6 +1476,8 @@ def test_ds41_bi_flashmla_breakable_graph_replays_live_kv(monkeypatch, tmp_path,
                 .reshape(1, 1, 128)
                 .repeat(5, 1, 1),
                 "lengths": torch.full((5,), 128, device="cuda", dtype=torch.int32),
+                # BI FULL capture breaks only for batches with prefills.
+                "swa": SimpleNamespace(num_prefills=1),
             }
             for rows in (128, 256, 384)
         ]

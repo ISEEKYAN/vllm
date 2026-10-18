@@ -46,8 +46,9 @@ class DeepseekSparseSWAFlashMLAMetadataBuilder(DeepseekV41SparseSWAMetadataBuild
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         if envs.VLLM_BATCH_INVARIANT:
-            # Keep prefill and decode on the same BF16 sparse kernel.
-            self.decode_threshold = 0
+            # BI decode runs the prefill sparse kernel too, through graph-safe
+            # metadata (DeepseekV4FlashMLAAttention._forward_decode_bi).
+            self.decode_threshold = 1
 
     @classmethod
     def get_cudagraph_support(cls, vllm_config, kv_cache_spec):
@@ -197,6 +198,11 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         swa_only: bool,
         output: torch.Tensor,
     ) -> None:
+        if envs.VLLM_BATCH_INVARIANT:
+            self._forward_decode_bi(
+                q, kv_cache, swa_metadata, attn_metadata, swa_only, output
+            )
+            return
         num_decodes = swa_metadata.num_decodes
         num_decode_tokens = swa_metadata.num_decode_tokens
 
@@ -268,6 +274,109 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             extra_topk_length=topk_lens,
             out=output.unsqueeze(1),
         )
+
+    def _forward_decode_bi(
+        self,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor | None,  # None for SWA-only layers
+        swa_metadata: "DeepseekSparseSWAMetadata",
+        attn_metadata: DeepseekV4FlashMLAMetadata | None,
+        swa_only: bool,
+        output: torch.Tensor,
+    ) -> None:
+        """Single-token decode through the BI prefill sparse kernel.
+
+        Each token gathers the same KV rows, in the same order, as the prefill
+        path would for it, so FlashMLA reduces identically. Shapes come from the
+        model capacity and every length from device metadata, so the path is
+        CUDA graph safe. Workspace shapes match _forward_prefill.
+        """
+        num_decodes = swa_metadata.num_decodes
+        assert swa_metadata.num_decode_tokens == num_decodes
+        assert swa_metadata.max_decode_query_len == 1
+        assert swa_metadata.seq_lens is not None
+        assert swa_metadata.query_start_loc is not None
+        assert swa_metadata.is_valid_token is not None
+        seq_lens = swa_metadata.seq_lens[:num_decodes]
+        # Same gather length as the prefill gather-lens kernel at query_len 1.
+        replay_start = (
+            swa_metadata.replay_start[:num_decodes]
+            if swa_metadata.replay_start is not None
+            else torch.zeros_like(seq_lens)
+        )
+        gather_lens = torch.minimum(
+            1 + torch.clamp(seq_lens - 1 - replay_start, 0, self.window_size - 1),
+            seq_lens,
+        ).to(torch.int32)
+        N = (
+            0
+            if swa_only
+            else (self.max_model_len + self.compress_ratio - 1) // self.compress_ratio
+        )
+        M = N + self.window_size + self.max_num_batched_tokens
+        if swa_only:
+            top_k = 0
+        else:
+            assert self.topk_indices_buffer is not None
+            top_k = self.topk_indices_buffer.shape[-1]
+        combined_topk = round_up(top_k + self.window_size, 128)
+        workspace_manager = current_workspace_manager()
+        for start in range(0, num_decodes, self.PREFILL_CHUNK_SIZE):
+            end = min(start + self.PREFILL_CHUNK_SIZE, num_decodes)
+            kv, combined_indices_out, combined_lens_out = (
+                workspace_manager.get_simultaneous(
+                    ((self.PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
+                    ((self.max_num_batched_tokens, combined_topk), torch.int32),
+                    ((self.max_num_batched_tokens,), torch.int32),
+                )
+            )
+            if not swa_only:
+                assert attn_metadata is not None
+                dequantize_and_gather_k_cache(
+                    kv[: end - start],
+                    kv_cache,
+                    seq_lens=seq_lens[start:end] // self.compress_ratio,
+                    gather_lens=None,
+                    block_table=attn_metadata.block_table[start:end],
+                    block_size=attn_metadata.block_size // self.compress_ratio,
+                    offset=0,
+                )
+            dequantize_and_gather_k_cache(
+                kv[: end - start],
+                self.swa_cache_layer.kv_cache,
+                seq_lens=seq_lens[start:end],
+                gather_lens=gather_lens[start:end],
+                block_table=swa_metadata.block_table[start:end],
+                block_size=swa_metadata.block_size,
+                offset=N,
+            )
+            assert self.topk_indices_buffer is not None
+            combined_indices, combined_lens = combine_topk_swa_indices(
+                self.topk_indices_buffer[start:end],
+                swa_metadata.query_start_loc[start : end + 1],
+                seq_lens[start:end],
+                gather_lens[start:end],
+                self.window_size,
+                self.compress_ratio,
+                top_k,
+                M,
+                N,
+                out=(
+                    combined_indices_out[: end - start],
+                    combined_lens_out[: end - start],
+                ),
+            )
+            # Graph-padding tokens attend to nothing.
+            combined_lens.masked_fill_(~swa_metadata.is_valid_token[start:end], 0)
+            flash_mla_sparse_fwd(
+                q=q[start:end],
+                kv=kv.view(-1, 1, q.shape[-1]),
+                indices=combined_indices.unsqueeze(1),
+                sm_scale=self.scale,
+                attn_sink=self.attn_sink,
+                topk_length=combined_lens,
+                out=output[start:end],
+            )
 
     def _forward_prefill(
         self,

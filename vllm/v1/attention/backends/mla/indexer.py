@@ -1990,7 +1990,7 @@ _BUILD_PREFILL_CHUNK_METADATA_KERNEL = BuildPrefillChunkMetadataKernel()
 
 
 class DeepseekV41BIIndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder):
-    """Use dense prefill scoring and selection for both BI query phases."""
+    """BI decode scores with the prefill kernels (sparse_attn_indexer)."""
 
     @classmethod
     def get_cudagraph_support(cls, vllm_config, kv_cache_spec):
@@ -2001,8 +2001,3 @@ class DeepseekV41BIIndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder):
             if is_breakable_cudagraph_enabled()
             else AttentionCGSupport.NEVER
         )
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.decode_threshold = 0
-        logger.info_once("DS4.1 batch-invariant indexer uses the prefill scorer")

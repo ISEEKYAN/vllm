@@ -350,6 +350,95 @@ def _gather_workspace_shapes(
     )
 
 
+def _batch_invariant_decode_topk(
+    kv_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    q_quant: torch.Tensor,
+    q_scale: torch.Tensor | None,
+    weights: torch.Tensor,
+    topk_indices: torch.Tensor,
+    head_dim: int,
+    use_fp4_cache: bool,
+    candidate_blocks: torch.Tensor | None,
+    candidate_block_size: int,
+    candidate_write: bool,
+) -> None:
+    """Single-token BI decode through the prefill scorer and top-k.
+
+    Gathers each request's indexer K densely, as a prefill chunk does, and
+    scores and selects with the same kernels, so a token's row matches its
+    prefill row bitwise. Lengths stay on device and the workspace is sized by
+    the block table, so the path is CUDA graph safe.
+    """
+    from vllm.model_executor.kernels.batch_invariant import top_k_per_row_prefill
+
+    num_rows = q_quant.shape[0]
+    capacity = block_table.shape[1] * kv_cache.shape[1]
+    (values_shape, values_dtype), (scales_shape, scales_dtype) = (
+        _gather_workspace_shapes(
+            num_rows * capacity, head_dim, current_platform.fp8_dtype(), use_fp4_cache
+        )
+    )
+    k_quant = torch.empty(values_shape, dtype=values_dtype, device=q_quant.device)
+    k_scale = torch.empty(scales_shape, dtype=scales_dtype, device=q_quant.device)
+    row_lens = seq_lens.reshape(-1)[:num_rows].to(torch.int32)
+    cu_seq_lens = torch.zeros(num_rows + 1, dtype=torch.int32, device=q_quant.device)
+    torch.cumsum(row_lens, 0, out=cu_seq_lens[1:])
+    ops.cp_gather_indexer_k_quant_cache(
+        kv_cache, k_quant, k_scale, block_table[:num_rows], cu_seq_lens
+    )
+    if use_fp4_cache:
+        q_cast = q_quant.view(torch.int8)
+        k_quant_cast = k_quant.view(torch.int8)
+        k_scale_cast = k_scale.view(torch.int32).squeeze(-1)
+    else:
+        q_cast = q_quant
+        k_quant_cast = k_quant
+        k_scale_cast = k_scale.view(
+            torch.int32 if mqa_logits_use_mx_scales() else torch.float32
+        ).squeeze(-1)
+    cu_seqlen_ks, cu_seqlen_ke = cu_seq_lens[:-1], cu_seq_lens[1:]
+    q_scale, row_weights = mqa_logits_mx_inputs(q_cast, q_scale, weights)
+    row_ends = cu_seqlen_ke - cu_seqlen_ks
+    logits = as_fp32_logits(
+        fp8_fp4_mqa_logits(
+            (q_cast, q_scale),
+            (k_quant_cast, k_scale_cast),
+            row_weights,
+            cu_seqlen_ks,
+            cu_seqlen_ke,
+            capacity,
+        ),
+        row_ends,
+    )
+    if candidate_blocks is not None:
+        rows_candidates = candidate_blocks[:num_rows]
+        if candidate_write:
+            _select_candidate_blocks(
+                logits,
+                None,
+                row_ends,
+                rows_candidates.shape[1],
+                candidate_block_size,
+                rows_candidates,
+            )
+        else:
+            _apply_candidate_mask(
+                logits, None, row_ends, rows_candidates, candidate_block_size
+            )
+    top_k_per_row_prefill(
+        logits,
+        torch.zeros_like(row_ends),
+        row_ends,
+        topk_indices,
+        num_rows,
+        logits.stride(0),
+        logits.stride(1),
+        topk_indices.shape[-1],
+    )
+
+
 def kv_cache_as_quant_view(
     kv_cache: torch.Tensor,
     head_dim: int,
@@ -799,7 +888,25 @@ def sparse_attn_indexer(
             # Rows are already fully ranked, so this is a layout gather.
             row_shard.exchange_topk(topk_indices_buffer, topk_tokens)
 
-    if has_decode:
+    if has_decode and envs.VLLM_BATCH_INVARIANT and current_platform.is_cuda():
+        decode_metadata = attn_metadata_narrowed.decode
+        assert decode_metadata is not None
+        assert dcp_world_size == 1, "BI indexer decode does not support DCP"
+        _batch_invariant_decode_topk(
+            kv_cache,
+            decode_metadata.block_table,
+            decode_metadata.seq_lens,
+            q_quant[:num_decode_tokens],
+            q_scale[:num_decode_tokens] if q_scale is not None else None,
+            weights[:num_decode_tokens],
+            topk_indices_buffer[:num_decode_tokens, :topk_tokens],
+            head_dim,
+            use_fp4_cache,
+            candidate_blocks,
+            candidate_block_size,
+            candidate_write,
+        )
+    elif has_decode:
         decode_metadata = attn_metadata_narrowed.decode
         assert decode_metadata is not None
         kv_cache = kv_cache_as_quant_view(kv_cache, head_dim, use_fp4_cache)
