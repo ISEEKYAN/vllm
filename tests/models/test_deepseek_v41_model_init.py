@@ -68,6 +68,26 @@ def test_prefix_replay_requires_an_uncompressed_kv_source(
     assert model.decoder_replay_start == (0 if replay else 2)
 
 
+@pytest.mark.parametrize("batch_invariant", [False, True])
+def test_bi_rejects_megamoe_in_kernel_combine(monkeypatch, batch_invariant):
+    """BI needs the fixed-order expert combine, which MegaMoE cannot provide."""
+    import vllm.models.deepseek_v41.nvidia.model as model_module
+    from vllm import envs
+
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", batch_invariant)
+    monkeypatch.setattr(model_module, "_use_sequence_parallel", lambda config: False)
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+        quant_config=None,
+        kernel_config=SimpleNamespace(moe_backend="deep_gemm_mega_moe"),
+        parallel_config=SimpleNamespace(enable_expert_parallel=True),
+    )
+    # The stub config stops construction right after the backend checks.
+    with pytest.raises(Exception) as error:
+        model_module.DeepseekV4Model(vllm_config=vllm_config)
+    assert ("MegaMoE" in str(error.value)) == batch_invariant
+
+
 def test_wo_a_dtype_defaults_to_fp8_and_rejects_unknown():
     from vllm.models.deepseek_v41.quant_config import deepseek_v4_wo_a_dtype
 

@@ -731,6 +731,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 "Enable it with --enable-expert-parallel, or pick a different "
                 "moe backend."
             )
+        if self.use_native_mega_moe and envs.VLLM_BATCH_INVARIANT:
+            # MegaMoE combines inside the kernel; the BI expert path instead
+            # reduces single-owner rows and combines top-k in a fixed order.
+            raise ValueError(
+                "VLLM_BATCH_INVARIANT=1 does not support the DeepGEMM MegaMoE "
+                "backend for DeepSeek V4.1; use moe_backend='deep_gemm' with "
+                "all2all_backend='allgather_reducescatter'."
+            )
         self.wo_a_bf16 = (
             deepseek_v4_wo_a_dtype(getattr(config, "text_config", config)) == "bf16"
         )
