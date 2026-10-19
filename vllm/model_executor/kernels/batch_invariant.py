@@ -42,6 +42,7 @@ def _load_batch_invariant_kernel_library(path: str) -> None:
             "top_k_per_row_prefill",
             "top_k_per_row_prefill_index_order",
             "silu_mul_bf16",
+            "swiglu_apply_weight_to_fp8",
             "hc_collapse",
             "sparse_metadata",
             "combine_swa_first_indices",
@@ -373,6 +374,51 @@ def silu_mul_bf16(
         input.contiguous(), output, clamp_limit
     )
     return output
+
+
+def swiglu_apply_weight_to_fp8(
+    x: torch.Tensor,
+    topk_weights: torch.Tensor | None = None,
+    *,
+    clamp_limit: float | None = None,
+    fast_math: bool = True,
+    avail_rows: torch.Tensor | None = None,
+    output_bf16: bool = False,
+) -> (
+    tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+):
+    """SwiGLU, routing weight and MXFP8 cast of DeepGEMM MegaMoE's L1 epilogue.
+
+    ``x`` is the BF16 ``[M, 2N]`` L1 output ([gate | up]); ``topk_weights`` is
+    the FP32 per-row routing weight (``None`` = 1, as for the shared expert).
+    Returns E4M3 ``[M, N]`` codes and packed UE8M0 scales ``[M, N/128]`` int32
+    in the MN-major TMA-aligned layout DeepGEMM grouped GEMMs consume, plus the
+    pre-cast FP32 values rounded to BF16 when ``output_bf16``. Rows from
+    ``avail_rows[0]`` on are left untouched.
+    """
+    require_batch_invariant_kernel()
+    rows, inter = x.shape[0], x.shape[1] // 2
+    q = torch.empty((rows, inter), device=x.device, dtype=torch.float8_e4m3fn)
+    aligned = (rows + 3) // 4 * 4
+    s = torch.empty((inter // 128, aligned), device=x.device, dtype=torch.int32).T[
+        :rows
+    ]
+    bf16 = (
+        torch.empty((rows, inter), device=x.device, dtype=torch.bfloat16)
+        if output_bf16
+        else None
+    )
+    torch.ops.vllm_batch_invariant.swiglu_apply_weight_to_fp8(
+        x.contiguous(),
+        None if topk_weights is None else topk_weights.contiguous(),
+        avail_rows,
+        q,
+        s,
+        bf16,
+        clamp_limit,
+        fast_math,
+    )
+    return (q, s, bf16) if output_bf16 else (q, s)
 
 
 def fused_silu_mul_per_token_group_quant_fp8(
