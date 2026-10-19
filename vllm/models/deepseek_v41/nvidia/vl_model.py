@@ -27,11 +27,13 @@ from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
     SupportsEagle3,
     SupportsEncoderCudaGraph,
+    SupportsLoRA,
     SupportsMultiModal,
     SupportsPP,
 )
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
+    PPMissingLayer,
     WeightsMapper,
     maybe_prefix,
 )
@@ -110,6 +112,30 @@ def _make_deepseek_v4_vl_weights_mapper(
     )
 
 
+def _check_lora_targets(vllm_config, model: nn.Module) -> None:
+    """LoRA targets must name modules in full: a suffix can wrap modules it
+    was not meant for, or none (an experts slot is built only when named)."""
+    lora_config = vllm_config.lora_config
+    if lora_config is None:
+        return
+    names, elsewhere = set(), []  # elsewhere: layers of other pipeline stages
+    for name, module in model.named_modules():
+        names.add(name)
+        if isinstance(module, PPMissingLayer):
+            elsewhere.append(name + ".")
+    targets = lora_config.target_modules
+    missing = [
+        t
+        for t in targets or ()
+        if t not in names and not t.startswith(tuple(elsewhere))
+    ]
+    if not targets or missing:
+        raise ValueError(
+            "DeepSeek-V4.1 LoRA needs target_modules as full module names "
+            f"(language_model.model.layers.N...); not modules: {missing}"
+        )
+
+
 @MULTIMODAL_REGISTRY.register_processor(
     DeepseekV4VLMultiModalProcessor,
     info=DeepseekV4VLProcessingInfo,
@@ -122,6 +148,7 @@ class DeepseekV41ForCausalLM(
     SupportsEncoderCudaGraph,
     SupportsPP,
     SupportsEagle3,
+    SupportsLoRA,
 ):
     """Multimodal entry point for DeepSeek-V4.1 checkpoints with a vision tower.
 
@@ -132,6 +159,12 @@ class DeepseekV41ForCausalLM(
     """
 
     supports_encoder_tp_data = True
+
+    # LoRA reads these off the registered (top) class. Adapter keys use the
+    # checkpoint names (``layers.N.attn.wq_b``), which the instance's
+    # ``hf_to_vllm_mapper`` maps under ``language_model.model``.
+    packed_modules_mapping = DeepseekV41LLMForCausalLM.packed_modules_mapping
+    lora_skip_prefixes = DeepseekV41LLMForCausalLM.lora_skip_prefixes
 
     # The MoE router needs raw token ids to detect image-span tokens
     # (all carrying image_token_id, see common/mm_preprocess.py) and apply
@@ -190,6 +223,7 @@ class DeepseekV41ForCausalLM(
         self.hf_to_vllm_mapper = _make_deepseek_v4_vl_weights_mapper(
             expert_dtype, _linear_scale_param_name(vllm_config, expert_dtype)
         )
+        _check_lora_targets(vllm_config, self)
 
     def _parse_and_validate_image_input(
         self, **kwargs: object

@@ -891,6 +891,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 if getattr(layer, "engram", None) is not None
             ],
             vllm_config.scheduler_config.max_num_batched_tokens,
+            DeepseekV41LLMForCausalLM.packed_modules_mapping,
         )
         if self.fuse_mhc_all_reduce:
             # A MoE's top-k finalize folds into the next layer's first mHC

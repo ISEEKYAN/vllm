@@ -1499,6 +1499,41 @@ def _all_to_all_rows(
     comm.group_end()
 
 
+def _lora_wraps_wkv(
+    layers: list["Engram"], packed_modules_mapping: dict[str, list[str]] | None
+) -> bool:
+    """Whether LoRA will wrap an Engram WKV, which then needs its BF16 input.
+
+    The batch stages MXFP8 rows only, so it is kept unless a WKV is targeted.
+    LoRA wraps by name suffix and packed children too (``wkv`` and
+    ``fused_wqa_wkv`` both reach ``engram.wkv``): an Engram WKV may be
+    targeted only by its full name, and targets must be given explicitly.
+    """
+    lora_config = get_current_vllm_config().lora_config
+    if lora_config is None:
+        return False
+    from vllm.lora.utils import is_in_target_modules
+
+    targets = lora_config.target_modules
+    if targets is None:
+        raise ValueError(
+            "DeepSeek-V4.1 LoRA needs --lora-target-modules with full module "
+            "names: without it every linear is wrapped."
+        )
+    names = [layer.wkv.prefix for layer in layers]
+    wrapped = [
+        name
+        for name in names
+        if is_in_target_modules(name, targets, packed_modules_mapping)
+    ]
+    if implicit := [name for name in wrapped if name not in targets]:
+        raise ValueError(
+            f"LoRA targets reach Engram {implicit} by suffix; name every "
+            "targeted module in full."
+        )
+    return bool(wrapped)
+
+
 class EngramBatch(nn.Module):
     """Stage every Engram layer's WKV input as MXFP8 with one exchange.
 
@@ -1548,16 +1583,20 @@ class EngramBatch(nn.Module):
             )
 
     @classmethod
-    def create(cls, layers: list["Engram"], max_tokens: int) -> "EngramBatch | None":
+    def create(
+        cls,
+        layers: list["Engram"],
+        max_tokens: int,
+        packed_modules_mapping: dict[str, list[str]] | None = None,
+    ) -> "EngramBatch | None":
         """Batch DP-sharded tables whose WKV takes FlashInfer MXFP8 input."""
-        if not layers:
+        if not layers or _lora_wraps_wkv(layers, packed_modules_mapping):
             return None
         table = layers[0].embed_tokens
         if (
             table.dp_size == 1
             or table.tp_size > 1
             or table.dim % 128
-            or get_current_vllm_config().lora_config is not None
             or not can_fuse_query_quant([layer.wkv for layer in layers])
         ):
             return None
