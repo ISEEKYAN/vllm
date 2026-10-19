@@ -34,6 +34,9 @@ class QuantizedActivation:
     orig_dtype: torch.dtype
     orig_shape: torch.Size
     quant_key: QuantKey
+    # The unquantized activation the data was produced from, when a consumer
+    # branch (a LoRA adapter) needs it beside the quantized one.
+    orig: torch.Tensor | None = None
 
     def weak_ref(self) -> "QuantizedActivation":
         """Return a copy with non-owning tensor references for CUDA graph replay."""
@@ -43,6 +46,7 @@ class QuantizedActivation:
             self,
             data=weak_ref_tensor(self.data),
             scale=weak_ref_tensor(self.scale),
+            orig=None if self.orig is None else weak_ref_tensor(self.orig),
         )
 
 
@@ -67,6 +71,12 @@ def get_input_quant_key(layer: torch.nn.Module) -> QuantKey | None:
     if getattr(layer, "requires_unquantized_input", False):
         return None
     return getattr(layer, "_input_quant_key", None)
+
+
+def get_base_input_quant_key(layer: torch.nn.Module) -> QuantKey | None:
+    """The key of the base kernel under any wrapper; a producer feeding a layer
+    that ``requires_unquantized_input`` this way must set ``orig``."""
+    return getattr(getattr(layer, "base_layer", layer), "_input_quant_key", None)
 
 
 def as_quantized_activation(

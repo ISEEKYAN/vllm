@@ -100,3 +100,22 @@ def test_lora_targets_must_be_full_module_names(targets, ok):
         with pytest.raises(ValueError):
             _check_lora_targets(config, model)
     _check_lora_targets(SimpleNamespace(lora_config=None), model)
+
+
+def test_lora_branch_reads_the_unquantized_activation():
+    import torch
+
+    from vllm.lora.layers.base_linear import _lora_input
+    from vllm.model_executor.layers.fusion.quant_activation import (
+        QuantizedActivation,
+    )
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        kMxfp8Dynamic,
+    )
+
+    orig = torch.randn(4, 64)
+    qa = QuantizedActivation(orig, orig, orig.dtype, orig.shape, kMxfp8Dynamic)
+    with pytest.raises(ValueError):
+        _lora_input(qa)
+    qa.orig = orig
+    assert _lora_input(qa) is orig and _lora_input(orig) is orig

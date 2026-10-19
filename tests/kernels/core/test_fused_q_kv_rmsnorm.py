@@ -301,3 +301,35 @@ def test_shared_query_quant_preserves_projection(
         torch.testing.assert_close(reshaped, expected.unsqueeze(0), rtol=0, atol=0)
         with pytest.raises(AssertionError, match="consumer kernel"):
             linear(replace(q, quant_key=kNvfp4Dynamic))
+
+
+@pytest.mark.skipif(
+    not current_platform.has_device_capability(100), reason="MXFP8 needs Blackwell"
+)
+@pytest.mark.parametrize("num_tokens", [1, 129, 1024])
+def test_fused_q_kv_rmsnorm_quant_emit_orig(num_tokens):
+    """The BF16 Q a LoRA adapter reads is exactly the value that was quantized,
+    and emitting it leaves the quantized Q and the KV unchanged."""
+    from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+        mxfp8_e4m3_quantize,
+    )
+    from vllm.models.deepseek_v41.common.ops.query_quant import (
+        fused_q_kv_rmsnorm_quant,
+    )
+
+    torch.manual_seed(0)
+    x = torch.randn(num_tokens, 1280 + 512, device="cuda", dtype=torch.bfloat16)
+    qr, kv = x.split([1280, 512], -1)
+    qw, kvw = torch.randn(1280, device="cuda"), torch.randn(512, device="cuda")
+    base, base_kv = fused_q_kv_rmsnorm_quant(
+        qr, kv, qw.bfloat16(), kvw.bfloat16(), 1e-6
+    )
+    out, out_kv = fused_q_kv_rmsnorm_quant(
+        qr, kv, qw.bfloat16(), kvw.bfloat16(), 1e-6, emit_orig=True
+    )
+    assert base.orig is None and out.orig is not None
+    assert torch.equal(out.data.view(torch.uint8), base.data.view(torch.uint8))
+    assert torch.equal(out.scale, base.scale) and torch.equal(out_kv, base_kv)
+    q, scale = mxfp8_e4m3_quantize(out.orig, is_sf_swizzled_layout=True)
+    assert torch.equal(q.view(torch.uint8), out.data.view(torch.uint8))
+    assert torch.equal(scale, out.scale)

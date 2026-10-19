@@ -804,10 +804,22 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             can_fuse_query_quant,
         )
 
+        return can_fuse_query_quant(self._q_quant_linears, allow_orig=True)
+
+    @cached_property
+    def _q_quant_linears(self) -> list[nn.Module]:
         linears = [self.wq_b]
         if self.indexer is not None:
             linears.append(self.indexer.wq_b)
-        return can_fuse_query_quant(linears)
+        return linears
+
+    @cached_property
+    def _q_quant_needs_orig(self) -> bool:
+        """A LoRA-wrapped Q projection also takes the BF16 normalized Q."""
+        return any(
+            getattr(linear, "requires_unquantized_input", False)
+            for linear in self._q_quant_linears
+        )
 
     def _split_qkv_and_norm(
         self, qr_kv: torch.Tensor
@@ -835,6 +847,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 self.q_norm.weight.data,
                 self.kv_norm.weight.data,
                 self.eps,
+                emit_orig=self._q_quant_needs_orig,
             )
             return qr_quant, None, kv
         qr, kv = fused_q_kv_rmsnorm(
