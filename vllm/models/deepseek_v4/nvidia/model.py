@@ -238,6 +238,15 @@ def _compile_mega_gate_configs(
     _MEGA_GATE_WARMED_M[key] = num_tokens
 
 
+def _lora_targets_experts(vllm_config: VllmConfig, experts_prefix: str) -> bool:
+    """Whether LoRA targets an adapter slot of these experts (by full name)."""
+    lora_config = vllm_config.lora_config
+    if lora_config is None or not lora_config.target_modules:
+        return False
+    targets = lora_config.target_modules
+    return any(t.startswith(experts_prefix + ".") for t in targets)
+
+
 class DeepseekV4MoE(nn.Module):
     def __init__(
         self,
@@ -425,7 +434,17 @@ class DeepseekV4MoE(nn.Module):
             and (self.use_sequence_parallel or self.tp_size == 1)
         )
 
-        self.experts = DeepGemmMegaMoEExperts(
+        experts_cls: type[DeepGemmMegaMoEExperts] = DeepGemmMegaMoEExperts
+        if _lora_targets_experts(vllm_config, f"{prefix}.experts"):
+            # LoRA needs the steps between MegaMoE's GEMMs: same numerics, unfused.
+            from vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe_unfused import (  # noqa: E501
+                DeepGemmMegaMoEUnfusedExperts,
+            )
+
+            if not fuse_shared_experts:
+                raise NotImplementedError("Expert LoRA needs the fused shared expert")
+            experts_cls = DeepGemmMegaMoEUnfusedExperts
+        self.experts = experts_cls(
             vllm_config,
             num_experts=self.n_physical_experts,
             num_local_experts=self.n_local_physical_experts,
