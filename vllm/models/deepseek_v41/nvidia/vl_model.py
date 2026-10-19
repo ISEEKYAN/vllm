@@ -166,6 +166,15 @@ class DeepseekV41ForCausalLM(
     packed_modules_mapping = DeepseekV41LLMForCausalLM.packed_modules_mapping
     lora_skip_prefixes = DeepseekV41LLMForCausalLM.lora_skip_prefixes
 
+    @staticmethod
+    def lora_tensor_transform(tensors: dict) -> dict:
+        """The trainer's expert adapters -> the unfused experts' slots."""
+        from vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe_unfused import (  # noqa: E501
+            lora_tensor_transform,
+        )
+
+        return lora_tensor_transform(tensors)
+
     # The MoE router needs raw token ids to detect image-span tokens
     # (all carrying image_token_id, see common/mm_preprocess.py) and apply
     # bias_vl.

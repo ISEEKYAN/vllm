@@ -119,3 +119,70 @@ def test_lora_branch_reads_the_unquantized_activation():
         _lora_input(qa)
     qa.orig = orig
     assert _lora_input(qa) is orig and _lora_input(orig) is orig
+
+
+def test_in_memory_adapter_update_keeps_caller_tensors():
+    import torch
+
+    from vllm.lora.lora_model import LoRAModel
+    from vllm.lora.request import LoRARequest
+    from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager
+
+    r, E = 4, 3
+    tensors = {
+        "layers.20.attn.wq_b.lora_A.weight": torch.randn(r, 16),
+        "layers.20.attn.wq_b.lora_B.weight": torch.randn(32, r),
+        "layers.20.ffn.experts.lora_gate_up_A.weight": torch.randn(r, 16),
+        "layers.20.ffn.experts.lora_down_B.weight": torch.randn(16, r),
+        "layers.20.ffn.shared_experts.w2.lora_A.weight": torch.randn(r, 8),
+        "layers.20.ffn.shared_experts.w2.lora_B.weight": torch.randn(16, r),
+        **{
+            f"layers.20.ffn.experts.{e}.lora_gate_up_B.weight": torch.randn(8, r)
+            for e in range(E)
+        },
+        **{
+            f"layers.20.ffn.experts.{e}.lora_down_A.weight": torch.randn(r, 4)
+            for e in range(E)
+        },
+    }
+    tensors = {k: v.bfloat16() for k, v in tensors.items()}
+    before = {k: v.clone() for k, v in tensors.items()}
+    added: list = []
+
+    def add_adapter(lora):
+        # As the model manager does: scale B by alpha / r in place.
+        for weights in lora.loras.values():
+            weights.optimize()
+        added.append(lora)
+
+    manager = SimpleNamespace(
+        model=DeepseekV41ForCausalLM.__new__(DeepseekV41ForCausalLM),
+        remove_adapter=lambda i: None,
+        add_adapter=add_adapter,
+        activate_adapter=lambda i: None,
+    )
+    manager.model.hf_to_vllm_mapper = _make_deepseek_v4_vl_weights_mapper(
+        "fp4", "weight_scale"
+    )
+    fake = SimpleNamespace(
+        _adapter_manager=manager,
+        _lora_model_cls=LoRAModel,
+        vocab_size=None,
+        lora_config=SimpleNamespace(max_lora_rank=r, lora_dtype=torch.bfloat16),
+    )
+    LRUCacheWorkerLoRAManager.add_adapter_tensors(
+        fake,
+        LoRARequest("policy-v7", 1, "mem://policy"),
+        tensors,
+        {"r": r, "lora_alpha": 2 * r, "target_modules": ["wq_b"]},
+    )
+    assert all(torch.equal(tensors[k], before[k]) for k in tensors)
+    loras = added[0].loras
+    prefix = "language_model.model.layers.20."
+    gate_up = loras[prefix + "ffn.experts.gate_up"]
+    assert gate_up.lora_b.shape == (E, 8, r)
+    assert torch.equal(
+        gate_up.lora_b[1], 2 * before["layers.20.ffn.experts.1.lora_gate_up_B.weight"]
+    )
+    assert loras[prefix + "ffn.experts.down"].lora_a.shape == (E, r, 4)
+    assert prefix + "ffn.experts.shared_w2" in loras
