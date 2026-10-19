@@ -18,6 +18,7 @@ from vllm.models.deepseek_v41.decoder_replay_layers import (
     DecoderReplayLayers,
     ReplayBatch,
     ReplayStage,
+    tail_rows,
 )
 from vllm.models.deepseek_v41.nvidia.decoder_replay_cudagraph import (
     DecoderReplayCudaGraphManager,
@@ -286,6 +287,7 @@ class DeepseekV41ModelState(DefaultModelState):
             )
         layers = self.decoder_replay_layers
         compilation_config = vllm_config.compilation_config
+        self._lora_stage_metas: list = []
         self.replay_cudagraphs: DecoderReplayCudaGraphManager | None = None
         if (
             layers is not None
@@ -576,6 +578,7 @@ class DeepseekV41ModelState(DefaultModelState):
                     attn_groups, layers.stage_metadata_prefixes[i]
                 )
         replay_groups, first_swa_groups = self._replay_attn_groups
+        lora_metas = self._replay_lora_metas()
         stages: list[ReplayStage] = []
         prev_dropped = None
         replay_batch: ReplayBatch | None = None
@@ -653,9 +656,23 @@ class DeepseekV41ModelState(DefaultModelState):
                 ),
                 is_padding=is_padding,
             )
+            lora_meta = None
+            if lora_metas is not None:
+                # The LoRA kernels size their tiles from the per-LoRA counts:
+                # these rows need metadata of their own (replay graphs are off).
+                assert run_graph is None
+                lora_meta = lora_metas[i]
+                layers.lora_punica.prepare_sub_batch_meta(
+                    lora_meta,
+                    tail_rows(input_batch.query_start_loc_np[: num_reqs + 1], lens),
+                )
             if i == 0:
                 replay_batch = ReplayBatch(
-                    rows[:num_tokens], forward_context, run_graph, stages
+                    rows[:num_tokens],
+                    forward_context,
+                    run_graph,
+                    stages,
+                    lora_meta=lora_meta,
                 )
             else:
                 stages.append(
@@ -664,9 +681,25 @@ class DeepseekV41ModelState(DefaultModelState):
                         select[:num_tokens],
                         forward_context,
                         run_graph,
+                        lora_meta=lora_meta,
                     )
                 )
         layers.replay_batch = replay_batch
+
+    def _replay_lora_metas(self) -> list | None:
+        """Per-stage LoRA kernel metadata when the replay layers carry LoRA."""
+        layers = self.decoder_replay_layers
+        if layers is None or self.vllm_config.lora_config is None:
+            return None
+        if layers.lora_punica is None:
+            # Resolved on first use: LoRA wraps the layers after construction.
+            layers.lora_punica = layers.find_lora_punica()
+            if layers.lora_punica is None:
+                return None
+            self._lora_stage_metas = [
+                layers.lora_punica.new_sub_batch_meta() for _ in layers.stage_rows
+            ]
+        return self._lora_stage_metas
 
     def capture_inner_cudagraphs(
         self,

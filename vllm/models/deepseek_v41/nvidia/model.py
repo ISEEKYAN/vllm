@@ -770,6 +770,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             vllm_config.kernel_config.moe_backend in NATIVE_MEGA_MOE_BACKENDS
         )
         self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
+        if self.use_sequence_parallel and vllm_config.lora_config is not None:
+            # Layers would run on token shards against a full-batch LoRA mapping.
+            raise ValueError(
+                "LoRA is not supported with DeepSeek-V4.1 sequence parallel"
+            )
         if (
             self.use_native_mega_moe
             and not vllm_config.parallel_config.enable_expert_parallel
@@ -960,6 +965,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 select_shared_rows=(
                     self._select_shared_replay_rows if stage_rows else None
                 ),
+                lora_modules=lambda: list(self.layers[cut : self.end_layer]),
             )
             if stage_rows:
                 logger.info_once(
