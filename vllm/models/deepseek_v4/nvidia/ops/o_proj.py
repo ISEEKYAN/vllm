@@ -118,6 +118,9 @@ def deep_gemm_fp8_o_proj(
     the padding groups are sliced off.
     """
     use_fp8 = wo_a.weight.dtype == torch.float8_e4m3fn
+    lora = getattr(wo_a, "apply_grouped_lora", None)
+    if lora is not None and (use_fp8 or not envs.VLLM_BATCH_INVARIANT):
+        raise NotImplementedError("wo_a LoRA needs the batch-invariant BF16 wo_a")
     if isinstance(o, QuantizedActivation):
         assert use_fp8
         o_proj_input, o_scale = o.data[:, :n_groups], o.scale[:, :n_groups]
@@ -192,6 +195,8 @@ def deep_gemm_fp8_o_proj(
             z[:, group] = bf16_fixed_mm(
                 o_proj_input[:, group].contiguous(), grouped_weight[group]
             ).to(z.dtype)
+        if lora is not None:
+            lora(o_proj_input, z)
     else:
         grouped_weight = wo_a.weight.view(n_groups, o_lora_rank, -1)
         torch.bmm(
