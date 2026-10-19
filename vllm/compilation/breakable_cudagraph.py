@@ -95,9 +95,10 @@ def eager_break_during_capture(fn: F) -> F:
         def unified_attention_with_output(...):
             ...
     """
-    if not is_breakable_cudagraph_enabled():
-        return fn
 
+    # Always wrap: VLLM_USE_BREAKABLE_CUDAGRAPH may be auto-enabled by the
+    # config after this module was imported. Without a capture the wrapper
+    # just calls ``fn``.
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         capture = BreakableCUDAGraphCapture.current()
