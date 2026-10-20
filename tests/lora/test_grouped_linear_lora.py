@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Grouped (``is_bmm``) linear LoRA, as on DeepSeek-V4 ``wo_a``: each group
 adds ``B_g (A_g x_g)`` to its own output slice, and a row's result does not
-depend on the batch around it."""
+depend on the batch around it; with an FP8 ``wo_a`` the adapter still reads the
+BF16 rotated attention output."""
 
 import pytest
 import torch
@@ -59,3 +60,76 @@ def test_grouped_lora(dist_init, monkeypatch):
     layer.apply_grouped_lora(x[:sub], z_sub)
     assert torch.equal(z_sub.view(torch.int16), z[:sub].view(torch.int16))
     lora_utils.get_lora_op_configs.cache_clear()
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="the RoPE kernel needs CUDA")
+def test_fp8_wo_a_lora_reads_bf16_inv_rope(monkeypatch):
+    """With an FP8 ``wo_a`` the adapter adds to the FP8 GEMM's output and reads
+    BF16 ``inv_rope(o)``: the rotation the GEMM input is quantized from."""
+    from types import SimpleNamespace
+
+    import vllm.models.deepseek_v4.nvidia.ops.o_proj as o_proj
+    from vllm.model_executor.layers.fusion.quant_activation import (
+        QuantizedActivation,
+    )
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        kMxfp8Dynamic,
+    )
+    from vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant import (
+        fused_inv_rope_fp8_quant,
+    )
+
+    monkeypatch.setattr(o_proj.envs, "VLLM_BATCH_INVARIANT", True)
+    monkeypatch.setattr(o_proj.envs, "VLLM_BI_MXFP8_GEMM", "tensor_core")
+    monkeypatch.setattr(o_proj, "_compile_einsum_configs", lambda *a, **k: None)
+    tokens, groups, heads_per_group, rank = 5, 2, 2, 128
+    base = torch.randn(tokens, groups, rank, device="cuda").bfloat16()
+    monkeypatch.setattr(o_proj, "fp8_einsum", lambda eq, a, b, z, recipe: z.copy_(base))
+    seen = {}
+
+    def lora(x, z):
+        seen["x"], seen["z"] = x.clone(), z.clone()
+        z.add_(1)
+
+    wo_a = SimpleNamespace(
+        weight=torch.zeros(groups * rank, heads_per_group * 512, device="cuda").to(
+            torch.float8_e4m3fn
+        ),
+        weight_scale=torch.zeros(1, device="cuda"),
+        apply_grouped_lora=lora,
+    )
+    o = torch.randn(tokens, groups * heads_per_group, 512, device="cuda").bfloat16()
+    positions = torch.arange(tokens, device="cuda")
+    cache = torch.randn(64, 64, device="cuda")
+    shape = dict(n_groups=groups, heads_per_group=heads_per_group, nope_dim=448)
+    out = o_proj.deep_gemm_fp8_o_proj(
+        o,
+        positions,
+        cache,
+        wo_a,
+        lambda z: z,
+        rope_dim=64,
+        o_lora_rank=rank,
+        einsum_recipe=(1, 1, 32),
+        tma_aligned_scales=True,
+        **shape,
+    )
+    rotated, _ = fused_inv_rope_fp8_quant(o, positions, cache, quantize=False, **shape)
+    assert torch.equal(seen["x"].view(torch.int16), rotated.view(torch.int16))
+    assert torch.equal(seen["z"], base)
+    assert torch.equal(out, base.clone().add_(1).flatten(1))
+
+    quantized = QuantizedActivation(o, o, o.dtype, o.shape, kMxfp8Dynamic)
+    with pytest.raises(NotImplementedError):
+        o_proj.deep_gemm_fp8_o_proj(
+            quantized,
+            positions,
+            cache,
+            wo_a,
+            lambda z: z,
+            rope_dim=64,
+            o_lora_rank=rank,
+            einsum_recipe=(1, 1, 32),
+            tma_aligned_scales=True,
+            **shape,
+        )
