@@ -77,9 +77,14 @@ def _mn_major(sf: torch.Tensor) -> torch.Tensor:
     return out.copy_(sf)
 
 
-def _bf16_add(base: torch.Tensor, delta: torch.Tensor, rows: torch.Tensor) -> None:
-    """``base[rows] = bf16(base + delta)``; other rows keep their bits."""
-    base.copy_(torch.where(rows[:, None], base + delta, base))
+def _slot_add(
+    base: torch.Tensor, slots: torch.Tensor, delta: torch.Tensor, mask: torch.Tensor
+) -> None:
+    """``base[slots] = bf16(base[slots] + delta)`` where ``mask``, one row per
+    (token, slot); other rows keep their bits. Slots of other ranks' experts
+    point at ``base``'s last (scratch) row."""
+    rows = base[slots]
+    base.index_copy_(0, slots, torch.where(mask[:, None], rows + delta, rows))
 
 
 class DeepGemmMegaMoEUnfusedExperts(DeepGemmMegaMoEExperts):
@@ -184,13 +189,18 @@ class DeepGemmMegaMoEUnfusedExperts(DeepGemmMegaMoEExperts):
             expert_map=self._expert_map,
         )
         rows = a.shape[0]
-        # Each permuted row's routing weight, source token, and adapter flag.
+        # Each (token, slot)'s permuted row (other ranks' slots: row ``rows``,
+        # a scratch row) and each permuted row's routing weight.
         dump = torch.where(inverse >= 0, inverse, rows).flatten().long()
         row_w = torch.zeros(rows + 1, device=device).scatter_(0, dump, w_all.flatten())
         row_w = row_w[:rows].contiguous()
-        l1 = torch.zeros(
-            (rows, 2 * self.intermediate_size), dtype=torch.bfloat16, device=device
+        l1_full = torch.zeros(
+            (rows + 1, 2 * self.intermediate_size), dtype=torch.bfloat16, device=device
         )
+        l1 = l1_full[:rows]
+        # Rows past the last expert block are padding: the epilogue skips them.
+        ends = torch.arange(1, rows + 1, dtype=torch.int32, device=device)
+        avail = (ends * (layout >= 0)).amax().reshape(1)
         with mk_alignment_scope(align):
             dg.m_grouped_fp8_fp4_gemm_nt_contiguous(
                 (a, a_sf),
@@ -200,28 +210,37 @@ class DeepGemmMegaMoEUnfusedExperts(DeepGemmMegaMoEExperts):
                 recipe_a=(1, 32),
                 recipe_b=(1, 32),
             )
-            row_lora = None
+            # LoRA work past the grouped GEMMs runs on the (token, slot) rows
+            # only, not on the padded capacity.
+            slot_lora = None
+            slot_row = dump.clamp(max=rows - 1)
             if gu is not None:
                 tok = torch.arange(x_all.shape[0], device=device).repeat_interleave(
                     top_k
                 )
                 row_tok = torch.zeros(rows + 1, dtype=torch.long, device=device)
                 row_tok = row_tok.scatter_(0, dump, tok)[:rows]
-                row_lora = parts[5][row_tok].bool() & (layout >= 0)
-                _bf16_add(l1, gu.expert_delta(parts[4][row_tok], layout), row_lora)
+                slot_lora = parts[5][tok].bool() & (dump < rows)
+                delta = gu.expert_delta(parts[4][row_tok], layout)
+                _slot_add(l1_full, dump, delta[slot_row], slot_lora)
             act = swiglu_apply_weight_to_fp8(
                 l1,
                 row_w,
                 clamp_limit=self.activation.clamp,
                 fast_math=self.fast_math,
+                avail_rows=avail,
                 output_bf16=dn is not None,
             )
-            l2 = torch.empty((rows, hidden), dtype=torch.bfloat16, device=device)
+            l2_full = torch.empty(
+                (rows + 1, hidden), dtype=torch.bfloat16, device=device
+            )
+            l2 = l2_full[:rows]
             dg.m_grouped_fp8_fp4_gemm_nt_contiguous(
                 act[:2], self.l2_weights, l2, layout, recipe_a=(1, 32), recipe_b=(1, 32)
             )
             if dn is not None:
-                _bf16_add(l2, dn.expert_delta(act[-1], layout), row_lora)
+                ad = dn.expert_delta(act[-1], layout)
+                _slot_add(l2_full, dump, dn.shared_delta(ad[slot_row]), slot_lora)
 
         slots = gather_expert_slots(
             l2, ids_all, inverse, self._expert_map, torch.bfloat16

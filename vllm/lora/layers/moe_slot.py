@@ -104,12 +104,10 @@ class MoELoRASlotWithLoRA(BaseLayerWithLoRA):
         return out[0]
 
     def expert_delta(self, x: torch.Tensor, layout: torch.Tensor) -> torch.Tensor:
-        """The BF16 delta of each expert-grouped row (``layout``: its local
-        expert, -1 for padding), FP32-accumulated, from its BF16 input (an
-        FP32 shrink output is rounded first, as punica's expand does)."""
-        from vllm.model_executor.kernels.linear.cute_dsl.batch_invariant import (
-            bf16_fixed_mm,
-        )
+        """Per-expert part of each expert-grouped row (``layout``: its local
+        expert, -1 for padding), FP32-accumulated, BF16, from its BF16 input
+        (an FP32 shrink output is rounded first, as punica's expand does):
+        gate_up's delta, or down's ``A_e a`` (``shared_delta`` finishes it)."""
         from vllm.utils.deep_gemm import _import_deep_gemm
 
         dg = _import_deep_gemm()
@@ -125,6 +123,14 @@ class MoELoRASlotWithLoRA(BaseLayerWithLoRA):
             return out
         ad = torch.empty((rows, pad), dtype=torch.bfloat16, device=x.device)
         dg.m_grouped_bf16_gemm_nt_contiguous(x.contiguous(), self.expert_w, ad, layout)
+        return ad
+
+    def shared_delta(self, ad: torch.Tensor) -> torch.Tensor:
+        """The down delta from ``A_e a`` rows: the shared B, BI fixed-order GEMM."""
+        from vllm.model_executor.kernels.linear.cute_dsl.batch_invariant import (
+            bf16_fixed_mm,
+        )
+
         return bf16_fixed_mm(ad, self.shared_w).to(torch.bfloat16)
 
     def add_linear(self, y: torch.Tensor, x: torch.Tensor, slots: list) -> None:
