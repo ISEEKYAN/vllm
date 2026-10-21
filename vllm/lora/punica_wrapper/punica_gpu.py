@@ -126,6 +126,12 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         sub[inside] = slots[rows[inside]]
         meta.prepare_tensors(torch.from_numpy(sub))
 
+    def prepare_capture_meta(self, meta: "LoRAKernelMeta", num_rows: int) -> None:
+        """Fill ``meta`` with every row on a LoRA slot, for capturing a graph
+        that holds the LoRA kernels (on replay, rows without LoRA skip them)."""
+        slots = np.arange(num_rows, dtype=np.int32) % self.max_loras
+        meta.prepare_tensors(torch.from_numpy(slots))
+
     @contextmanager
     def use_token_mapping_meta(self, meta: "LoRAKernelMeta") -> Iterator[None]:
         """Run every LoRA layer sharing this wrapper with ``meta``."""

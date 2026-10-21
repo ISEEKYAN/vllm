@@ -261,7 +261,6 @@ class DecoderReplayLayers:
                 ]
                 if self.select_shared_rows is not None:
                     self.select_shared_rows(stage.select)
-            assert stage.run_graph is None or stage.lora_meta is None
             with (
                 override_forward_context(stage.forward_context),
                 self._lora_scope(stage.lora_meta),

@@ -295,8 +295,8 @@ class DeepseekV41ModelState(DefaultModelState):
             and compilation_config.cudagraph_mode.has_piecewise_cudagraphs()
             and is_breakable_cudagraph_enabled()
             and get_pp_group().is_first_rank
-            # The graphs' fixed inputs hold no LoRA mapping and no None input ids.
-            and vllm_config.lora_config is None
+            # The graphs' fixed inputs hold no None input ids; LoRA reads each
+            # stage's own kernel metadata, filled before the replay.
             and not vllm_config.model_config.enable_prompt_embeds
         ):
             threshold = compilation_config.decoder_replay_trim_threshold
@@ -659,13 +659,19 @@ class DeepseekV41ModelState(DefaultModelState):
             lora_meta = None
             if lora_metas is not None:
                 # The LoRA kernels size their tiles from the per-LoRA counts:
-                # these rows need metadata of their own (replay graphs are off).
-                assert run_graph is None
+                # these rows need metadata of their own, and a graph's padding
+                # rows (indices past the batch) none.
                 lora_meta = lora_metas[i]
-                layers.lora_punica.prepare_sub_batch_meta(
-                    lora_meta,
-                    tail_rows(input_batch.query_start_loc_np[: num_reqs + 1], lens),
-                )
+                if capture_desc is not None:
+                    layers.lora_punica.prepare_capture_meta(lora_meta, num_padded)
+                else:
+                    rows_np = tail_rows(
+                        input_batch.query_start_loc_np[: num_reqs + 1], lens
+                    )
+                    pad = np.full(num_padded - len(rows_np), np.iinfo(np.int64).max)
+                    layers.lora_punica.prepare_sub_batch_meta(
+                        lora_meta, np.concatenate([rows_np, pad])
+                    )
             if i == 0:
                 replay_batch = ReplayBatch(
                     rows[:num_tokens],

@@ -92,14 +92,22 @@ class DecoderReplayCudaGraphManager(CudaGraphManager):
                 replay_batch.forward_context,
                 *(stage.forward_context for stage in replay_batch.stages),
             ]
+            # The graphs bind each stage's own LoRA metadata, as replays use it.
+            lora_metas = [
+                replay_batch.lora_meta,
+                *(stage.lora_meta for stage in replay_batch.stages),
+            ]
 
             def forward_fn(cg_mode: CUDAGraphMode) -> None:
-                for i, (runner, context) in enumerate(
-                    zip(self.stage_runners, contexts, strict=True)
+                for i, (runner, context, meta) in enumerate(
+                    zip(self.stage_runners, contexts, lora_metas, strict=True)
                 ):
                     buffers = self.stage_input_buffers[i % 2]
-                    with override_forward_context(
-                        replace(context, cudagraph_runtime_mode=cg_mode)
+                    with (
+                        override_forward_context(
+                            replace(context, cudagraph_runtime_mode=cg_mode)
+                        ),
+                        self.layers._lora_scope(meta),
                     ):
                         runner(*(buf[: desc.num_tokens] for buf in buffers))
 
