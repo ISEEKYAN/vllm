@@ -27,6 +27,7 @@ from vllm.lora.layers import (
     MergedColumnParallelLinearWithShardedLoRA,
     MergedQKVParallelLinearWithLoRA,
     MergedQKVParallelLinearWithShardedLoRA,
+    MoELoRASlotWithLoRA,
     QKVParallelLinearWithLoRA,
     QKVParallelLinearWithShardedLoRA,
     ReplicatedLinearWithLoRA,
@@ -95,6 +96,7 @@ _all_lora_classes: tuple[type[BaseLayerWithLoRA], ...] = (
     RowParallelLinearWithShardedLoRA,
     FusedMoEWithLoRA,
     FusedMoE3DWithLoRA,
+    MoELoRASlotWithLoRA,
 )
 
 
@@ -244,6 +246,8 @@ def get_supported_lora_modules(model: nn.Module) -> list[str]:
 
         if isinstance(module, (LinearBase, MoERunner)):
             supported_lora_modules.add(name.split(".")[-1])
+        if getattr(module, "is_lora_slot", False):  # e.g. "experts.gate_up"
+            supported_lora_modules.add(".".join(name.split(".")[-2:]))
 
     return list(supported_lora_modules)
 

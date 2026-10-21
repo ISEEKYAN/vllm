@@ -16,6 +16,7 @@ from vllm.lora.layers.column_parallel_linear import (
 from vllm.lora.layers.fused_moe import FusedMoE3DWithLoRA, FusedMoEWithLoRA
 from vllm.lora.layers.grouped_linear import GroupedColumnParallelLinearWithLoRA
 from vllm.lora.layers.logits_processor import LogitsProcessorWithLoRA
+from vllm.lora.layers.moe_slot import MoELoRASlotWithLoRA
 from vllm.lora.layers.replicated_linear import ReplicatedLinearWithLoRA
 from vllm.lora.layers.row_parallel_linear import (
     RowParallelLinearWithLoRA,
@@ -30,6 +31,7 @@ __all__ = [
     "LogitsProcessorWithLoRA",
     "ColumnParallelLinearWithLoRA",
     "GroupedColumnParallelLinearWithLoRA",
+    "MoELoRASlotWithLoRA",
     "ColumnParallelLinearWithShardedLoRA",
     "MergedColumnParallelLinearWithLoRA",
     "MergedColumnParallelLinearWithShardedLoRA",

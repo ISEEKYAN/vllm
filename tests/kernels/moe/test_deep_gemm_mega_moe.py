@@ -1476,3 +1476,254 @@ def test_deep_gemm_mega_gate_rows_ignore_batch_when_deterministic():
     finally:
         # The import is cached, so restore the mode it set.
         deep_gemm.use_deterministic_algorithms(envs.VLLM_BATCH_INVARIANT)
+
+
+def _mega_moe_experts(cls, hidden, inter, num_experts, top_k, tag, seed=0):
+    """MXFP4 MegaMoE experts with a fused MXFP8 shared expert, loaded from
+    random checkpoint shards (``seed`` fixes them) through the real loader."""
+    fmt, device = MEGA_MOE_MXFP4, "cuda"
+    gen = torch.Generator(device=device).manual_seed(seed)
+
+    def randn(*shape):
+        return (
+            torch.randn(*shape, device=device, generator=gen) / shape[1] ** 0.5
+        ).bfloat16()
+
+    shared = [
+        _quantize(randn(*s), fmt.shared[0])
+        for s in ((inter, hidden),) * 2 + ((hidden, inter),)
+    ]
+    shared_mlp = SimpleNamespace(
+        gate_up_proj=SimpleNamespace(
+            weight=torch.cat([shared[0][0], shared[1][0]]),
+            weight_scale_inv=torch.cat([shared[0][1], shared[1][1]]),
+        ),
+        down_proj=SimpleNamespace(weight=shared[2][0], weight_scale_inv=shared[2][1]),
+    )
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=2048),
+        compilation_config=SimpleNamespace(static_forward_context={}),
+    )
+    with torch.device(device):
+        experts = cls(
+            config,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            experts_start_idx=0,
+            top_k=top_k,
+            hidden_size=hidden,
+            intermediate_size=inter,
+            activation=MegaMoEActivation(clamp=10.0),
+            weight_format=fmt,
+            shared_experts=shared_mlp,
+            prefix=f"model.layers.0.{tag}",
+        )
+    for e in range(num_experts):
+        w13 = _quantize(randn(2 * inter, hidden), fmt.routed)
+        w2 = _quantize(randn(hidden, inter), fmt.routed)
+        for shard, param, rows, (weight, scale, _, _) in (
+            ("w1", "w13", slice(0, inter), w13),
+            ("w3", "w13", slice(inter, None), w13),
+            ("w2", "w2", slice(None), w2),
+        ):
+            for suffix, tensor in (("weight", weight), ("weight_scale", scale)):
+                name = f"{param}_{suffix}"
+                experts.weight_loader(
+                    getattr(experts, name),
+                    tensor[rows],
+                    f"experts.{name}",
+                    shard_id=shard,
+                    expert_id=e,
+                )
+    for (weight, scale, _, _), shard in zip(shared, ("w1", "w3", "w2")):
+        experts.load_shared_expert_weight(f"shared_experts.{shard}.weight", weight)
+        experts.load_shared_expert_weight(f"shared_experts.{shard}.weight_scale", scale)
+    assert experts.has_fused_shared_experts
+    return experts
+
+
+def _routes(tokens, num_experts, top_k, hidden):
+    torch.manual_seed(1)
+    x = (torch.randn(tokens, hidden, device="cuda") * 8).bfloat16()  # clamp active
+    _, ids = torch.topk(torch.rand(tokens, num_experts, device="cuda"), top_k)
+    weights = torch.rand(tokens, top_k, device="cuda") + 0.05
+    ids[::7, 1] = -1
+    return x, weights / weights.sum(-1, keepdim=True) * 2.5, ids
+
+
+def _bits_equal(a, b):
+    return torch.equal(a.view(torch.int16), b.view(torch.int16))
+
+
+requires_mega_moe = pytest.mark.skipif(
+    not (
+        current_platform.is_device_capability_family(100) and is_deep_gemm_supported()
+    ),
+    reason="DeepGEMM MegaMoE kernels require SM100 and DeepGEMM",
+)
+
+
+@requires_mega_moe
+@pytest.mark.parametrize(
+    "hidden,inter,num_experts,top_k", [(1024, 512, 16, 6), (5120, 2304, 32, 6)]
+)
+def test_unfused_mega_moe_matches_fused(dist_init, hidden, inter, num_experts, top_k):
+    """The unfused MegaMoE (for LoRA layers) loads the same checkpoint and
+    returns MegaMoE's output bit for bit, at any batch and row order."""
+    from vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe_unfused import (
+        DeepGemmMegaMoEUnfusedExperts,
+    )
+
+    args = (hidden, inter, num_experts, top_k)
+    fused = _mega_moe_experts(DeepGemmMegaMoEExperts, *args, "fused")
+    unfused = _mega_moe_experts(DeepGemmMegaMoEUnfusedExperts, *args, "unfused")
+    x, weights, ids = _routes(1000, num_experts, top_k, hidden)
+    full = unfused(x, weights, ids)
+    assert _bits_equal(full, fused(x, weights, ids))
+    for m in (1, 129):
+        assert _bits_equal(unfused(x[-m:], weights[-m:], ids[-m:]), full[-m:])
+    rev = torch.arange(999, -1, -1, device="cuda")
+    assert _bits_equal(unfused(x[rev], weights[rev], ids[rev]), full[rev])
+
+
+@requires_mega_moe
+@pytest.mark.parametrize("tokens", [2, 300])
+def test_unfused_psum_layout_matches_contiguous(dist_init, tokens):
+    """The BI permutation's expert ends drive DeepGEMM's psum layout: the
+    routed GEMM visits the occupied blocks only and every live row keeps its
+    contiguous-layout bits (empty experts and other ranks' experts included)."""
+    from vllm.model_executor.kernels.batch_invariant import stable_expert_permute
+    from vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe_unfused import (
+        DeepGemmMegaMoEUnfusedExperts,
+    )
+    from vllm.utils.deep_gemm import _import_deep_gemm, mk_alignment_scope
+
+    dg = _import_deep_gemm()
+    hidden, inter, num_experts, top_k, local = 1024, 512, 32, 6, 16
+    experts = _mega_moe_experts(
+        DeepGemmMegaMoEUnfusedExperts, hidden, inter, local, top_k, "psum"
+    )
+    _, _, ids = _routes(tokens, num_experts, top_k, hidden)
+    ids[ids == 13] = 14  # local expert 5 (global 13) stays empty
+    expert_map = torch.full((num_experts,), -1, dtype=torch.int32, device="cuda")
+    expert_map[8 : 8 + local] = torch.arange(local, dtype=torch.int32, device="cuda")
+    x = torch.randn(tokens, hidden, device="cuda").to(torch.float8_e4m3fn)
+    sf = torch.exp2(torch.randint(-3, 4, (tokens, hidden // 32), device="cuda").float())
+    align = 128
+    capacity = (tokens * top_k // align + local + 1) * align
+    ends = torch.empty(local, dtype=torch.int32, device="cuda")
+    a, a_sf, layout, inverse = stable_expert_permute(
+        x, sf, ids, local, capacity, align, expert_map=expert_map, expert_ends=ends
+    )
+    counts = torch.bincount(layout[layout >= 0], minlength=local)
+    starts = ends - counts
+    assert int(starts[0]) == 0 and int(counts[5]) == 0
+    assert torch.equal(starts[1:], (ends[:-1] + align - 1) // align * align)
+    # The adapters' BF16 grouped GEMM (rank-sized K) takes the same ends.
+    xb = torch.randn(capacity, 64, device="cuda").bfloat16()
+    wb = torch.randn(local, 4 * inter, 64, device="cuda").bfloat16()
+    outs = []
+    for psum in (False, True):
+        out = torch.zeros(capacity, 2 * inter, dtype=torch.bfloat16, device="cuda")
+        with mk_alignment_scope(align):
+            dg.m_grouped_fp8_fp4_gemm_nt_contiguous(
+                (a, a_sf),
+                experts.l1_weights,
+                out,
+                ends if psum else layout,
+                recipe_a=(1, 32),
+                recipe_b=(1, 32),
+                use_psum_layout=psum,
+            )
+        outs.append(out)
+        out = torch.zeros(capacity, 4 * inter, dtype=torch.bfloat16, device="cuda")
+        with mk_alignment_scope(align):
+            dg.m_grouped_bf16_gemm_nt_contiguous(
+                xb, wb, out, ends if psum else layout, use_psum_layout=psum
+            )
+        outs.append(out)
+    live = layout >= 0
+    for i in (0, 1):
+        assert _bits_equal(outs[i][live], outs[i + 2][live])
+        assert outs[i + 2][live].abs().amax() > 0
+
+
+@requires_mega_moe
+def test_unfused_mega_moe_lora(dist_init, monkeypatch):
+    """Shared-outer routed and shared-expert adapters: per-expert deltas match
+    torch, rows of tokens without an adapter keep the base bits, and a row
+    does not depend on the batch (other experts' row counts and offsets)."""
+    import vllm.lora.ops.triton_ops.lora_shrink_op as shrink_op
+    import vllm.lora.ops.triton_ops.utils as lora_utils
+    from vllm.config.lora import LoRAConfig
+    from vllm.lora.layers import LoRAMapping, MoELoRASlotWithLoRA
+    from vllm.lora.punica_wrapper.punica_gpu import PunicaWrapperGPU
+    from vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe_unfused import (
+        LORA_SLOTS,
+        DeepGemmMegaMoEUnfusedExperts,
+    )
+
+    # Punica's batch-invariant shrink: a fixed split, not M-dependent tiles.
+    monkeypatch.setattr(lora_utils, "is_batch_invariant", True)
+    monkeypatch.setattr(shrink_op, "is_batch_invariant", True)
+    lora_utils.get_lora_op_configs.cache_clear()
+    hidden, inter, num_experts, top_k, rank = 1024, 512, 16, 6, 16
+    experts = _mega_moe_experts(
+        DeepGemmMegaMoEUnfusedExperts, hidden, inter, num_experts, top_k, "lora"
+    )
+    x, weights, ids = _routes(300, num_experts, top_k, hidden)
+    base = experts(x, weights, ids)
+    config = LoRAConfig(max_loras=1, max_lora_rank=rank, lora_dtype=torch.bfloat16)
+    punica = PunicaWrapperGPU(1024, 8, "cuda", lora_config=config)
+    for name in LORA_SLOTS:
+        slot = MoELoRASlotWithLoRA(getattr(experts, name))
+        slot.create_lora_weights(1, config)
+        slot.set_mapping(punica)
+        setattr(experts, name, slot)
+        a_shape = (rank, slot.in_features)
+        b_shape = (slot.out_features, rank)
+        if name == "gate_up":
+            b_shape = (num_experts, *b_shape)
+        elif name == "down":
+            a_shape = (num_experts, *a_shape)
+        slot.set_lora(
+            0,
+            (torch.randn(a_shape, device="cuda") / a_shape[-1] ** 0.5).bfloat16(),
+            (0.05 * torch.randn(b_shape, device="cuda")).bfloat16(),
+        )
+
+    # Per-expert deltas against torch: expert-grouped rows, padding rows -1.
+    layout = torch.full((4 * 128,), -1, dtype=torch.int32, device="cuda")
+    for i, (e, n) in enumerate(((0, 5), (3, 128), (15, 77))):
+        layout[i * 128 : i * 128 + n] = e
+    valid, e_row = layout >= 0, layout.clamp(min=0).long()
+    gu, dn = experts.gate_up, experts.down
+    xa = torch.randn(layout.shape[0], rank, device="cuda")
+    ref = torch.einsum(
+        "tr,tor->to", xa.bfloat16().float(), gu.expert_w[:, :, :rank].float()[e_row]
+    )
+    xp = torch.zeros(layout.shape[0], gu.expert_w.shape[-1], device="cuda").bfloat16()
+    xp[:, :rank] = xa
+    out = gu.expert_delta(xp, layout)
+    torch.testing.assert_close(out[valid].float(), ref[valid], atol=2e-2, rtol=2e-2)
+    a = torch.randn(layout.shape[0], inter, device="cuda").bfloat16()
+    ad = torch.einsum("ti,tri->tr", a.float(), dn.expert_w[:, :rank].float()[e_row])
+    ref = ad.bfloat16().float() @ dn.shared_w[:, :rank].float().T
+    out = dn.shared_delta(dn.expert_delta(a, layout))
+    torch.testing.assert_close(out[valid].float(), ref[valid], atol=2e-2, rtol=2e-2)
+
+    def run(rows):
+        mapping = tuple(1 if r % 5 else 0 for r in rows.tolist())  # every 5th: none
+        punica.update_metadata(LoRAMapping(mapping, mapping), [1], 1, 0)
+        return experts(x[rows], weights[rows], ids[rows])
+
+    rows = torch.arange(300, device="cuda")
+    full = run(rows)
+    plain = rows % 5 == 0
+    assert _bits_equal(full[plain], base[plain])
+    assert not torch.equal(full[~plain], base[~plain])
+    rel = (full.float() - base.float()).norm() / base.float().norm()
+    assert 1e-3 < rel < 0.5  # adapters change the output, within reason
+    for sub in (rows[:37], rows[150:], rows.flip(0)):
+        assert _bits_equal(run(sub), full[sub])
+    lora_utils.get_lora_op_configs.cache_clear()
