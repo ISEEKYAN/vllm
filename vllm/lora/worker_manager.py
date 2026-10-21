@@ -286,6 +286,37 @@ class LRUCacheWorkerLoRAManager(WorkerLoRAManager):
         for lora in loras_map.values():
             self.add_adapter(lora)
 
+    def add_adapter_tensors(
+        self, lora_request: LoRARequest, tensors: dict, peft_config: dict
+    ) -> None:
+        """Load an adapter from in-memory tensors, replacing one with the same id
+        in its GPU slot (no graph recapture). The tensors are copied first: the
+        loader scales B in place and must not touch the caller's (a trainer's)
+        weights. Use a new ``lora_name`` per version: prefix-cache entries are
+        keyed by name and path, not by weights."""
+        model = self._adapter_manager.model
+        tensors = {name: t.to("cpu", copy=True) for name, t in tensors.items()}
+        transform = getattr(model, "lora_tensor_transform", None)
+        if transform is not None:
+            tensors = transform(tensors)
+        peft_helper = PEFTHelper.from_dict(peft_config)
+        peft_helper.validate_legal(self.lora_config)
+        mapper = getattr(model, "hf_to_vllm_mapper", None)
+        lora = self._lora_model_cls.from_lora_tensors(
+            lora_model_id=lora_request.lora_int_id,
+            tensors=tensors,
+            peft_helper=peft_helper,
+            device="cpu",
+            dtype=self.lora_config.lora_dtype,
+            model_vocab_size=self.vocab_size,
+            weights_mapper=None if mapper is None else mapper.get_rename_mapper(),
+            skip_prefixes=getattr(model, "lora_skip_prefixes", None),
+        )
+        with gpu_sync_allowed():
+            self._adapter_manager.remove_adapter(lora.id)
+            self._adapter_manager.add_adapter(lora)
+            self._adapter_manager.activate_adapter(lora.id)
+
     def add_adapter(self, lora_request: LoRARequest) -> bool:
         # Note that this method is not thread-safe. It may be invoked multiple
         # times for the same adapter when using multiple API servers.
