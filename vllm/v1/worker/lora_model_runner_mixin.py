@@ -3,7 +3,7 @@
 """Define LoRA functionality mixin for model runners."""
 
 from collections.abc import Callable
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 import numpy as np
 import torch
@@ -266,6 +266,7 @@ class LoRAModelRunnerMixin:
         remove_lora: bool = True,
         num_active_loras: int = 0,
         mapping_type: LoRAMappingType = LoRAMappingType.LANGUAGE,
+        keep_adapters: bool = False,
     ):
         """Context manager for dummy runs with LoRA.
 
@@ -277,16 +278,22 @@ class LoRAModelRunnerMixin:
             num_active_loras: Number of distinct active LoRAs to use.
                 LoRA is activated when num_active_loras > 0.
             mapping_type: Which LoRA mapping to build (language or encoder).
+            keep_adapters: A filler batch while serving (an idle DP rank):
+                no warmup LoRA is added or activated, so the GPU slots keep the
+                served adapters, which an EP rank's experts still apply to
+                other ranks' tokens; the dummy tokens themselves get none.
 
         """
         with (
-            self.maybe_setup_dummy_loras(lora_config, remove_lora),
+            nullcontext()
+            if keep_adapters
+            else self.maybe_setup_dummy_loras(lora_config, remove_lora),
             self.maybe_select_dummy_loras(
                 lora_config,
                 num_scheduled_tokens,
                 mapping_type,
                 num_sampled_tokens,
-                num_active_loras,
+                0 if keep_adapters else num_active_loras,
             ),
         ):
             yield
