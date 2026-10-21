@@ -389,6 +389,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     "csrc/batch_invariant/sparse_paged_indices.cu"
     "csrc/batch_invariant/top_k.cu"
     "csrc/batch_invariant/silu_mul_bf16.cu"
+    "csrc/batch_invariant/swiglu_apply_weight_to_fp8.cu"
     "csrc/batch_invariant/fused_silu_mul_per_token_group_quant.cu"
     "csrc/batch_invariant/torch_bindings.cpp")
   set_gencode_flags_for_srcs(

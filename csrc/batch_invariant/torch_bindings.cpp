@@ -25,6 +25,11 @@ void top_k_per_row_prefill_reference(const torch::Tensor& logits,
                                      int64_t top_k);
 void silu_mul_bf16(const torch::Tensor& input, torch::Tensor& output,
                    std::optional<double> clamp_limit);
+void swiglu_apply_weight_to_fp8(
+    const torch::Tensor& input, const std::optional<torch::Tensor>& weights,
+    const std::optional<torch::Tensor>& avail_rows, torch::Tensor& output_q,
+    torch::Tensor& output_s, const std::optional<torch::Tensor>& output_bf16,
+    std::optional<double> clamp_limit, bool fast_math);
 void hc_collapse(const torch::Tensor& hidden, const torch::Tensor& pre,
                  torch::Tensor& output);
 void sparse_metadata(const torch::Tensor& mask,
@@ -126,6 +131,10 @@ TORCH_LIBRARY(vllm_batch_invariant, ops) {
   ops.def(
       "silu_mul_bf16(Tensor input, Tensor(a!) output, float? clamp_limit) -> "
       "()");
+  ops.def(
+      "swiglu_apply_weight_to_fp8(Tensor input, Tensor? weights, "
+      "Tensor? avail_rows, Tensor(a!) output_q, Tensor(b!) output_s, "
+      "Tensor(c!)? output_bf16, float? clamp_limit, bool fast_math) -> ()");
   ops.def("hc_collapse(Tensor hidden, Tensor pre, Tensor(a!) output) -> ()");
   ops.def(
       "sparse_metadata(Tensor mask, Tensor? main, int main_size, int window, "
@@ -197,6 +206,8 @@ TORCH_LIBRARY_IMPL(vllm_batch_invariant, CUDA, ops) {
   ops.impl("top_k_per_row_prefill_reference",
            &vllm::batch_invariant::top_k_per_row_prefill_reference);
   ops.impl("silu_mul_bf16", &vllm::batch_invariant::silu_mul_bf16);
+  ops.impl("swiglu_apply_weight_to_fp8",
+           &vllm::batch_invariant::swiglu_apply_weight_to_fp8);
   ops.impl("hc_collapse", &vllm::batch_invariant::hc_collapse);
   ops.impl("sparse_metadata", &vllm::batch_invariant::sparse_metadata);
   ops.impl("combine_swa_first_indices",
