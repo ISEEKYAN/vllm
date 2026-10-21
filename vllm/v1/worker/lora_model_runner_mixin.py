@@ -127,17 +127,30 @@ class LoRAModelRunnerMixin:
                 for lora_id in range(1, num_loras + 1)
             }
 
-            with self.lora_manager.dummy_lora_cache():
-                # Add the dummy LoRAs here so _set_active_loras doesn't try to
-                # load from disk.
-                for lr in lora_requests:
-                    self.lora_manager.add_dummy_lora(lr, rank=lora_warmup_rank)
+            # Adapters registered now (e.g. loaded from memory, with no path to
+            # reload them from) must outlive the dummy run, even if inserting
+            # the dummies pushes them out of a full LRU cache.
+            registered = self.lora_manager.registered_adapters()
+            added: list[int] = []
+            try:
+                with self.lora_manager.dummy_lora_cache():
+                    # Add the dummy LoRAs here so _set_active_loras doesn't try
+                    # to load from disk.
+                    added = [
+                        lr.lora_int_id
+                        for lr in lora_requests
+                        if self.lora_manager.add_dummy_lora(lr, rank=lora_warmup_rank)
+                    ]
 
-                yield
-
-            # __exit__ code
-            if remove_lora:
-                self.lora_manager.remove_all_adapters()
+                    yield
+            finally:
+                # __exit__ code: remove only the dummies added here, then
+                # re-register the adapters they evicted (kept dummies may be
+                # evicted in turn).
+                if remove_lora:
+                    for lora_id in added:
+                        self.lora_manager.remove_adapter(lora_id)
+                self.lora_manager.restore_adapters(registered)
 
     @contextmanager
     def maybe_select_dummy_loras(

@@ -241,6 +241,15 @@ class WorkerLoRAManager:
     def list_adapters(self) -> set[int]:
         return set(self._adapter_manager.list_adapters())
 
+    def registered_adapters(self) -> dict[int, LoRAModel]:
+        return self._adapter_manager.list_adapters()
+
+    def restore_adapters(self, adapters: dict[int, LoRAModel]) -> None:
+        """Re-register those of ``adapters`` evicted since they were listed."""
+        for adapter_id, lora in adapters.items():
+            if adapter_id not in self._adapter_manager.list_adapters():
+                self._adapter_manager.add_adapter(lora)
+
 
 class LRUCacheWorkerLoRAManager(WorkerLoRAManager):
     """WorkerLoRAManager that manages LoRA models on the worker side.
