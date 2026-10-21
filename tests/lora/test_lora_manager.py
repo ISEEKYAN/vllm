@@ -1167,3 +1167,126 @@ def test_target_modules_match_packed_runtime_modules(
         ],
         vllm_config=default_vllm_config,
     )
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("cpu_loras", [1, 2])
+@pytest.mark.parametrize("remove_lora", [True, False])
+def test_dummy_run_keeps_registered_adapters(
+    dist_init, dummy_model, device, tmp_path, cpu_loras, remove_lora
+):
+    """An idle DP rank's dummy batch adds warmup LoRAs; an adapter registered
+    before it (which may have no path to reload it from) must still be served
+    from the cache afterwards, with the same weights, whatever the CPU cache
+    size and whether the warmup LoRAs are kept."""
+    import shutil
+
+    import numpy as np
+
+    from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
+
+    lora_config = LoRAConfig(
+        max_lora_rank=8,
+        max_cpu_loras=cpu_loras,
+        max_loras=1,
+        lora_dtype=DEFAULT_DTYPE,
+    )
+    files = f"{tmp_path}/lora_adapter"
+    os.makedirs(files, exist_ok=True)
+    create_peft_lora(
+        dummy_model,
+        save_dir=files,
+        target_modules=["layer1.dense1", "dense2"],
+        lora_dtype=DEFAULT_DTYPE,
+    )
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(max_model_len=16), lora_config=lora_config
+    )
+    vllm_config.scheduler_config.max_num_seqs = 4
+    vllm_config.scheduler_config.max_num_batched_tokens = 2
+    manager = LRUCacheWorkerLoRAManager(vllm_config, device, EMBEDDING_MODULES)
+    manager.create_lora_manager(dummy_model, vllm_config)
+    runner = LoRAModelRunnerMixin()
+    runner.lora_manager = manager
+
+    real = LoRARequest("123", 123, files)
+    manager.set_active_adapters([real], LoRAMapping((123,), (123,)))
+    cpu_copy = manager.registered_adapters()[123]
+    slots = {
+        name: (m.lora_a_stacked[0][0].clone(), m.lora_b_stacked[0][0].clone())
+        for name, m in manager._adapter_manager.modules.items()
+    }
+    shutil.rmtree(files)  # from now on only the cache can serve it
+
+    with runner.maybe_dummy_run_with_lora(
+        lora_config, np.array([1]), np.array([1]), remove_lora, num_active_loras=1
+    ):
+        # With one CPU slot, inserting the warmup LoRA evicts the adapter.
+        assert (123 in manager.list_adapters()) == (cpu_loras > 1)
+    assert manager.registered_adapters()[123] is cpu_copy
+
+    manager.set_active_adapters([real], LoRAMapping((123,), (123,)))
+    for name, m in manager._adapter_manager.modules.items():
+        assert torch.equal(m.lora_a_stacked[0][0], slots[name][0])
+        assert torch.equal(m.lora_b_stacked[0][0], slots[name][1])
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("cpu_loras", [1, 2])
+@pytest.mark.parametrize("keep_adapters", [True, False])
+def test_filler_dummy_run_keeps_slot_weights(
+    dist_init, dummy_model, device, tmp_path, cpu_loras, keep_adapters
+):
+    """An idle DP rank's filler batch runs while other ranks serve: under EP its
+    experts still apply the GPU slot's adapter to their tokens, so the served
+    adapter must stay active in its slot, bit for bit. A warmup dummy run (no
+    ``keep_adapters``) activates a zero warmup LoRA in that slot instead."""
+    import numpy as np
+
+    from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
+
+    lora_config = LoRAConfig(
+        max_lora_rank=8, max_cpu_loras=cpu_loras, max_loras=1, lora_dtype=DEFAULT_DTYPE
+    )
+    files = f"{tmp_path}/lora_adapter"
+    os.makedirs(files, exist_ok=True)
+    create_peft_lora(
+        dummy_model,
+        save_dir=files,
+        target_modules=["layer1.dense1", "dense2"],
+        lora_dtype=DEFAULT_DTYPE,
+    )
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(max_model_len=16), lora_config=lora_config
+    )
+    vllm_config.scheduler_config.max_num_seqs = 4
+    vllm_config.scheduler_config.max_num_batched_tokens = 2
+    manager = LRUCacheWorkerLoRAManager(vllm_config, device, EMBEDDING_MODULES)
+    manager.create_lora_manager(dummy_model, vllm_config)
+    runner = LoRAModelRunnerMixin()
+    runner.lora_manager = manager
+    real = LoRARequest("123", 123, files)
+    manager.set_active_adapters([real], LoRAMapping((123,), (123,)))
+    modules = manager._adapter_manager.modules
+    slots = {
+        n: (m.lora_a_stacked[0][0].clone(), m.lora_b_stacked[0][0].clone())
+        for n, m in modules.items()
+    }
+
+    def kept():
+        return manager._adapter_manager.lora_index_to_id[0] == 123 and all(
+            torch.equal(m.lora_a_stacked[0][0], slots[n][0])
+            and torch.equal(m.lora_b_stacked[0][0], slots[n][1])
+            for n, m in modules.items()
+        )
+
+    with runner.maybe_dummy_run_with_lora(
+        lora_config,
+        np.array([1]),
+        np.array([1]),
+        num_active_loras=1,
+        keep_adapters=keep_adapters,
+    ):
+        assert kept() == keep_adapters
+        assert (123 in manager.list_adapters()) == (keep_adapters or cpu_loras > 1)
+    assert 123 in manager.list_adapters()

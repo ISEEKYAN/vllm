@@ -836,6 +836,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         is_profile: bool = False,
         valid_dummy_state_slots: bool = False,
         randomize_inputs: bool = False,
+        keep_adapters: bool = False,
         **kwargs,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         if skip_attn and not is_profile:
@@ -904,6 +905,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_sampled_tokens=None,
             remove_lora=True,
             num_active_loras=max_loras,
+            keep_adapters=keep_adapters,
         ):
             # Execute the model.
             self.execute_model(

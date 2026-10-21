@@ -3,7 +3,7 @@
 """Define LoRA functionality mixin for model runners."""
 
 from collections.abc import Callable
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 import numpy as np
 import torch
@@ -127,17 +127,30 @@ class LoRAModelRunnerMixin:
                 for lora_id in range(1, num_loras + 1)
             }
 
-            with self.lora_manager.dummy_lora_cache():
-                # Add the dummy LoRAs here so _set_active_loras doesn't try to
-                # load from disk.
-                for lr in lora_requests:
-                    self.lora_manager.add_dummy_lora(lr, rank=lora_warmup_rank)
+            # Adapters registered now (e.g. loaded from memory, with no path to
+            # reload them from) must outlive the dummy run, even if inserting
+            # the dummies pushes them out of a full LRU cache.
+            registered = self.lora_manager.registered_adapters()
+            added: list[int] = []
+            try:
+                with self.lora_manager.dummy_lora_cache():
+                    # Add the dummy LoRAs here so _set_active_loras doesn't try
+                    # to load from disk.
+                    added = [
+                        lr.lora_int_id
+                        for lr in lora_requests
+                        if self.lora_manager.add_dummy_lora(lr, rank=lora_warmup_rank)
+                    ]
 
-                yield
-
-            # __exit__ code
-            if remove_lora:
-                self.lora_manager.remove_all_adapters()
+                    yield
+            finally:
+                # __exit__ code: remove only the dummies added here, then
+                # re-register the adapters they evicted (kept dummies may be
+                # evicted in turn).
+                if remove_lora:
+                    for lora_id in added:
+                        self.lora_manager.remove_adapter(lora_id)
+                self.lora_manager.restore_adapters(registered)
 
     @contextmanager
     def maybe_select_dummy_loras(
@@ -253,6 +266,7 @@ class LoRAModelRunnerMixin:
         remove_lora: bool = True,
         num_active_loras: int = 0,
         mapping_type: LoRAMappingType = LoRAMappingType.LANGUAGE,
+        keep_adapters: bool = False,
     ):
         """Context manager for dummy runs with LoRA.
 
@@ -264,16 +278,22 @@ class LoRAModelRunnerMixin:
             num_active_loras: Number of distinct active LoRAs to use.
                 LoRA is activated when num_active_loras > 0.
             mapping_type: Which LoRA mapping to build (language or encoder).
+            keep_adapters: A filler batch while serving (an idle DP rank):
+                no warmup LoRA is added or activated, so the GPU slots keep the
+                served adapters, which an EP rank's experts still apply to
+                other ranks' tokens; the dummy tokens themselves get none.
 
         """
         with (
-            self.maybe_setup_dummy_loras(lora_config, remove_lora),
+            nullcontext()
+            if keep_adapters
+            else self.maybe_setup_dummy_loras(lora_config, remove_lora),
             self.maybe_select_dummy_loras(
                 lora_config,
                 num_scheduled_tokens,
                 mapping_type,
                 num_sampled_tokens,
-                num_active_loras,
+                0 if keep_adapters else num_active_loras,
             ),
         ):
             yield
