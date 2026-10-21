@@ -6,8 +6,11 @@ Punica: Multi-Tenant LoRA Serving.
 https://arxiv.org/abs/2310.18547
 """
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any, final
 
+import numpy as np
 import torch
 
 from vllm.lora.layers import LoRAMapping
@@ -70,6 +73,11 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             device=device,
             captured_lora_counts=captured_lora_counts,
         )
+        self._captured_lora_counts = captured_lora_counts
+        self._max_num_batched_tokens = max_num_batched_tokens
+        # Per-token LoRA slot (-1 = none) of the current batch, kept on the host
+        # so metadata for a forward over a subset of its rows needs no sync.
+        self._token_slots_cpu = np.empty(0, dtype=np.int32)
 
     def update_metadata(
         self,
@@ -81,12 +89,57 @@ class PunicaWrapperGPU(PunicaWrapperBase):
     ):
         self.is_prefill = mapping.is_prefill
         self._update_base_metadata(mapping, lora_index_to_id, max_loras, vocab_size)
+        slot_of = {i: s for s, i in enumerate(lora_index_to_id) if i is not None}
+        self._token_slots_cpu = np.fromiter(
+            (slot_of[i] if i > 0 else -1 for i in mapping.index_mapping),
+            dtype=np.int32,
+            count=len(mapping.index_mapping),
+        )
 
         # TODO avoid gpu<->cpu sync here
         with gpu_sync_allowed():
             # Prepare cuda kernel metadata tensors
             self.token_mapping_meta.prepare_tensors(self.token_lora_indices)
             self.prompt_mapping_meta.prepare_tensors(self.sampler_indices)
+
+    def new_sub_batch_meta(self) -> "LoRAKernelMeta":
+        """Kernel metadata for a forward over a subset of the batch rows."""
+        return LoRAKernelMeta.make(
+            self.max_loras,
+            self._max_num_batched_tokens,
+            device=self.device,
+            captured_lora_counts=self._captured_lora_counts,
+        )
+
+    def prepare_sub_batch_meta(self, meta: "LoRAKernelMeta", rows: np.ndarray) -> None:
+        """Fill ``meta`` for a forward whose inputs are batch rows ``rows``.
+
+        The kernels size their tiles from the per-LoRA token counts, so a
+        forward over gathered rows must not use the full-batch metadata: it
+        would apply other rows' adapters and touch rows past the subset.
+        Rows outside the current mapping (idle dummy batches) get no LoRA.
+        """
+        slots = self._token_slots_cpu
+        rows = np.asarray(rows, dtype=np.int64)
+        sub = np.full(rows.shape, -1, dtype=np.int32)
+        inside = rows < slots.shape[0]
+        sub[inside] = slots[rows[inside]]
+        meta.prepare_tensors(torch.from_numpy(sub))
+
+    def prepare_capture_meta(self, meta: "LoRAKernelMeta", num_rows: int) -> None:
+        """Fill ``meta`` with every row on a LoRA slot, for capturing a graph
+        that holds the LoRA kernels (on replay, rows without LoRA skip them)."""
+        slots = np.arange(num_rows, dtype=np.int32) % self.max_loras
+        meta.prepare_tensors(torch.from_numpy(slots))
+
+    @contextmanager
+    def use_token_mapping_meta(self, meta: "LoRAKernelMeta") -> Iterator[None]:
+        """Run every LoRA layer sharing this wrapper with ``meta``."""
+        saved, self.token_mapping_meta = self.token_mapping_meta, meta
+        try:
+            yield
+        finally:
+            self.token_mapping_meta = saved
 
     def add_shrink(
         self,

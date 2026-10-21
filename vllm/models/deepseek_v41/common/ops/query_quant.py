@@ -5,6 +5,7 @@ import torch
 
 from vllm.model_executor.layers.fusion.quant_activation import (
     QuantizedActivation,
+    get_base_input_quant_key,
     get_input_quant_key,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
@@ -42,6 +43,7 @@ def _q_kv_norm_quant_kernel(
     qo,
     kvo,
     scales,
+    qbf,
     num_tokens,
     q_stride,
     kv_stride,
@@ -50,6 +52,7 @@ def _q_kv_norm_quant_kernel(
     KV_SIZE: tl.constexpr,
     BLOCK: tl.constexpr,
     LAUNCH_PDL: tl.constexpr,
+    STORE_ORIG: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     cols = tl.arange(0, BLOCK)
@@ -62,6 +65,8 @@ def _q_kv_norm_quant_kernel(
             y = _norm_row(q, qw, row, q_stride, eps, Q_SIZE, BLOCK)
             # Preserve the materialized normalization output's rounding boundary.
             y = y.to(q.dtype.element_ty).to(tl.float32)
+            if STORE_ORIG:
+                tl.store(qbf + row * Q_SIZE + cols, y, cols < Q_SIZE)
             grouped = tl.reshape(y, (BLOCK // 32, 32))
             amax = tl.max(tl.abs(grouped), 1)
             normalized = amax * (1.0 / 448.0)
@@ -93,8 +98,12 @@ def fused_q_kv_rmsnorm_quant(
     q_weight: torch.Tensor,
     kv_weight: torch.Tensor,
     eps: float,
+    emit_orig: bool = False,
 ) -> tuple[QuantizedActivation, torch.Tensor]:
-    """Normalize Q/KV and quantize Q with FlashInfer's swizzled MXFP8 scales."""
+    """Normalize Q/KV and quantize Q with FlashInfer's swizzled MXFP8 scales.
+
+    ``emit_orig`` also stores the normalized BF16 Q that was quantized, for a
+    consumer that needs it (a LoRA adapter on a Q projection)."""
     assert qr.ndim == kv.ndim == 2 and qr.shape[0] == kv.shape[0]
     assert qr.stride(-1) == kv.stride(-1) == 1
     assert q_weight.is_contiguous() and kv_weight.is_contiguous()
@@ -107,6 +116,9 @@ def fused_q_kv_rmsnorm_quant(
     scales = torch.empty(
         mxfp8_scale_bytes(tokens, q_size), dtype=torch.uint8, device=qr.device
     )
+    orig = (
+        torch.empty(qr.shape, dtype=qr.dtype, device=qr.device) if emit_orig else None
+    )
     if tokens:
         block = triton.next_power_of_2(max(q_size, kv_size))
         launch_pdl = current_platform.is_arch_support_pdl()
@@ -118,6 +130,7 @@ def fused_q_kv_rmsnorm_quant(
             qo,
             kvo,
             scales,
+            qo if orig is None else orig,
             tokens,
             qr.stride(0),
             kv.stride(0),
@@ -126,14 +139,23 @@ def fused_q_kv_rmsnorm_quant(
             kv_size,
             block,
             launch_pdl,
+            orig is not None,
             num_warps=8 if block >= 2048 else 4,
             launch_pdl=launch_pdl,
         )
-    return QuantizedActivation(qo, scales, qr.dtype, qr.shape, kMxfp8Dynamic), kvo
+    activation = QuantizedActivation(
+        qo, scales, qr.dtype, qr.shape, kMxfp8Dynamic, orig=orig
+    )
+    return activation, kvo
 
 
-def can_fuse_query_quant(linears: list[torch.nn.Module]) -> bool:
-    """Require both local projections to use the same MXFP8 activation ABI."""
+def can_fuse_query_quant(
+    linears: list[torch.nn.Module], allow_orig: bool = False
+) -> bool:
+    """Require both local projections to use the same MXFP8 activation ABI.
+
+    ``allow_orig`` judges the base kernels of wrapped layers too, for a caller
+    that emits the unquantized activation beside the quantized one."""
     if not current_platform.is_cuda():
         return False
     from vllm.model_executor.kernels.linear.mxfp8.batch_invariant import (
@@ -146,8 +168,9 @@ def can_fuse_query_quant(linears: list[torch.nn.Module]) -> bool:
 
     # QuantKey does not encode scale layout; restrict this producer to the
     # consumers that accept F8_128x4 swizzled scales.
+    key_of = get_base_input_quant_key if allow_orig else get_input_quant_key
     return all(
-        get_input_quant_key(linear) == kMxfp8Dynamic
+        key_of(linear) == kMxfp8Dynamic
         and type(getattr(getattr(linear, "quant_method", None), "kernel", None))
         in (
             FlashInferCutedslMxfp8LinearKernel,

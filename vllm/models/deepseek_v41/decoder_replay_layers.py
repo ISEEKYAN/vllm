@@ -14,8 +14,11 @@ break out to the replay batch, which may run in a graph of its own
 """
 
 from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
+from typing import Any
 
+import numpy as np
 import torch
 
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
@@ -64,6 +67,8 @@ class ReplayStage:
     select: torch.Tensor
     forward_context: ForwardContext
     run_graph: Callable[..., tuple[torch.Tensor, ...]] | None = None
+    # LoRA kernel metadata for these rows (LoRAKernelMeta), when LoRA is on.
+    lora_meta: Any = None
 
 
 @dataclass
@@ -75,6 +80,7 @@ class ReplayBatch:
     forward_context: ForwardContext
     run_graph: Callable[..., tuple[torch.Tensor, ...]] | None = None
     stages: list[ReplayStage] = field(default_factory=list)
+    lora_meta: Any = None
 
 
 class DecoderReplayLayers:
@@ -109,6 +115,7 @@ class DecoderReplayLayers:
         run_stage: Callable[..., tuple[torch.Tensor, ...]] | None = None,
         stage_metadata_prefixes: list[set[str]] | None = None,
         select_shared_rows: Callable[[torch.Tensor], None] | None = None,
+        lora_modules: Callable[[], list[torch.nn.Module]] | None = None,
     ) -> None:
         self.window = window
         self.kept_rows = window if kept_rows is None else kept_rows
@@ -128,6 +135,25 @@ class DecoderReplayLayers:
         # this many tokens or more break out to the replay batch.
         self.trim_threshold: int | None = None
         self._break_outputs: list[torch.Tensor] | None = None
+        # The punica wrapper of the replay layers' LoRA modules, set by the model
+        # state when LoRA is on: each replay forward swaps in its rows' metadata.
+        self.lora_punica: Any = None
+        self.lora_modules = lora_modules
+
+    def find_lora_punica(self) -> Any:
+        """The punica wrapper the replay layers' LoRA modules share, or None."""
+        from vllm.lora.layers import BaseLayerWithLoRA
+
+        for layer in self.lora_modules() if self.lora_modules else ():
+            for module in layer.modules():
+                if isinstance(module, BaseLayerWithLoRA):
+                    return module.punica_wrapper
+        return None
+
+    def _lora_scope(self, meta: Any) -> AbstractContextManager:
+        if self.lora_punica is None or meta is None:
+            return nullcontext()
+        return self.lora_punica.use_token_mapping_meta(meta)
 
     def __call__(
         self, hidden_states: torch.Tensor | MoEOutput, *states: torch.Tensor | None
@@ -179,7 +205,10 @@ class DecoderReplayLayers:
             return self._run_stages(replay_batch, hidden_states, *states)
         rows = replay_batch.rows
         inputs = (hidden_states, *states)
-        with override_forward_context(replay_batch.forward_context):
+        with (
+            override_forward_context(replay_batch.forward_context),
+            self._lora_scope(replay_batch.lora_meta),
+        ):
             if replay_batch.run_graph is not None:
                 row_outputs = replay_batch.run_graph(rows, inputs)
             else:
@@ -210,6 +239,7 @@ class DecoderReplayLayers:
                 replay_batch.rows,
                 replay_batch.forward_context,
                 replay_batch.run_graph,
+                replay_batch.lora_meta,
             ),
             *replay_batch.stages,
         ]
@@ -231,7 +261,10 @@ class DecoderReplayLayers:
                 ]
                 if self.select_shared_rows is not None:
                     self.select_shared_rows(stage.select)
-            with override_forward_context(stage.forward_context):
+            with (
+                override_forward_context(stage.forward_context),
+                self._lora_scope(stage.lora_meta),
+            ):
                 if stage.run_graph is not None:
                     outputs = stage.run_graph(
                         [index for _, index in sources], [t for t, _ in sources]
@@ -254,6 +287,14 @@ class DecoderReplayLayers:
         last_rows = stages[-1].rows
         final = [_to_batch_rows(out, last_rows, num_tokens) for out in carried]
         return (*final, *aux)
+
+
+def tail_rows(query_start_loc: np.ndarray, lens: np.ndarray) -> np.ndarray:
+    """Batch rows of each request's last ``lens[r]`` rows, request-major: the
+    rows ``_kept_input_batch`` gathers, rebuilt on the host."""
+    ends = np.repeat(query_start_loc[1:].astype(np.int64), lens)
+    within = np.arange(int(lens.sum())) - np.repeat(np.cumsum(lens) - lens, lens)
+    return ends - np.repeat(lens, lens) + within
 
 
 def _to_batch_rows(

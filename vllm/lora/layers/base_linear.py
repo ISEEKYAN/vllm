@@ -14,6 +14,7 @@ from vllm.forward_context import (
     get_forward_context,
     is_forward_context_available,
 )
+from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     LinearBase,
@@ -65,6 +66,19 @@ if envs.VLLM_LORA_ENABLE_DUAL_STREAM:
         op_func=lora_linear_async,
         fake_impl=lora_linear_async_fake,
     )
+
+
+def _lora_input(x: "torch.Tensor | QuantizedActivation") -> torch.Tensor:
+    """The adapter's input: the base layer may take a pre-quantized activation,
+    the adapter takes the unquantized one it was produced from."""
+    if not isinstance(x, QuantizedActivation):
+        return x
+    if x.orig is None:
+        raise ValueError(
+            "A LoRA layer got a QuantizedActivation without its unquantized "
+            "activation (orig)."
+        )
+    return x.orig
 
 
 class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
@@ -197,7 +211,11 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
 
     def apply(self, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
         # is_forward_context_available for tower modules
-        if self._enable_aux_cuda_stream and is_forward_context_available():
+        if (
+            self._enable_aux_cuda_stream
+            and is_forward_context_available()
+            and not isinstance(x, QuantizedActivation)
+        ):
             output_size = sum(self.output_slices)
             return torch.ops.vllm.lora_linear_async(
                 self.layer_name, output_size, x, bias
@@ -209,12 +227,12 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
         self, x: torch.Tensor, bias: torch.Tensor | None = None
     ) -> torch.Tensor:
         output = self._get_quant_method().apply(self.base_layer, x, bias)
-        return self._apply_lora_to_output(x, output)
+        return self._apply_lora_to_output(_lora_input(x), output)
 
     def _apply_base_forward(self, x: torch.Tensor) -> torch.Tensor:
         base_output = self.base_layer(x)
         output = base_output[0] if isinstance(base_output, tuple) else base_output
-        return self._apply_lora_to_output(x, output)
+        return self._apply_lora_to_output(_lora_input(x), output)
 
     def _apply_lora_to_output(
         self, x: torch.Tensor, output: torch.Tensor

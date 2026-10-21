@@ -118,6 +118,13 @@ def deep_gemm_fp8_o_proj(
     the padding groups are sliced off.
     """
     use_fp8 = wo_a.weight.dtype == torch.float8_e4m3fn
+    lora = getattr(wo_a, "apply_grouped_lora", None)
+    if lora is not None and (
+        isinstance(o, QuantizedActivation) or not envs.VLLM_BATCH_INVARIANT
+    ):
+        raise NotImplementedError(
+            "wo_a LoRA needs the batch-invariant wo_a and a BF16 attention output"
+        )
     if isinstance(o, QuantizedActivation):
         assert use_fp8
         o_proj_input, o_scale = o.data[:, :n_groups], o.scale[:, :n_groups]
@@ -187,6 +194,22 @@ def deep_gemm_fp8_o_proj(
             grouped_weight.transpose(1, 2),
             out=z.transpose(0, 1),
         )
+    if lora is not None:
+        # The adapter reads BF16 inv_rope(o): with FP8 wo_a, the same rotation
+        # rounded once to BF16 instead of quantized.
+        if use_fp8:
+            o_proj_input, _ = fused_inv_rope_fp8_quant(
+                o,
+                positions,
+                cos_sin_cache,
+                n_groups=n_groups,
+                heads_per_group=heads_per_group,
+                nope_dim=nope_dim,
+                rope_dim=rope_dim,
+                quant_group_size=einsum_recipe[2],
+                quantize=False,
+            )
+        lora(o_proj_input, z)
     return wo_b(z.flatten(1))
 
 
