@@ -1587,6 +1587,68 @@ def test_unfused_mega_moe_matches_fused(dist_init, hidden, inter, num_experts, t
 
 
 @requires_mega_moe
+@pytest.mark.parametrize("tokens", [2, 300])
+def test_unfused_psum_layout_matches_contiguous(dist_init, tokens):
+    """The BI permutation's expert ends drive DeepGEMM's psum layout: the
+    routed GEMM visits the occupied blocks only and every live row keeps its
+    contiguous-layout bits (empty experts and other ranks' experts included)."""
+    from vllm.model_executor.kernels.batch_invariant import stable_expert_permute
+    from vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe_unfused import (
+        DeepGemmMegaMoEUnfusedExperts,
+    )
+    from vllm.utils.deep_gemm import _import_deep_gemm, mk_alignment_scope
+
+    dg = _import_deep_gemm()
+    hidden, inter, num_experts, top_k, local = 1024, 512, 32, 6, 16
+    experts = _mega_moe_experts(
+        DeepGemmMegaMoEUnfusedExperts, hidden, inter, local, top_k, "psum"
+    )
+    _, _, ids = _routes(tokens, num_experts, top_k, hidden)
+    ids[ids == 13] = 14  # local expert 5 (global 13) stays empty
+    expert_map = torch.full((num_experts,), -1, dtype=torch.int32, device="cuda")
+    expert_map[8 : 8 + local] = torch.arange(local, dtype=torch.int32, device="cuda")
+    x = torch.randn(tokens, hidden, device="cuda").to(torch.float8_e4m3fn)
+    sf = torch.exp2(torch.randint(-3, 4, (tokens, hidden // 32), device="cuda").float())
+    align = 128
+    capacity = (tokens * top_k // align + local + 1) * align
+    ends = torch.empty(local, dtype=torch.int32, device="cuda")
+    a, a_sf, layout, inverse = stable_expert_permute(
+        x, sf, ids, local, capacity, align, expert_map=expert_map, expert_ends=ends
+    )
+    counts = torch.bincount(layout[layout >= 0], minlength=local)
+    starts = ends - counts
+    assert int(starts[0]) == 0 and int(counts[5]) == 0
+    assert torch.equal(starts[1:], (ends[:-1] + align - 1) // align * align)
+    # The adapters' BF16 grouped GEMM (rank-sized K) takes the same ends.
+    xb = torch.randn(capacity, 64, device="cuda").bfloat16()
+    wb = torch.randn(local, 4 * inter, 64, device="cuda").bfloat16()
+    outs = []
+    for psum in (False, True):
+        out = torch.zeros(capacity, 2 * inter, dtype=torch.bfloat16, device="cuda")
+        with mk_alignment_scope(align):
+            dg.m_grouped_fp8_fp4_gemm_nt_contiguous(
+                (a, a_sf),
+                experts.l1_weights,
+                out,
+                ends if psum else layout,
+                recipe_a=(1, 32),
+                recipe_b=(1, 32),
+                use_psum_layout=psum,
+            )
+        outs.append(out)
+        out = torch.zeros(capacity, 4 * inter, dtype=torch.bfloat16, device="cuda")
+        with mk_alignment_scope(align):
+            dg.m_grouped_bf16_gemm_nt_contiguous(
+                xb, wb, out, ends if psum else layout, use_psum_layout=psum
+            )
+        outs.append(out)
+    live = layout >= 0
+    for i in (0, 1):
+        assert _bits_equal(outs[i][live], outs[i + 2][live])
+        assert outs[i + 2][live].abs().amax() > 0
+
+
+@requires_mega_moe
 def test_unfused_mega_moe_lora(dist_init, monkeypatch):
     """Shared-outer routed and shared-expert adapters: per-expert deltas match
     torch, rows of tokens without an adapter keep the base bits, and a row

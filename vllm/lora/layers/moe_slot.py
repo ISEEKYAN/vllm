@@ -103,9 +103,12 @@ class MoELoRASlotWithLoRA(BaseLayerWithLoRA):
         self.punica_wrapper.add_shrink(out, x, self.lora_a_stacked, 1.0)
         return out[0]
 
-    def expert_delta(self, x: torch.Tensor, layout: torch.Tensor) -> torch.Tensor:
+    def expert_delta(
+        self, x: torch.Tensor, layout: torch.Tensor, psum: bool = False
+    ) -> torch.Tensor:
         """Per-expert part of each expert-grouped row (``layout``: its local
-        expert, -1 for padding), FP32-accumulated, BF16, from its BF16 input
+        expert, -1 for padding; or with ``psum`` each expert's end row, the
+        psum layout), FP32-accumulated, BF16, from its BF16 input
         (an FP32 shrink output is rounded first, as punica's expand does):
         gate_up's delta, or down's ``A_e a`` (``shared_delta`` finishes it)."""
         from vllm.utils.deep_gemm import _import_deep_gemm
@@ -119,10 +122,14 @@ class MoELoRASlotWithLoRA(BaseLayerWithLoRA):
             out = torch.empty(
                 (rows, self.expert_w.shape[1]), dtype=torch.bfloat16, device=x.device
             )
-            dg.m_grouped_bf16_gemm_nt_contiguous(xp, self.expert_w, out, layout)
+            dg.m_grouped_bf16_gemm_nt_contiguous(
+                xp, self.expert_w, out, layout, use_psum_layout=psum
+            )
             return out
         ad = torch.empty((rows, pad), dtype=torch.bfloat16, device=x.device)
-        dg.m_grouped_bf16_gemm_nt_contiguous(x.contiguous(), self.expert_w, ad, layout)
+        dg.m_grouped_bf16_gemm_nt_contiguous(
+            x.contiguous(), self.expert_w, ad, layout, use_psum_layout=psum
+        )
         return ad
 
     def shared_delta(self, ad: torch.Tensor) -> torch.Tensor:

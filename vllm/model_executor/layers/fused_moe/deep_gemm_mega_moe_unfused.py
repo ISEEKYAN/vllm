@@ -87,6 +87,30 @@ def _slot_add(
     base.index_copy_(0, slots, torch.where(mask[:, None], rows + delta, rows))
 
 
+def _to_rows(
+    act: tuple[torch.Tensor, ...], slots: torch.Tensor, rows: int
+) -> list[torch.Tensor]:
+    """The epilogue's per-(token, slot) outputs (FP8 codes, packed MN-major
+    scales, optional BF16) placed at their permuted rows of ``rows``; slots of
+    other ranks' experts land in a scratch row past them."""
+    q, sf = act[0], act[1]
+    out_q = torch.empty((rows + 1, q.shape[1]), dtype=q.dtype, device=q.device)
+    out_q.view(torch.uint8).index_copy_(0, slots, q.view(torch.uint8))
+    out_sf = torch.empty_strided(
+        (rows + 1, sf.shape[1]),
+        (1, (rows + 4) // 4 * 4),
+        dtype=sf.dtype,
+        device=sf.device,
+    )
+    out = [out_q[:rows], out_sf.index_copy_(0, slots, sf)[:rows]]
+    if len(act) > 2:
+        b = torch.empty(
+            (rows + 1, act[2].shape[1]), dtype=act[2].dtype, device=q.device
+        )
+        out.append(b.index_copy_(0, slots, act[2])[:rows])
+    return out
+
+
 class DeepGemmMegaMoEUnfusedExperts(DeepGemmMegaMoEExperts):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -179,7 +203,12 @@ class DeepGemmMegaMoEUnfusedExperts(DeepGemmMegaMoEExperts):
             alignment=get_mk_alignment_for_contiguous_layout()[0],
             expert_tokens_meta=None,
         )
-        a, a_sf, layout, inverse = stable_expert_permute(
+        # The grouped GEMMs take the psum layout (expert end rows): they visit
+        # the occupied blocks only, not the whole padded capacity.
+        expert_ends = torch.empty(
+            self.num_local_experts, dtype=torch.int32, device=device
+        )
+        a, a_sf, _, inverse = stable_expert_permute(
             x_all,
             sf_all,
             ids_all,
@@ -187,31 +216,29 @@ class DeepGemmMegaMoEUnfusedExperts(DeepGemmMegaMoEExperts):
             capacity,
             align,
             expert_map=self._expert_map,
+            expert_ends=expert_ends,
         )
         rows = a.shape[0]
         # Each (token, slot)'s permuted row (other ranks' slots: row ``rows``,
-        # a scratch row) and each permuted row's routing weight.
+        # a scratch row).
         dump = torch.where(inverse >= 0, inverse, rows).flatten().long()
-        row_w = torch.zeros(rows + 1, device=device).scatter_(0, dump, w_all.flatten())
-        row_w = row_w[:rows].contiguous()
-        l1_full = torch.zeros(
+        l1_full = torch.empty(
             (rows + 1, 2 * self.intermediate_size), dtype=torch.bfloat16, device=device
         )
         l1 = l1_full[:rows]
-        # Rows past the last expert block are padding: the epilogue skips them.
-        ends = torch.arange(1, rows + 1, dtype=torch.int32, device=device)
-        avail = (ends * (layout >= 0)).amax().reshape(1)
         with mk_alignment_scope(align):
             dg.m_grouped_fp8_fp4_gemm_nt_contiguous(
                 (a, a_sf),
                 self.l1_weights,
                 l1,
-                layout,
+                expert_ends,
                 recipe_a=(1, 32),
                 recipe_b=(1, 32),
+                use_psum_layout=True,
             )
-            # LoRA work past the grouped GEMMs runs on the (token, slot) rows
-            # only, not on the padded capacity.
+            # The epilogue and the LoRA work past the grouped GEMMs run on the
+            # (token, slot) rows only, not on the padded capacity.
+            h = l1_full[dump]
             slot_lora = None
             slot_row = dump.clamp(max=rows - 1)
             if gu is not None:
@@ -221,25 +248,34 @@ class DeepGemmMegaMoEUnfusedExperts(DeepGemmMegaMoEExperts):
                 row_tok = torch.zeros(rows + 1, dtype=torch.long, device=device)
                 row_tok = row_tok.scatter_(0, dump, tok)[:rows]
                 slot_lora = parts[5][tok].bool() & (dump < rows)
-                delta = gu.expert_delta(parts[4][row_tok], layout)
-                _slot_add(l1_full, dump, delta[slot_row], slot_lora)
-            act = swiglu_apply_weight_to_fp8(
-                l1,
-                row_w,
-                clamp_limit=self.activation.clamp,
-                fast_math=self.fast_math,
-                avail_rows=avail,
-                output_bf16=dn is not None,
+                delta = gu.expert_delta(parts[4][row_tok], expert_ends, psum=True)
+                h = torch.where(slot_lora[:, None], h + delta[slot_row], h)
+            act = _to_rows(
+                swiglu_apply_weight_to_fp8(
+                    h,
+                    w_all.flatten(),
+                    clamp_limit=self.activation.clamp,
+                    fast_math=self.fast_math,
+                    output_bf16=dn is not None,
+                ),
+                dump,
+                rows,
             )
             l2_full = torch.empty(
                 (rows + 1, hidden), dtype=torch.bfloat16, device=device
             )
             l2 = l2_full[:rows]
             dg.m_grouped_fp8_fp4_gemm_nt_contiguous(
-                act[:2], self.l2_weights, l2, layout, recipe_a=(1, 32), recipe_b=(1, 32)
+                act[:2],
+                self.l2_weights,
+                l2,
+                expert_ends,
+                recipe_a=(1, 32),
+                recipe_b=(1, 32),
+                use_psum_layout=True,
             )
             if dn is not None:
-                ad = dn.expert_delta(act[-1], layout)
+                ad = dn.expert_delta(act[-1], expert_ends, psum=True)
                 _slot_add(l2_full, dump, dn.shared_delta(ad[slot_row]), slot_lora)
 
         slots = gather_expert_slots(

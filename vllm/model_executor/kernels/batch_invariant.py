@@ -563,8 +563,12 @@ def stable_expert_permute(
     *,
     expert_map: torch.Tensor | None,
     output: torch.Tensor | None = None,
+    expert_ends: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Group FP8 rows in token/slot order without host readback or atomics."""
+    """Group FP8 rows in token/slot order without host readback or atomics.
+
+    ``expert_ends``, if given, receives each local expert's end row (its
+    ``alignment``-aligned start plus its row count): DeepGEMM's psum layout."""
     require_batch_invariant_kernel()
     if output is None:
         output = torch.empty((capacity, a.shape[1]), dtype=a.dtype, device=a.device)
@@ -589,6 +593,8 @@ def stable_expert_permute(
         starts,
         alignment,
     )
+    if expert_ends is not None:
+        torch.add(starts, counts, out=expert_ends)
     return output, output_scale, layout, inverse
 
 
