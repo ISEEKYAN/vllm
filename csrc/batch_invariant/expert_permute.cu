@@ -6,6 +6,8 @@
 #include <c10/cuda/CUDAException.h>
 #include <torch/extension.h>
 
+#include <cub/block/block_scan.cuh>
+
 #include <climits>
 #include <optional>
 
@@ -58,12 +60,26 @@ __global__ void expert_offsets_kernel(const Index* routes, const int32_t* map,
   if (threadIdx.x == 0) counts[expert] = prior;
 }
 
+// Exclusive prefix sum of the aligned counts in one block: integers, so the
+// result does not depend on the scan order.
+constexpr int kStartsThreads = 256;
+
 __global__ void expert_starts_kernel(const int32_t* counts, int32_t* starts,
                                      int experts, int alignment) {
-  int64_t start = 0;
-  for (int expert = 0; expert < experts; ++expert) {
-    starts[expert] = int32_t(start);
-    start += (int64_t(counts[expert]) + alignment - 1) / alignment * alignment;
+  using Scan = cub::BlockScan<int64_t, kStartsThreads>;
+  __shared__ typename Scan::TempStorage temp;
+  int64_t carry = 0;
+  for (int begin = 0; begin < experts; begin += kStartsThreads) {
+    const int expert = begin + threadIdx.x;
+    const int64_t aligned =
+        expert < experts
+            ? (int64_t(counts[expert]) + alignment - 1) / alignment * alignment
+            : 0;
+    int64_t start, total;
+    Scan(temp).ExclusiveSum(aligned, start, total);
+    if (expert < experts) starts[expert] = int32_t(carry + start);
+    carry += total;
+    __syncthreads();
   }
 }
 
@@ -193,9 +209,9 @@ void expert_permute(const torch::Tensor& a, const torch::Tensor& scale,
         routes.data_ptr<scalar_t>(), map, inverse.data_ptr<int32_t>(),
         counts.data_ptr<int32_t>(), positions, routes.size(1), routes.stride(0),
         routes.stride(1), experts, global_experts);
-    expert_starts_kernel<<<1, 1, 0, stream>>>(counts.data_ptr<int32_t>(),
-                                              starts.data_ptr<int32_t>(),
-                                              experts, alignment);
+    expert_starts_kernel<<<1, kStartsThreads, 0, stream>>>(
+        counts.data_ptr<int32_t>(), starts.data_ptr<int32_t>(), experts,
+        alignment);
     const bool vec = a.stride(1) == 1 && a.size(1) % 16 == 0 &&
                      a.stride(0) % 16 == 0 &&
                      reinterpret_cast<uintptr_t>(a.data_ptr()) % 16 == 0 &&
