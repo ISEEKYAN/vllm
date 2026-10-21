@@ -217,6 +217,7 @@ class DeepGemmMegaMoEUnfusedExperts(DeepGemmMegaMoEExperts):
             align,
             expert_map=self._expert_map,
             expert_ends=expert_ends,
+            fill_padding=False,  # the psum GEMMs read the expert rows only
         )
         rows = a.shape[0]
         # Each (token, slot)'s permuted row (other ranks' slots: row ``rows``,
@@ -245,10 +246,17 @@ class DeepGemmMegaMoEUnfusedExperts(DeepGemmMegaMoEExperts):
                 tok = torch.arange(x_all.shape[0], device=device).repeat_interleave(
                     top_k
                 )
-                row_tok = torch.zeros(rows + 1, dtype=torch.long, device=device)
-                row_tok = row_tok.scatter_(0, dump, tok)[:rows]
                 slot_lora = parts[5][tok].bool() & (dump < rows)
-                delta = gu.expert_delta(parts[4][row_tok], expert_ends, psum=True)
+                # Each slot's shrink output, BF16, at its permuted row.
+                xa = torch.zeros(
+                    (rows + 1, gu.expert_w.shape[-1]),
+                    dtype=torch.bfloat16,
+                    device=device,
+                )
+                xa[:, : parts[4].shape[1]].index_copy_(
+                    0, dump, parts[4][tok].to(torch.bfloat16)
+                )
+                delta = gu.expert_delta(xa[:rows], expert_ends, psum=True)
                 h = torch.where(slot_lora[:, None], h + delta[slot_row], h)
             act = _to_rows(
                 swiglu_apply_weight_to_fp8(
@@ -286,8 +294,11 @@ class DeepGemmMegaMoEUnfusedExperts(DeepGemmMegaMoEExperts):
         y = torch.zeros((num_tokens, hidden), dtype=torch.float32, device=device)
         if self.has_fused_shared_experts:
             y += self._shared(dg, hidden_states, x_q, x_sf).float()
-        for k in range(top_k):  # MegaMoE's combine: shared first, slot order
-            y = torch.where((ids[:, k] >= 0)[:, None], y + slots[:, k].float(), y)
+        # MegaMoE's combine: shared first, slot order. An absent slot adds +0.0,
+        # which keeps y's bits (y starts at +0.0, so it is never -0.0).
+        slots = torch.where((ids >= 0)[..., None], slots, 0).float()
+        for k in range(top_k):
+            y += slots[:, k]
         y = y.to(torch.bfloat16)
         if shared_experts is not None:
             y += shared_experts(hidden_states)

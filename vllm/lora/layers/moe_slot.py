@@ -106,31 +106,20 @@ class MoELoRASlotWithLoRA(BaseLayerWithLoRA):
     def expert_delta(
         self, x: torch.Tensor, layout: torch.Tensor, psum: bool = False
     ) -> torch.Tensor:
-        """Per-expert part of each expert-grouped row (``layout``: its local
-        expert, -1 for padding; or with ``psum`` each expert's end row, the
-        psum layout), FP32-accumulated, BF16, from its BF16 input
-        (an FP32 shrink output is rounded first, as punica's expand does):
-        gate_up's delta, or down's ``A_e a`` (``shared_delta`` finishes it)."""
+        """Per-expert part of each expert-grouped BF16 row (``layout``: its
+        local expert, -1 for padding; or with ``psum`` each expert's end row,
+        the psum layout), FP32-accumulated, BF16: gate_up's delta from the
+        rounded shrink output K-padded to the slot width (as punica's expand
+        rounds it), or down's ``A_e a`` (``shared_delta`` finishes it)."""
         from vllm.utils.deep_gemm import _import_deep_gemm
 
-        dg = _import_deep_gemm()
-        rows, pad = x.shape[0], self.expert_w.shape[-1 if self._b_per_expert else 1]
-        x = x.to(torch.bfloat16)
-        if self._b_per_expert:
-            xp = torch.zeros((rows, pad), dtype=torch.bfloat16, device=x.device)
-            xp[:, : x.shape[1]] = x
-            out = torch.empty(
-                (rows, self.expert_w.shape[1]), dtype=torch.bfloat16, device=x.device
-            )
-            dg.m_grouped_bf16_gemm_nt_contiguous(
-                xp, self.expert_w, out, layout, use_psum_layout=psum
-            )
-            return out
-        ad = torch.empty((rows, pad), dtype=torch.bfloat16, device=x.device)
-        dg.m_grouped_bf16_gemm_nt_contiguous(
-            x.contiguous(), self.expert_w, ad, layout, use_psum_layout=psum
+        out = torch.empty(
+            (x.shape[0], self.expert_w.shape[1]), dtype=torch.bfloat16, device=x.device
         )
-        return ad
+        _import_deep_gemm().m_grouped_bf16_gemm_nt_contiguous(
+            x, self.expert_w, out, layout, use_psum_layout=psum
+        )
+        return out
 
     def shared_delta(self, ad: torch.Tensor) -> torch.Tensor:
         """The down delta from ``A_e a`` rows: the shared B, BI fixed-order GEMM."""

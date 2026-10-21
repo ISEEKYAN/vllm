@@ -1702,7 +1702,9 @@ def test_unfused_mega_moe_lora(dist_init, monkeypatch):
     ref = torch.einsum(
         "tr,tor->to", xa.bfloat16().float(), gu.expert_w[:, :, :rank].float()[e_row]
     )
-    out = gu.expert_delta(xa, layout)
+    xp = torch.zeros(layout.shape[0], gu.expert_w.shape[-1], device="cuda").bfloat16()
+    xp[:, :rank] = xa
+    out = gu.expert_delta(xp, layout)
     torch.testing.assert_close(out[valid].float(), ref[valid], atol=2e-2, rtol=2e-2)
     a = torch.randn(layout.shape[0], inter, device="cuda").bfloat16()
     ad = torch.einsum("ti,tri->tr", a.float(), dn.expert_w[:, :rank].float()[e_row])
