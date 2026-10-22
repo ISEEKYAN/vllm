@@ -25,6 +25,7 @@ an adapter, and zero adapters, give the bits of the plain fused MegaMoE.
 import torch
 
 from vllm.distributed import get_ep_group
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe import (
     DeepGemmMegaMoEExperts,
 )
@@ -37,6 +38,21 @@ from vllm.triton_utils import tl, triton
 # deterministic tensor-core path.
 _DELTA_K = 128
 _BLOCK_M = 16
+
+
+def _tokens_across_ep(num_tokens: int, world: int) -> int:
+    """All EP ranks' tokens this step (EP spans the DP ranks, TP 1). Eager DP
+    steps are ragged, so this rank's count times the world can fall short of
+    the rows its experts receive."""
+    dp_metadata = (
+        get_forward_context().dp_metadata if is_forward_context_available() else None
+    )
+    if world == 1 or dp_metadata is None:
+        return num_tokens * world
+    sizes = dp_metadata.num_tokens_across_dp_cpu
+    if len(sizes) != world:
+        raise NotImplementedError("MegaMoE LoRA hooks need EP == DP (TP 1)")
+    return int(sizes.sum())
 
 
 @triton.jit
@@ -277,10 +293,10 @@ class DeepGemmMegaMoELoRAExperts(DeepGemmMegaMoEExperts):
         num_tokens, r = y.shape[0], self.lora_rank
         dn, w2 = self._lora("down"), self._lora("shared_w2")
         ep = get_ep_group()
-        grid = (
-            triton.cdiv(ep.world_size * num_tokens * self.top_k, _BLOCK_M)
-            + self.num_local_experts,
-        )
+        # Enough blocks for every row the local experts received: per expert
+        # ceil(count / BLOCK_M), with the total bounded by all ranks' tokens.
+        rows = _tokens_across_ep(num_tokens, ep.world_size) * self.top_k
+        grid = (triton.cdiv(rows, _BLOCK_M) + self.num_local_experts,)
         _down_shrink_return_kernel[grid](
             buffer.lora_act,
             buffer.lora_expert_info,
