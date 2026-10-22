@@ -216,17 +216,20 @@ class DeepGemmMegaMoELoRAExperts(DeepGemmMegaMoEExperts):
     def _refresh_views(self) -> None:
         if self._views is None:
             return
-        r, dg = self.lora_rank, self._deep_gemm
+        r, dg, views = self.lora_rank, self._deep_gemm, self._views
         w1_b = self.shared_w1.lora_b_stacked[0][0, 0]
         w3_b = self.shared_w3.lora_b_stacked[0][0, 0]
-        self._views["gate_up"].copy_(
-            dg.transform_lora_b_for_mega_moe(self.gate_up.expert_w[:, :, :r])
-        )
-        self._views["shared"].copy_(dg.transform_shared_lora_b_for_mega_moe(w1_b, w3_b))
-        delta = self._views["delta"]
-        delta.zero_()
-        delta[:, :r].copy_(self.down.shared_w[:, :r])
-        delta[:, r : 2 * r].copy_(self.shared_w2.lora_b_stacked[0][0, 0])
+        # The views are made during a forward (inference tensors); adapter
+        # loads run outside inference mode, where in-place writes to them fail.
+        with torch.inference_mode():
+            views["gate_up"].copy_(
+                dg.transform_lora_b_for_mega_moe(self.gate_up.expert_w[:, :, :r])
+            )
+            views["shared"].copy_(dg.transform_shared_lora_b_for_mega_moe(w1_b, w3_b))
+            delta = views["delta"]
+            delta.zero_()
+            delta[:, :r].copy_(self.down.shared_w[:, :r])
+            delta[:, r : 2 * r].copy_(self.shared_w2.lora_b_stacked[0][0, 0])
 
     def forward(
         self, hidden_states, topk_weights, topk_ids, shared_experts=None
