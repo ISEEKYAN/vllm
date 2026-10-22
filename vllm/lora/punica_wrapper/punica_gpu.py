@@ -174,6 +174,25 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             scale,
         )
 
+    def add_shrink_grouped(
+        self,
+        y: torch.Tensor,
+        x: torch.Tensor,
+        lora_a_stacked: tuple[torch.Tensor, ...],
+        scale: float,
+    ):
+        """One launch for all slices; same per-slice arithmetic as the base
+        class's per-slice ``add_shrink`` calls."""
+        lora_shrink(
+            x,
+            lora_a_stacked,
+            y,
+            *self.token_mapping_meta.meta_args(
+                x.size(0), self.lora_config.specialize_active_lora
+            ),
+            scale,
+        )
+
     def add_expand(
         self,
         y: torch.Tensor,

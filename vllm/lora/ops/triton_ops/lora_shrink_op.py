@@ -132,6 +132,7 @@ def _lora_shrink_kernel(
     output_split_stride=0,
     PARTIAL_N: tl.constexpr = 0,
     PARTIAL_K: tl.constexpr = 0,
+    input_slice_stride=0,
 ):
     if STORE_PARTIALS:
         # The split-K partial stage specializes on N and K.
@@ -213,12 +214,13 @@ def _lora_shrink_kernel(
         SLICE_NUM,
         USE_GDC,
         STORE_PARTIALS,
+        input_slice_stride,
     )
 
 
 @torch.inference_mode()
 def _lora_shrink(
-    inputs: torch.Tensor,  #  shape [num_tokens, hidden_size]
+    inputs: torch.Tensor,  # [num_tokens, (num_slices,) hidden_size]
     lora_a_weights: list[torch.Tensor],  # shape [num_loras, lora_rank, hidden_size]
     output_tensor: torch.Tensor,  # shape [num_slices, num_tokens, lora_rank]
     token_lora_mapping: torch.Tensor,  # shape [num_tokens]
@@ -231,7 +233,8 @@ def _lora_shrink(
     scaling: float,
 ) -> None:
     """Args:
-    inputs (torch.Tensor): Input tensor
+    inputs (torch.Tensor): Input tensor. 3-D inputs give each slice its own
+        input row ``inputs[:, slice]`` (e.g. a grouped linear's groups).
     lora_a_weights (list[torch.Tensor]): LoRA weights
     output_tensor (torch.Tensor): output tensor
     token_lora_mapping (torch.Tensor): A tensor mapping each input token
@@ -282,8 +285,15 @@ def _lora_shrink(
     for weight in lora_a_weights:
         assert weight.dtype in [torch.float16, torch.bfloat16]
 
-    assert inputs.size(1) == lora_a_weights[0].size(-1)
-    inputs = inputs.contiguous()
+    assert inputs.size(-1) == lora_a_weights[0].size(-1)
+    input_slice_stride = 0
+    if inputs.dim() == 3:
+        assert inputs.size(1) == len(lora_a_weights)
+        if inputs.stride(-1) != 1:
+            inputs = inputs.contiguous()
+        input_slice_stride = inputs.stride(1)
+    else:
+        inputs = inputs.contiguous()
     assert output_tensor.is_contiguous()
 
     # metadata sanity check
@@ -363,7 +373,7 @@ def _lora_shrink(
         lora_ids,
         scaling,
         inputs.stride(0),
-        inputs.stride(1),
+        inputs.stride(-1),
         lora_strides_d0,
         lora_strides_d1,
         lora_strides_d2,
@@ -382,6 +392,7 @@ def _lora_shrink(
         num_ctas=NUM_CTAS,
         num_stages=NUM_STAGES,
         launch_pdl=use_gdc,
+        input_slice_stride=input_slice_stride,
         **partial_args,
     )
     if partials is not None:

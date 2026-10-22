@@ -315,6 +315,23 @@ class PunicaWrapperBase(PunicaWrapperABC):
         # TODO: implement it based on torch ops
         raise NotImplementedError
 
+    def add_shrink_grouped(
+        self,
+        y: torch.Tensor,
+        x: torch.Tensor,
+        lora_a_stacked: tuple[torch.Tensor, ...],
+        scale: float,
+    ) -> None:
+        """``add_shrink`` where slice ``i`` reads its own input ``x[:, i]``
+        (``x``: [num_tokens, num_slices, hidden]).
+
+        Semantics:
+        for i in range(len(lora_a_stacked)):
+            y[i] += (x[:, i] @ lora_a_stacked[i]) * scale
+        """
+        for i in range(len(lora_a_stacked)):
+            self.add_shrink(y[i : i + 1], x[:, i], lora_a_stacked[i : i + 1], scale)
+
     @abstractmethod
     def add_expand(
         self,

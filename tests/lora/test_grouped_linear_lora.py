@@ -133,3 +133,37 @@ def test_fp8_wo_a_lora_reads_bf16_inv_rope(monkeypatch):
             tma_aligned_scales=True,
             **shape,
         )
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="punica kernels need CUDA")
+@pytest.mark.parametrize("tokens", [1, 13, 64, 300])
+def test_grouped_shrink_matches_per_group(dist_init, monkeypatch, tokens):
+    """One shrink over all groups (slice ``g`` reading ``x[:, g]``) gives the
+    bits of one shrink per group, with two adapters and rows without LoRA."""
+    import vllm.lora.ops.triton_ops.lora_shrink_op as shrink_op
+    import vllm.lora.ops.triton_ops.utils as lora_utils
+
+    monkeypatch.setattr(lora_utils, "is_batch_invariant", True)
+    monkeypatch.setattr(shrink_op, "is_batch_invariant", True)
+    lora_utils.get_lora_op_configs.cache_clear()
+    torch.manual_seed(tokens)
+    groups, k, rank, max_loras = 8, 4096, 32, 2
+    config = LoRAConfig(
+        max_loras=max_loras, max_lora_rank=rank, lora_dtype=torch.bfloat16
+    )
+    punica = PunicaWrapperGPU(512, max_loras, "cuda", lora_config=config)
+    lora_a = tuple(
+        (torch.randn(max_loras, 1, rank, k, device="cuda") / k**0.5).bfloat16()
+        for _ in range(groups)
+    )
+    ids = tuple(i % 3 for i in range(tokens))  # adapters 1 and 2; 0 = none
+    punica.update_metadata(LoRAMapping(ids, ids), [1, 2], max_loras, vocab_size=0)
+    x = torch.randn(tokens, groups, k, device="cuda").bfloat16()
+
+    merged = torch.full((groups, tokens, rank), float("nan"), device="cuda")
+    punica.add_shrink_grouped(merged, x, lora_a, 1.0)
+    per_group = torch.full_like(merged, float("nan"))
+    for g in range(groups):
+        punica.add_shrink(per_group[g : g + 1], x[:, g], lora_a[g : g + 1], 1.0)
+    assert torch.equal(merged.view(torch.int32), per_group.view(torch.int32))
+    lora_utils.get_lora_op_configs.cache_clear()

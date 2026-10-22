@@ -57,17 +57,14 @@ class GroupedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
 
     def apply_grouped_lora(self, x: torch.Tensor, out: torch.Tensor) -> None:
         """Add each group's delta to ``out[:, g]`` (in place, BF16), from
-        ``x[:, g]``: the punica shrink per group, one expand over all."""
+        ``x[:, g]``: one punica shrink and one expand over all groups."""
         tokens = x.shape[0]
         buffer = torch.empty(
             (self.groups, tokens, self.lora_config.max_lora_rank),
             dtype=torch.float32,
             device=x.device,
         )
-        for g in range(self.groups):
-            self.punica_wrapper.add_shrink(
-                buffer[g : g + 1], x[:, g], self.lora_a_stacked[g : g + 1], 1.0
-            )
+        self.punica_wrapper.add_shrink_grouped(buffer, x, self.lora_a_stacked, 1.0)
         self.punica_wrapper.add_expand(
             out.view(tokens, -1),
             buffer,

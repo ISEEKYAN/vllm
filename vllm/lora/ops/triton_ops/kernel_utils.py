@@ -267,6 +267,7 @@ def do_shrink_kernel(
     SLICE_NUM: tl.constexpr,
     USE_GDC: tl.constexpr,
     STORE_PARTIALS: tl.constexpr,
+    input_slice_stride=0,
 ):
     """Given an array of integers that identifies the rows of A, ram,
     a lora index that identifies which LoRA to use from lora_ptr, lora_index,
@@ -291,6 +292,8 @@ def do_shrink_kernel(
     offset_k = pid_sk * BLOCK_K + tl.arange(0, BLOCK_K)
     a_ptr = (
         input_ptr
+        # Slice ``s`` reads its own input when the slices have separate inputs.
+        + slice_id.to(tl.int64) * input_slice_stride
         # int64 to keep the row offset from overflowing at long context lengths
         + ram[:, None].to(tl.int64) * input_d0_stride
         + offset_k[None, :] * input_d1_stride
