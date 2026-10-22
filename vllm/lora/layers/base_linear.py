@@ -210,6 +210,8 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
         return quant_method
 
     def apply(self, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
+        if envs.VLLM_LORA_OVERLAP_SHRINK and is_forward_context_available():
+            return self._apply_shrink_overlap(x, bias)
         # is_forward_context_available for tower modules
         if (
             self._enable_aux_cuda_stream
@@ -228,6 +230,41 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
     ) -> torch.Tensor:
         output = self._get_quant_method().apply(self.base_layer, x, bias)
         return self._apply_lora_to_output(_lora_input(x), output)
+
+    def _apply_shrink_overlap(
+        self, x: torch.Tensor, bias: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """``_apply_sync`` with the adapter's shrink on the aux stream, beside
+        the base GEMM; the expand still adds into the base output on the main
+        stream. Same kernels and arithmetic as ``_apply_sync`` (bit for bit),
+        unlike the dual-stream path that adds a separately rounded delta."""
+        from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+
+        from .utils import get_lora_shrink_stream
+
+        lora_x = _lora_input(x)
+        if lora_x.ndim != 2 or BreakableCUDAGraphCapture.is_active():
+            return self._apply_sync(x, bias)
+        # Allocated on the main stream, which uses it last (the expand).
+        buffer = torch.empty(
+            (len(self.output_slices), lora_x.size(0), self.lora_b_stacked[0].size(-1)),
+            dtype=torch.float32,
+            device=lora_x.device,
+        )
+        if not hasattr(self, "_shrink_events"):
+            self._shrink_events = (torch.cuda.Event(), torch.cuda.Event())
+        start, shrunk = self._shrink_events
+        start.record()
+        with torch.cuda.stream(get_lora_shrink_stream()):
+            start.wait()
+            self.punica_wrapper.add_shrink(buffer, lora_x, self.lora_a_stacked, 1.0)
+            shrunk.record()
+        output = self._get_quant_method().apply(self.base_layer, x, bias)
+        shrunk.wait()
+        self.punica_wrapper.add_expand(
+            output, buffer, self.lora_b_stacked, self.output_slices, add_inputs=True
+        )
+        return output
 
     def _apply_base_forward(self, x: torch.Tensor) -> torch.Tensor:
         base_output = self.base_layer(x)

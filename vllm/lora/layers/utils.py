@@ -15,6 +15,18 @@ from vllm.utils.math_utils import next_power_of_2
 _lora_aux_cuda_stream: torch.cuda.Stream | None = None
 
 
+_lora_shrink_stream: torch.cuda.Stream | None = None
+
+
+def get_lora_shrink_stream() -> torch.cuda.Stream:
+    """The stream LoRA shrinks run on beside their base GEMMs
+    (VLLM_LORA_OVERLAP_SHRINK)."""
+    global _lora_shrink_stream
+    if _lora_shrink_stream is None:
+        _lora_shrink_stream = torch.cuda.Stream()
+    return _lora_shrink_stream
+
+
 def _get_lora_aux_cuda_stream() -> torch.cuda.Stream | None:
     if not envs.VLLM_LORA_ENABLE_DUAL_STREAM:
         return None
