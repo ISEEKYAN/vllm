@@ -27,6 +27,9 @@ class MoELoRASlotWithLoRA(BaseLayerWithLoRA):
         super().__init__()
         self.base_layer = base_layer
         self.experts = base_layer.per_expert
+        # Set by experts that keep their own layout of the adapters (the fused
+        # MegaMoE hooks): called after every change of the slot's weights.
+        self.on_update = None
 
     def create_lora_weights(
         self,
@@ -78,6 +81,8 @@ class MoELoRASlotWithLoRA(BaseLayerWithLoRA):
         if self.experts:
             self.expert_w.zero_()
             self.shared_w.zero_()
+        if self.on_update is not None:
+            self.on_update()
 
     def set_lora(self, index: int, lora_a: torch.Tensor, lora_b: torch.Tensor):
         self.reset_lora(index)
@@ -85,8 +90,7 @@ class MoELoRASlotWithLoRA(BaseLayerWithLoRA):
             r = lora_a.shape[0]
             self.lora_a_stacked[0][index, 0, :r].copy_(lora_a, non_blocking=True)
             self.lora_b_stacked[0][index, 0, :, :r].copy_(lora_b, non_blocking=True)
-            return
-        if self._b_per_expert:  # gate_up: shared A, per-expert B
+        elif self._b_per_expert:  # gate_up: shared A, per-expert B
             r = lora_a.shape[0]
             self.lora_a_stacked[0][index, 0, :r].copy_(lora_a, non_blocking=True)
             self.expert_w[:, :, :r].copy_(self._local(lora_b), non_blocking=True)
@@ -94,6 +98,8 @@ class MoELoRASlotWithLoRA(BaseLayerWithLoRA):
             r = lora_b.shape[1]
             self.expert_w[:, :r].copy_(self._local(lora_a), non_blocking=True)
             self.shared_w[:, :r].copy_(lora_b, non_blocking=True)
+        if self.on_update is not None:
+            self.on_update()
 
     def shrink(self, x: torch.Tensor) -> torch.Tensor:
         """``x A^T`` in FP32 for every token with an adapter, punica's BI shrink."""

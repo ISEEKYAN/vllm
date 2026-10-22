@@ -444,6 +444,12 @@ class DeepseekV4MoE(nn.Module):
             if not fuse_shared_experts:
                 raise NotImplementedError("Expert LoRA needs the fused shared expert")
             experts_cls = DeepGemmMegaMoEUnfusedExperts
+            if envs.VLLM_MEGAMOE_LORA_FUSED:
+                from vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe_lora import (  # noqa: E501
+                    DeepGemmMegaMoELoRAExperts,
+                )
+
+                experts_cls = DeepGemmMegaMoELoRAExperts
         self.experts = experts_cls(
             vllm_config,
             num_experts=self.n_physical_experts,

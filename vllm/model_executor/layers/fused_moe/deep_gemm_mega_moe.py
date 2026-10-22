@@ -306,6 +306,8 @@ class DeepGemmMegaMoEExperts(nn.Module):
         self.activation = activation
         self.fast_math = fast_math
         self._kernel_kwargs = activation.kernel_kwargs()
+        # Extra symmetric-buffer arguments of subclasses (LoRA ranks).
+        self._symm_buffer_kwargs: dict[str, Any] = {}
         self.eplb_state = EplbLayerState()
         # L2 input scale of every logical expert; the NVFP4 kernel takes the max.
         self._w2_input_scales = torch.zeros(self.num_logical_experts, device="cpu")
@@ -620,6 +622,7 @@ class DeepGemmMegaMoEExperts(nn.Module):
             None if self.shared_spec is None else self.shared_spec.dtype,
             self.weight_format.mma_type,
             self.activation.name,
+            tuple(sorted(self._symm_buffer_kwargs.items())),
         )
         symm_buffer = self._symm_buffers.get(key)
         if symm_buffer is None:
@@ -649,6 +652,7 @@ class DeepGemmMegaMoEExperts(nn.Module):
                     num_shared_experts=self.num_shared_experts,
                     mma_type=self.weight_format.mma_type,
                     activation=self.activation.name,
+                    **self._symm_buffer_kwargs,
                 )
             self._symm_buffers[key] = symm_buffer
         return symm_buffer
