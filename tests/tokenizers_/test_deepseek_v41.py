@@ -9,6 +9,7 @@ import pytest
 
 from tests.tokenizers_.test_deepseek_v4 import FakeHfTokenizer
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+from vllm.entrypoints.serve.tokenize.protocol import TokenizeChatRequest
 from vllm.tokenizers.deepseek_v41 import get_deepseek_v41_tokenizer
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -185,3 +186,67 @@ def test_images_preserve_content_order_and_reference_separator(image_type):
 def test_unsupported_media_is_a_request_error():
     with pytest.raises(ValueError, match="text and image content only"):
         render([{"role": "user", "content": [{"type": "input_audio"}]}])
+
+
+@pytest.mark.parametrize("reasoning_field", ["reasoning", "reasoning_content", "both"])
+@pytest.mark.parametrize("tool_calls_type", [list, tuple, iter])
+def test_tokenize_reasoning_tool_calls_match_chat(reasoning_field, tool_calls_type):
+    def payload():
+        assistant = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": tool_calls_type(
+                [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "calculate", "arguments": '{"value": 2}'},
+                    }
+                ]
+            ),
+        }
+        if reasoning_field in ("reasoning", "both"):
+            assistant["reasoning"] = "I should calculate first."
+        if reasoning_field in ("reasoning_content", "both"):
+            assistant["reasoning_content"] = (
+                "deprecated reasoning"
+                if reasoning_field == "both"
+                else "I should calculate first."
+            )
+        return {
+            "model": "test-model",
+            "messages": [
+                {"role": "user", "content": "Calculate two."},
+                assistant,
+                {"role": "tool", "tool_call_id": "call_1", "content": "2"},
+            ],
+        }
+
+    token_request = TokenizeChatRequest.model_validate(payload())
+    chat_request = ChatCompletionRequest.model_validate(payload())
+    assert token_request.messages[1]["reasoning"] == "I should calculate first."
+    assert isinstance(token_request.messages[1]["tool_calls"], list)
+    assert "reasoning_content" not in token_request.messages[1]
+    assert render(token_request.messages) == render(chat_request.messages)
+    tokenizer = get_deepseek_v41_tokenizer(FakeHfTokenizer())
+    assert tokenizer.apply_chat_template(
+        token_request.messages
+    ) == tokenizer.apply_chat_template(chat_request.messages)
+    assert (
+        json.loads(token_request.model_dump_json())["messages"]
+        == (json.loads(chat_request.model_dump_json())["messages"])
+    )
+
+
+@pytest.mark.parametrize(
+    "messages",
+    [
+        [{"role": "user", "content": "Hello"}],
+        [{"role": "user", "content": "Hello"}, {"role": "assistant", "content": "Hi"}],
+    ],
+)
+def test_tokenize_existing_text_messages_unchanged(messages):
+    original = copy.deepcopy(messages)
+    request = TokenizeChatRequest(messages=copy.deepcopy(messages))
+    assert request.messages == original
+    assert render(request.messages) == render(original)
